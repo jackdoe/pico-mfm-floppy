@@ -5,12 +5,7 @@
 
 A bare-metal 3.5" floppy disk driver for the Raspberry Pi Pico, implementing MFM encoding/decoding and FAT12 filesystem support without any dedicated floppy disk controller hardware.
 
-```
- ______
-| |__| |
-|  ()  |
-|______|
-```
+![picture](picture.jpg)
 
 ## Table of Contents
 
