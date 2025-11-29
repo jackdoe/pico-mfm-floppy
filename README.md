@@ -331,18 +331,39 @@ We need an encoding that guarantees regular transitions for clock recovery.
 
 ### FM Encoding
 
+### FM Encoding
+
 FM (Frequency Modulation) was an early solution. Insert a clock bit (always 1) before every data bit:
 
 ```
-    FM Encoding Example: 0x3A = 0011 1010
-    ═══════════════════════════════════════
-    Data bits:     0       0       1       1       1       0       1       0
-    Clock bits:      1       1       1       1       1       1       1       1
-                  ───────────────────────────────────────────────────────────
-    FM bitstream:  0 1     0 1     1 1     1 1     1 1     0 1     1 1     0 1
-                     ↑       ↑     ↑ ↑     ↑ ↑     ↑ ↑       ↑     ↑ ↑       ↑
-                     │       │     │ │     │ │     │ │       │     │ │       │
-    Flux pulses:     █       █     █ █     █ █     █ █       █     █ █       █
+    FM Encoding: Each data bit becomes [clock=1][data]
+    ══════════════════════════════════════════════════
+
+    Example: 0x3A = 0011 1010
+
+    Data bit:        0       0       1       1       1       0       1       0
+                   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐   ┌───┐
+    FM cell:       │C D│   │C D│   │C D│   │C D│   │C D│   │C D│   │C D│   │C D│
+                   │1 0│   │1 0│   │1 1│   │1 1│   │1 1│   │1 0│   │1 1│   │1 0│
+                   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘   └───┘
+
+    FM bitstream:  1 0     1 0     1 1     1 1     1 1     1 0     1 1     1 0
+                   ↑       ↑       ↑ ↑     ↑ ↑     ↑ ↑     ↑       ↑ ↑     ↑
+                   C       C       C D     C D     C D     C       C D     C
+
+    Flux waveform (transition on every '1'):
+
+         1   0   1   0   1   1   1   1   1   1   1   0   1   1   1   0
+       ──┐   ┌───┐   ┌───┐ ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌───┐   ┌─┐ ┌─┐ ┌───┐   │
+         └───┘   └───┘   └─┘ └─┘ └─┘ └─┘ └─┘   └───┘ └─┘ └─┘   └───┘
+         ^       ^       ^ ^ ^ ^ ^ ^ ^ ^       ^     ^ ^ ^     ^
+         │       │       └─┴─┴─┴─┴─┴─┴─┘       │     └─┴─┘     │
+        data=0  data=0    data=1,1,1 (fast)  data=0  data=1  data=0
+
+    Clock transitions happen EVERY cell (the '1' at position C).
+    Data transitions happen when data=1 (the '1' at position D).
+
+    For 8 data bits: 16 FM bits with 12 transitions. Very inefficient!
 ```
 
 FM doubles the bit rate (one clock bit per data bit), which halves storage capacity. MFM improves on this.
