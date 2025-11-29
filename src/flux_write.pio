@@ -1,0 +1,62 @@
+; SPDX-License-Identifier: MIT
+; PIO program for writing flux transitions to floppy drive
+;
+; Input: 8-bit timing values from FIFO (time between flux transitions)
+; Output: Pulse write_data pin low briefly at each transition
+;
+; Clock: Run at 24MHz (same as read)
+;
+; Timing: The input value is the total time between transitions.
+; Overhead per pulse: pull(1) + out(1) + set(1) + set(1) + jmp(1) = 5 cycles
+; Plus 14 cycles of nop delay during pulse = 19 cycles total overhead
+; The wait loop runs X times, so actual delay = X + 19 cycles
+;
+; For MFM HD at 500kbps (values should be total time - will subtract overhead):
+;   2T (short)  = 2us  = 48 counts -> X = 48 - 19 = 29
+;   3T (medium) = 3us  = 72 counts -> X = 72 - 19 = 53
+;   4T (long)   = 4us  = 96 counts -> X = 96 - 19 = 77
+
+.program flux_write
+
+.wrap_target
+    pull block              ; 1 cycle - Get next timing value from FIFO
+    out x, 8                ; 1 cycle - Move 8 bits to X
+
+    set pins, 0             ; 1 cycle - Drive write pin LOW (flux transition)
+    nop [13]                ; 14 cycles - Hold low for ~580ns
+    set pins, 1             ; 1 cycle - Drive write pin HIGH
+
+wait_loop:
+    jmp x-- wait_loop       ; 1 cycle per iteration - wait for timing
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void flux_write_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_config c = flux_write_program_get_default_config(offset);
+
+    // Set the pin as SET pin
+    sm_config_set_set_pins(&c, pin, 1);
+
+    // Shift OSR to right, autopull at 8 bits
+    sm_config_set_out_shift(&c, true, true, 8);
+
+    // Join FIFOs for TX (more buffer space)
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    // 24MHz PIO clock
+    float div = (float)clock_get_hz(clk_sys) / 24000000.0f;
+    sm_config_set_clkdiv(&c, div);
+
+    // Initialize the pin
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);  // Output
+
+    // Start with pin high
+    pio_sm_set_pins_with_mask(pio, sm, 1u << pin, 1u << pin);
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+%}

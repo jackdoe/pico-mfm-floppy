@@ -1,0 +1,54 @@
+; SPDX-License-Identifier: MIT
+; PIO program for reading flux transitions from floppy drive
+;
+; Measures time between flux transitions (falling edges on read_data pin)
+; Output: 16-bit delta time since last transition
+; Two samples packed into each 32-bit FIFO word (lower 16 bits first)
+;
+; Clock: Run at 72MHz (3 * 24MHz) for 24MHz effective sampling
+;        Each loop iteration is 3 instructions = 1 sample period
+;
+; The counter counts DOWN from 0xFFFF (wraps at 15 bits for 16-bit output)
+
+.program flux_read
+
+.wrap_target
+wait_high:
+    jmp x-- wait_high_next    ; Decrement counter
+wait_high_next:
+    jmp pin wait_low          ; If pin high, go wait for low
+    jmp wait_high             ; Pin still low, keep waiting
+
+wait_low:
+    jmp x-- wait_low_next     ; Decrement counter
+wait_low_next:
+    jmp pin wait_low [1]      ; If pin still high, wait (extra delay for timing)
+    ; Falling edge detected - capture and reset
+    in pins, 1                ; what was the index pin at the time of the pulse
+    in x, 15                  ; Push counter value (time since last edge)
+    jmp x-- wait_high         ; Reset X to 0xFFFF (jmp x-- when x=0 wraps to 0xFFFF)
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void flux_read_program_init(PIO pio, uint sm, uint offset, uint pin, uint index_pin) {
+    pio_sm_config c = flux_read_program_get_default_config(offset);
+    sm_config_set_jmp_pin(&c, pin);
+    sm_config_set_in_pins(&c, index_pin);
+    sm_config_set_in_shift(&c, true, true, 32); // shift right, autopush
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    pio_sm_set_pins_with_mask(pio, sm, 1 << pin, 1 << pin);
+    // 3 instructions per loop, target 24MHz effective sample rate -> 72MHz PIO clock
+    float div = (float)clock_get_hz(clk_sys) / (3.0f * 24000000.0f);
+    // printf("Clock: %lu, Divider: %f\n", clock_get_hz(clk_sys), div);
+    sm_config_set_clkdiv(&c, div);
+
+    pio_gpio_init(pio, pin);
+    pio_gpio_init(pio, index_pin);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_exec(pio, sm, pio_encode_set(pio_x, 0));
+    pio_sm_exec(pio, sm, pio_encode_jmp(offset));  // Jump to start
+}
+
+%}
