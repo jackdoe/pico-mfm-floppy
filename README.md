@@ -336,16 +336,13 @@ FM (Frequency Modulation) was an early solution. Insert a clock bit (always 1) b
 ```
     FM Encoding Example: 0x3A = 0011 1010
     ═══════════════════════════════════════
-
-    Data bits:        0       0       1       1       1       0       1       0
-    Clock bits:         1       1       1       1       1       1       1       1
-    FM bitstream:     0   1   0   1   1   1   1   1   1   1   0   1   1   1   0   1
-
-    Flux transitions occur on every '1':
-
-                      0   1   0   1   1   1   1   1   1   1   0   1   1   1   0   1
-    Flux:         ────┐   ┌───┐   ┌───┬───┬───┬───┬───┐   ┌───┬───┐   ┌───────┐
-                      └───┘   └───┘                   └───┘                   └───────┘
+    Data bits:     0       0       1       1       1       0       1       0
+    Clock bits:      1       1       1       1       1       1       1       1
+                  ───────────────────────────────────────────────────────────
+    FM bitstream:  0 1     0 1     1 1     1 1     1 1     0 1     1 1     0 1
+                     ↑       ↑     ↑ ↑     ↑ ↑     ↑ ↑       ↑     ↑ ↑       ↑
+                     │       │     │ │     │ │     │ │       │     │ │       │
+    Flux pulses:     █       █     █ █     █ █     █ █       █     █ █       █
 ```
 
 FM doubles the bit rate (one clock bit per data bit), which halves storage capacity. MFM improves on this.
@@ -586,7 +583,7 @@ Once we see LMLM, we know:
     │                        │  │                       │    │    │
     │         ...            │  │         ...           │    │    │
     │                        │  │                       │    │    │
-    │    Track 79 ────────►  │  │  ┌─────────────────┐  │    │    │
+    │    Track 79 ───────────────► ┌─────────────────┐  │    │    │
     │                        │  │  │     (center)    │  │    │    │
     │                        │  │  └─────────────────┘  │    │    │
     │                        │  │                       │    │    │
