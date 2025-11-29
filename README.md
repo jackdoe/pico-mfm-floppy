@@ -89,9 +89,9 @@ A 3.5" HD (High Density) floppy disk stores **1.44 MB** of data:
 ```
                     Floppy Disk Cross-Section
 
-         Track 0 (outer edge)              Track 79 (inner)
-              │                                  │
-              ▼                                  ▼
+         Track 0 (outer edge)      
+              │                    
+              ▼                    
     ┌─────────────────────────────────────────────────┐
     │  ┌───────────────────────────────────────────┐  │
     │  │  ┌─────────────────────────────────────┐  │  │
@@ -225,7 +225,7 @@ The problem is the RC time constant. Parasitic capacitance from wiring (~10-20pF
 
          Expected signal        With weak pull-up
          ────────────────       ─────────────────
-              ┌─┐                    ╭──╮
+              ┌─┐                   ╭────╮
         HIGH ─┘ └─ HIGH         ────╯    ╰────
               │ │                        ↑
              100ns              Signal never fully recovers
@@ -345,7 +345,7 @@ FM (Frequency Modulation) was an early solution. Insert a clock bit (always 1) b
 
                       0   1   0   1   1   1   1   1   1   1   0   1   1   1   0   1
     Flux:         ────┐   ┌───┐   ┌───┬───┬───┬───┬───┐   ┌───┬───┐   ┌───────┐
-                     └───┘   └───┘               └───┘               └───────┘
+                      └───┘   └───┘                   └───┘                   └───────┘
 ```
 
 FM doubles the bit rate (one clock bit per data bit), which halves storage capacity. MFM improves on this.
@@ -397,13 +397,13 @@ MFM creates three distinct intervals between flux transitions:
     The interval between transitions determines the pattern:
 
     Short (2T):   "10"        ──┐ ┌──     2 bit-cells = ~2μs
-                               └─┘
+                                └─┘
 
     Medium (3T):  "100"       ──┐   ┌──   3 bit-cells = ~3μs
-                               └───┘
+                                └───┘
 
     Long (4T):    "1000"      ──┐     ┌── 4 bit-cells = ~4μs
-                               └─────┘
+                                └─────┘
 
     MFM guarantees: minimum 2T, maximum 4T between transitions.
     This is called a "run-length limited" code: RLL(1,3).
@@ -582,15 +582,15 @@ Once we see LMLM, we know:
     │                                                             │
     │    Track 0 ─────────►  ┌───────────────────────────────┐    │
     │                        │                               │    │
-    │    Track 1 ─────────►  │  ┌───────────────────────┐   │    │
-    │                        │  │                       │   │    │
-    │         ...            │  │         ...           │   │    │
-    │                        │  │                       │   │    │
-    │    Track 79 ────────►  │  │  ┌─────────────────┐  │   │    │
-    │                        │  │  │     (center)    │  │   │    │
-    │                        │  │  └─────────────────┘  │   │    │
-    │                        │  │                       │   │    │
-    │                        │  └───────────────────────┘   │    │
+    │    Track 1 ─────────►  │  ┌───────────────────────┐    │    │
+    │                        │  │                       │    │    │
+    │         ...            │  │         ...           │    │    │
+    │                        │  │                       │    │    │
+    │    Track 79 ────────►  │  │  ┌─────────────────┐  │    │    │
+    │                        │  │  │     (center)    │  │    │    │
+    │                        │  │  └─────────────────┘  │    │    │
+    │                        │  │                       │    │    │
+    │                        │  └───────────────────────┘    │    │
     │                        │                               │    │
     │                        └───────────────────────────────┘    │
     │                                                             │
@@ -946,7 +946,7 @@ The encoder converts data bytes to pulse timings:
 
     For each bit:
     ┌─────────────────────────────────────────────────────────────┐
-    │  clock_bit = (prev_bit == 0 && data_bit == 0) ? 1 : 0      │
+    │  clock_bit = (prev_bit == 0 && data_bit == 0) ? 1 : 0       │
     │                                                             │
     │  if (clock_bit == 1):                                       │
     │      emit_pulse(pending_cells)   // Transition on clock     │
@@ -1124,10 +1124,10 @@ Standard PC floppy format:
 
     FAT12 uses 12 bits per cluster entry, packed into bytes:
 
-    Cluster:    0         1         2         3
-    Bits:    [11:0]    [11:0]    [11:0]    [11:0]
-              │          │          │          │
-              ▼          ▼          ▼          ▼
+    Cluster:     0       1       2        3
+    Bits:     [11:0]  [11:0]  [11:0]   [11:0]
+               │        │        │        │
+               ▼        ▼        ▼        ▼
     Bytes:  [  AB  ] [  CD  ] [  EF  ] [  GH  ] [  IJ  ] [  KL  ]
             └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────┘
 
@@ -1222,10 +1222,10 @@ f12_closedir(&dir);
     │  Most Recently Used                    Least Recently Used  │
     │        │                                        │           │
     │        ▼                                        ▼           │
-    │    ┌──────┐   ┌──────┐   ┌──────┐         ┌──────┐         │
-    │    │ C0H0 │◄─►│ C0H0 │◄─►│ C0H1 │◄─► ... ◄─►│ C1H0 │        │
-    │    │ S1   │   │ S2   │   │ S1   │         │ S5   │        │
-    │    └──────┘   └──────┘   └──────┘         └──────┘         │
+    │    ┌──────┐   ┌──────┐   ┌──────┐         ┌──────┐          │
+    │    │ C0H0 │◄─►│ C0H0 │◄─►│ C0H1 │◄─► . ◄─►│ C1H0 │          │
+    │    │ S1   │   │ S2   │   │ S1   │         │ S5   │          │
+    │    └──────┘   └──────┘   └──────┘         └──────┘          │
     │                                              ▲              │
     │                                              │              │
     │                                    Evicted when cache full  │
