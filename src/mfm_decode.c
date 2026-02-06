@@ -4,10 +4,10 @@
 #include <stdio.h>
 
 static int mfm_classify(mfm_t *m, uint16_t delta) {
-  if (delta < 35) return -1;
-  if (delta <= m->T2_max) return 0;
-  if (delta <= m->T3_max) return 1;
-  if (delta < 120) return 2;
+  if (delta < MFM_PULSE_FLOOR) return -1;
+  if (delta <= m->T2_max) return MFM_SHORT;
+  if (delta <= m->T3_max) return MFM_MEDIUM;
+  if (delta < MFM_PULSE_CEILING) return MFM_LONG;
   return -1;
 }
 
@@ -49,7 +49,7 @@ bool mfm_feed(mfm_t *m, uint16_t delta, sector_t *out) {
 
   switch (m->state) {
     case MFM_HUNT:
-      if (p == 0) {
+      if (p == MFM_SHORT) {
         m->short_count++;
         m->preamble_sum += delta;
       } else {
@@ -59,7 +59,7 @@ bool mfm_feed(mfm_t *m, uint16_t delta, sector_t *out) {
           m->T3_max = t_cell * 7 / 4;
           m->state = MFM_SYNCING;
           m->sync_stage = 0;
-          if (p == 1) {
+          if (p == MFM_MEDIUM) {
             m->sync_stage = 1;
           } else {
             m->state = MFM_HUNT;
@@ -87,22 +87,22 @@ bool mfm_feed(mfm_t *m, uint16_t delta, sector_t *out) {
           m->crc = crc16_update(m->crc, 0xA1);
         }
       } else {
-        if (p == 0) m->short_count = 1;
+        if (p == MFM_SHORT) m->short_count = 1;
         m->state = MFM_HUNT;
       }
       break;
 
     case MFM_DATA:
       switch (p) {
-        case 0:
+        case MFM_SHORT:
           mfm_push_bit(m, 1);
           break;
-        case 1:
+        case MFM_MEDIUM:
           mfm_push_bit(m, 0);
           mfm_push_bit(m, 0);
           m->state = MFM_CLOCK;
           break;
-        case 2:
+        case MFM_LONG:
           mfm_push_bit(m, 0);
           mfm_push_bit(m, 1);
           break;
@@ -111,14 +111,14 @@ bool mfm_feed(mfm_t *m, uint16_t delta, sector_t *out) {
 
     case MFM_CLOCK:
       switch (p) {
-        case 0:
+        case MFM_SHORT:
           mfm_push_bit(m, 0);
           break;
-        case 1:
+        case MFM_MEDIUM:
           mfm_push_bit(m, 1);
           m->state = MFM_DATA;
           break;
-        case 2:
+        case MFM_LONG:
           mfm_reset(m);
           return false;
       }
@@ -130,9 +130,9 @@ bool mfm_feed(mfm_t *m, uint16_t delta, sector_t *out) {
 check_record:
   if (m->buf_pos == 1 && m->bytes_expected == 0) {
     uint8_t mark = m->buf[0];
-    if (mark == 0xFE) {
+    if (mark == MFM_ADDR_MARK) {
       m->bytes_expected = 7;
-    } else if (mark == 0xFB || mark == 0xFA) {
+    } else if (mark == MFM_DATA_MARK || mark == MFM_DELETED_MARK) {
       if (m->have_pending_addr) {
         m->bytes_expected = 1 + (128 << m->pending_size_code) + 2;
       } else {
@@ -148,7 +148,7 @@ check_record:
     uint8_t mark = m->buf[0];
     bool crc_ok = (m->crc == 0);
 
-    if (mark == 0xFE) {
+    if (mark == MFM_ADDR_MARK) {
       if (crc_ok) {
         m->pending_track = m->buf[1];
         m->pending_side = m->buf[2];
@@ -161,7 +161,7 @@ check_record:
         m->have_pending_addr = false;
       }
       mfm_reset(m);
-    } else if ((mark == 0xFB || mark == 0xFA) && m->have_pending_addr) {
+    } else if ((mark == MFM_DATA_MARK || mark == MFM_DELETED_MARK) && m->have_pending_addr) {
       uint16_t size = 128 << m->pending_size_code;
       out->track = m->pending_track;
       out->side = m->pending_side;

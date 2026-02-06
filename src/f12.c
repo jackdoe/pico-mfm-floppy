@@ -19,6 +19,7 @@ static f12_err_t f12_check_disk(f12_t *fs) {
     for (int i = 0; i < F12_MAX_OPEN_FILES; i++) {
       fs->files[i].mode = F12_MODE_CLOSED;
     }
+    fs->fat.batch_in_use = false;
 
     fs->mounted = false;
     return f12_set_error(fs, F12_ERR_DISK_CHANGED);

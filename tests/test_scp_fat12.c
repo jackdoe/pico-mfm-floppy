@@ -336,7 +336,6 @@ int main(int argc, char *argv[]) {
     scp_disk_init(&scp_disk, scp_file, scp_size);
 
     printf("=== SCP+FAT12 End-to-End Tests ===\n");
-    printf("Source: System Shock Disk 1 (Greaseweazle v0.37 capture)\n");
     printf("File: %s (%.1f MB)\n\n", scp_path, scp_size / 1048576.0);
 
     printf("--- Raw Decode ---\n");

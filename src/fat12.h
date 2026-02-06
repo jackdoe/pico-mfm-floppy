@@ -96,7 +96,21 @@ typedef struct {
 #define FAT12_ATTR_ARCHIVE    0x20
 #define FAT12_ATTR_LFN        0x0F
 
+#define FAT12_DIRENT_FREE     0xE5
+#define FAT12_DIRENT_END      0x00
+
+#define FAT12_WRITE_BATCH_MAX 36
+
+typedef struct fat12 fat12_t;
+
 typedef struct {
+  fat12_t *fat;
+  uint16_t lbas[FAT12_WRITE_BATCH_MAX];
+  uint8_t data[FAT12_WRITE_BATCH_MAX][SECTOR_SIZE];
+  uint8_t count;
+} fat12_write_batch_t;
+
+struct fat12 {
   fat12_io_t io;
   fat12_bpb_t bpb;
 
@@ -107,7 +121,10 @@ typedef struct {
   uint16_t total_clusters;
 
   sector_t sector_buf;
-} fat12_t;
+
+  fat12_write_batch_t batch;
+  bool batch_in_use;
+};
 
 typedef enum {
   FAT12_OK = 0,
@@ -119,15 +136,6 @@ typedef enum {
   FAT12_ERR_FULL,
 } fat12_err_t;
 
-#define FAT12_WRITE_BATCH_MAX 36
-
-typedef struct {
-  fat12_t *fat;
-  uint16_t lbas[FAT12_WRITE_BATCH_MAX];
-  uint8_t data[FAT12_WRITE_BATCH_MAX][SECTOR_SIZE];
-  uint8_t count;
-} fat12_write_batch_t;
-
 typedef struct {
   fat12_t *fat;
   uint16_t current_cluster;
@@ -137,7 +145,7 @@ typedef struct {
 
 typedef struct {
   fat12_t *fat;
-  fat12_write_batch_t batch;
+  fat12_write_batch_t *batch;
   uint16_t dirent_index;
   fat12_dirent_t dirent;
   uint16_t first_cluster;

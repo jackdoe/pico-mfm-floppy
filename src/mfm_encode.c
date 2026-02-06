@@ -78,13 +78,13 @@ void mfm_encode_sync(mfm_encode_t *e) {
 
 void mfm_encode_gap(mfm_encode_t *e, size_t count) {
     for (size_t i = 0; i < count; i++) {
-        uint8_t gap = 0x4E;
+        uint8_t gap = MFM_GAP_BYTE;
         mfm_encode_bytes(e, &gap, 1);
     }
 }
 
 void mfm_encode_sector(mfm_encode_t *e, const sector_t *s) {
-    uint8_t addr[5] = {0xFE, s->track, s->side, s->sector_n, 0x02};
+    uint8_t addr[5] = {MFM_ADDR_MARK, s->track, s->side, s->sector_n, 0x02};
     uint16_t addr_crc = crc16_mfm(addr, 5);
 
     mfm_encode_sync(e);
@@ -94,7 +94,7 @@ void mfm_encode_sector(mfm_encode_t *e, const sector_t *s) {
 
     mfm_encode_gap(e, 22);
 
-    uint8_t data_mark = 0xFB;
+    uint8_t data_mark = MFM_DATA_MARK;
     uint16_t data_crc = 0xFFFF;
     data_crc = crc16_update(data_crc, 0xA1);
     data_crc = crc16_update(data_crc, 0xA1);
@@ -111,7 +111,7 @@ void mfm_encode_sector(mfm_encode_t *e, const sector_t *s) {
     mfm_encode_bytes(e, data_crc_bytes, 2);
 }
 
-void mfm_encode_precomp(uint8_t *buf, size_t len) {
+static void mfm_encode_precomp(uint8_t *buf, size_t len) {
     if (len < 3) return;
     for (size_t i = 1; i < len - 1; i++) {
         if (buf[i] != MFM_PULSE_SHORT) continue;

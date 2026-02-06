@@ -9,7 +9,7 @@
 #include "lru.h"
 
 #define F12_MAX_OPEN_FILES 10
-#define F12_CACHE_SIZE 36
+#define F12_CACHE_SIZE 54
 
 typedef enum {
   F12_OK = 0,

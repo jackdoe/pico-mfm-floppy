@@ -3,10 +3,13 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "floppy.h"
+#include "mfm_encode.h"
 
 #define MFM_MIN_PREAMBLE 60
+#define MFM_PULSE_FLOOR 35
+#define MFM_PULSE_CEILING 120
 
+typedef enum { MFM_SHORT = 0, MFM_MEDIUM = 1, MFM_LONG = 2 } mfm_pulse_t;
 typedef enum { MFM_HUNT, MFM_SYNCING, MFM_DATA, MFM_CLOCK } mfm_state_t;
 
 typedef struct {

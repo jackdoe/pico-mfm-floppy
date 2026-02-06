@@ -11,6 +11,11 @@
 #define MFM_PULSE_MEDIUM (72 - MFM_PIO_OVERHEAD)
 #define MFM_PULSE_LONG   (96 - MFM_PIO_OVERHEAD)
 
+#define MFM_GAP_BYTE 0x4E
+#define MFM_ADDR_MARK 0xFE
+#define MFM_DATA_MARK 0xFB
+#define MFM_DELETED_MARK 0xFA
+
 #define MFM_PRECOMP_SHIFT 3
 #define MFM_PRECOMP_START_TRACK 40
 
@@ -22,8 +27,6 @@ typedef struct {
     int pending_cells;
     bool overflow;
 } mfm_encode_t;
-
-void mfm_encode_precomp(uint8_t *buf, size_t len);
 
 void mfm_encode_init(mfm_encode_t *e, uint8_t *buf, size_t size);
 

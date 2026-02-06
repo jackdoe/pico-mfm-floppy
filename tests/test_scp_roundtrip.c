@@ -1,3 +1,4 @@
+#include <time.h>
 #include "test.h"
 #include "scp_disk.h"
 #include "vdisk.h"
@@ -824,10 +825,237 @@ TEST(test_format_fill_delete_refill_roundtrip) {
     f12_unmount(&fs);
 }
 
+static uint32_t fuzz_seed;
+
+static uint32_t fuzz_rand(void) {
+    fuzz_seed = fuzz_seed * 1103515245 + 12345;
+    return (fuzz_seed >> 16) & 0x7FFF;
+}
+
+static void fuzz_rand_name(char *out) {
+    int name_len = 1 + fuzz_rand() % 8;
+    int ext_len = fuzz_rand() % 4;
+    for (int i = 0; i < name_len; i++) {
+        out[i] = 'A' + fuzz_rand() % 26;
+    }
+    if (ext_len > 0) {
+        out[name_len] = '.';
+        for (int i = 0; i < ext_len; i++) {
+            out[name_len + 1 + i] = 'A' + fuzz_rand() % 26;
+        }
+        out[name_len + 1 + ext_len] = '\0';
+    } else {
+        out[name_len] = '\0';
+    }
+}
+
+static void decode_image_from_scp_buf(uint8_t *scp_data, size_t scp_size,
+                                       uint8_t image[2880][512]) {
+    flux_sim_t sim;
+    flux_sim_open_scp(&sim, scp_data, scp_size);
+    for (int track = 0; track < 80; track++) {
+        for (int side = 0; side < 2; side++) {
+            if (!flux_sim_seek(&sim, track, side, 0)) continue;
+            mfm_t mfm;
+            mfm_init(&mfm);
+            sector_t out;
+            uint16_t delta;
+            while (flux_sim_next(&sim, &delta)) {
+                if (mfm_feed(&mfm, delta, &out)) {
+                    if (out.valid && out.track == track && out.side == side &&
+                        out.sector_n >= 1 && out.sector_n <= SECTORS_PER_TRACK) {
+                        int lba = (track * 2 + side) * SECTORS_PER_TRACK + (out.sector_n - 1);
+                        memcpy(image[lba], out.data, 512);
+                    }
+                }
+            }
+        }
+    }
+    flux_sim_close(&sim);
+}
+
+TEST(test_fuzz_roundtrip) {
+    int iterations = 100;
+    uint8_t *wbuf = malloc(65536);
+
+    printf("\n  Seed: %u\n", fuzz_seed);
+    printf("  Iterations: %d\n\n", iterations);
+
+    int total_files_created = 0;
+    int total_files_deleted = 0;
+    int total_files_verified = 0;
+    int total_roundtrips = 0;
+
+    for (int iter = 0; iter < iterations; iter++) {
+        vdisk_init(&shared_vdisk);
+        f12_t fs;
+        memset(&fs, 0, sizeof(fs));
+        fs.io = make_vdisk_io(&shared_vdisk);
+        f12_format(&fs, "FUZZ", false);
+        f12_mount(&fs, make_vdisk_io(&shared_vdisk));
+
+        file_manifest_t manifest[MAX_MANIFEST];
+        int mc = 0;
+
+        int num_ops = 5 + fuzz_rand() % 40;
+        for (int op = 0; op < num_ops && mc < MAX_MANIFEST - 1; op++) {
+            int action = fuzz_rand() % 10;
+
+            if (action < 6 || mc == 0) {
+                char name[13];
+                fuzz_rand_name(name);
+
+                uint32_t sz = fuzz_rand() % 50000;
+
+                f12_file_t *f = f12_open(&fs, name, "w");
+                if (!f) continue;
+
+                uint32_t written = 0;
+                while (written < sz) {
+                    uint32_t chunk = sz - written;
+                    if (chunk > 512) chunk = 512;
+                    for (uint32_t j = 0; j < chunk; j++)
+                        wbuf[j] = gen_pattern_byte(iter * 1000 + op, written + j);
+                    int n = f12_write(f, wbuf, chunk);
+                    if (n <= 0) break;
+                    written += n;
+                }
+                f12_close(f);
+
+                if (written == 0 && sz > 0) continue;
+
+                bool replaced = false;
+                for (int m = 0; m < mc; m++) {
+                    if (strcmp(manifest[m].name, name) == 0) {
+                        manifest[m].size = written;
+                        uint32_t ck = 0;
+                        for (uint32_t j = 0; j < written; j++)
+                            ck = (ck << 5) + ck + gen_pattern_byte(iter * 1000 + op, j);
+                        manifest[m].checksum = ck;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced) {
+                    memset(manifest[mc].name, 0, 13);
+                    strncpy(manifest[mc].name, name, 12);
+                    manifest[mc].size = written;
+                    uint32_t ck = 0;
+                    for (uint32_t j = 0; j < written; j++)
+                        ck = (ck << 5) + ck + gen_pattern_byte(iter * 1000 + op, j);
+                    manifest[mc].checksum = ck;
+                    mc++;
+                }
+                total_files_created++;
+
+            } else if (action < 9 && mc > 0) {
+                int victim = fuzz_rand() % mc;
+                f12_err_t err = f12_delete(&fs, manifest[victim].name);
+                if (err == F12_OK) {
+                    manifest[victim] = manifest[mc - 1];
+                    mc--;
+                    total_files_deleted++;
+                }
+            }
+        }
+
+        f12_unmount(&fs);
+        vdisk_to_image(&shared_vdisk, disk_modified);
+
+        size_t scp_size;
+        uint8_t *scp_data = scp_encode_disk(disk_modified, &scp_size);
+        if (!scp_data) {
+            printf("  iter %d: encode failed!\n", iter);
+            exit(1);
+        }
+
+        decode_image_from_scp_buf(scp_data, scp_size, disk_roundtrip);
+        free(scp_data);
+
+        for (int i = 0; i < 2880; i++) {
+            if (memcmp(disk_modified[i], disk_roundtrip[i], 512) != 0) {
+                printf("  iter %d: sector %d mismatch after roundtrip!\n", iter, i);
+                exit(1);
+            }
+        }
+
+        image_to_vdisk(disk_roundtrip, &shared_vdisk);
+        memset(&fs, 0, sizeof(fs));
+        if (f12_mount(&fs, make_vdisk_io(&shared_vdisk)) != F12_OK) {
+            printf("  iter %d: mount failed after roundtrip!\n", iter);
+            exit(1);
+        }
+
+        for (int m = 0; m < mc; m++) {
+            f12_stat_t stat;
+            if (f12_stat(&fs, manifest[m].name, &stat) != F12_OK) {
+                printf("  iter %d: file '%s' missing after roundtrip!\n",
+                       iter, manifest[m].name);
+                exit(1);
+            }
+
+            if (stat.size != manifest[m].size) {
+                printf("  iter %d: file '%s' size %u != expected %u\n",
+                       iter, manifest[m].name, stat.size, manifest[m].size);
+                exit(1);
+            }
+
+            if (manifest[m].size > 0) {
+                f12_file_t *f = f12_open(&fs, manifest[m].name, "r");
+                if (!f) {
+                    printf("  iter %d: can't open '%s' for read!\n", iter, manifest[m].name);
+                    exit(1);
+                }
+                uint32_t t = f12_read_full(f, wbuf, manifest[m].size);
+                f12_close(f);
+
+                if (t != manifest[m].size) {
+                    printf("  iter %d: file '%s' read %u != size %u\n",
+                           iter, manifest[m].name, t, manifest[m].size);
+                    exit(1);
+                }
+
+                if (checksum_buf(wbuf, t) != manifest[m].checksum) {
+                    printf("  iter %d: file '%s' checksum mismatch!\n",
+                           iter, manifest[m].name);
+                    exit(1);
+                }
+            }
+            total_files_verified++;
+        }
+
+        f12_unmount(&fs);
+        total_roundtrips++;
+
+        if ((iter + 1) % 100 == 0) {
+            printf("  [%d/%d] roundtrips OK, %d created, %d deleted, %d verified\n",
+                   iter + 1, iterations,
+                   total_files_created, total_files_deleted, total_files_verified);
+        }
+    }
+
+    printf("\n  === Fuzz Summary ===\n");
+    printf("  Roundtrips:      %d\n", total_roundtrips);
+    printf("  Files created:   %d\n", total_files_created);
+    printf("  Files deleted:   %d\n", total_files_deleted);
+    printf("  Files verified:  %d\n", total_files_verified);
+    printf("  Seed: %u\n  ", fuzz_seed);
+
+    free(wbuf);
+    ASSERT_EQ(total_roundtrips, iterations);
+}
+
 int main(int argc, char *argv[]) {
     const char *scp_path = SCP_PATH;
     if (argc > 1) scp_path = argv[1];
     (void)scp_path;
+
+    fuzz_seed = (uint32_t)time(NULL);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            fuzz_seed = (uint32_t)atoi(argv[++i]);
+        }
+    }
 
     printf("=== SCP Full Roundtrip: decode -> f12 modify -> encode -> decode -> f12 verify ===\n\n");
 
@@ -851,6 +1079,9 @@ int main(int argc, char *argv[]) {
 
     printf("\n--- Phase 7: Format + Fill + Delete + Refill ---\n");
     RUN_TEST(test_format_fill_delete_refill_roundtrip);
+
+    printf("\n--- Phase 8: Fuzz Roundtrip (100 iterations) ---\n");
+    RUN_TEST(test_fuzz_roundtrip);
 
     TEST_RESULTS();
 }
