@@ -48,3 +48,12 @@ add_test(NAME test_scp_fat12 COMMAND test_scp_fat12)
 add_executable(test_scp_roundtrip test_scp_roundtrip.c flux_sim.c ${SRCS})
 target_include_directories(test_scp_roundtrip PRIVATE ${STUBS} ${SRCDIR})
 add_test(NAME test_scp_roundtrip COMMAND test_scp_roundtrip)
+
+add_executable(test_pio_sim test_pio_sim.c pio_sim.c flux_sim.c ${SRCS} ${SRCDIR}/floppy.c)
+target_include_directories(test_pio_sim PRIVATE ${STUBS} ${SRCDIR})
+target_compile_definitions(test_pio_sim PRIVATE FLOPPY_DEBUG=0)
+add_test(NAME test_pio_sim COMMAND test_pio_sim)
+
+add_executable(test_pio_emu test_pio_emu.c pio_emu.c flux_sim.c ${SRCS})
+target_include_directories(test_pio_emu PRIVATE ${STUBS} ${SRCDIR})
+add_test(NAME test_pio_emu COMMAND test_pio_emu)
