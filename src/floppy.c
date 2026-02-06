@@ -11,7 +11,6 @@
 #include "flux_read.pio.h"
 #include "flux_write.pio.h"
 
-// Debug levels: 0=none, 1=errors, 2=warnings, 3=verbose
 #define FLOPPY_DEBUG 1
 
 #if FLOPPY_DEBUG >= 1
@@ -32,56 +31,48 @@
 #define FLOPPY_DBG(fmt, ...)
 #endif
 
-// ============== Constants ==============
 #define DIR_INWARD 1
 #define DIR_OUTWARD 2
-#define IDLE_CHECK_INTERVAL_MS 1000  // Check idle every 1 second
+#define IDLE_CHECK_INTERVAL_MS 1000
 
-// ============== Internal Helpers ==============
-
-static void gpio_put_oc(uint pin, bool value);  // Forward declare
-
-// ============== Idle Timer Callback ==============
+static void gpio_put_oc(uint pin, bool value);
 
 static bool floppy_idle_timer_callback(struct repeating_timer *t) {
   floppy_t *f = (floppy_t *)t->user_data;
 
-  // Skip if motor already off
   if (!f->motor_on) {
     return true;
   }
 
-  // Check if idle timeout has elapsed
   uint32_t now = to_ms_since_boot(get_absolute_time());
   if (now - f->last_io_time_ms >= FLOPPY_IDLE_TIMEOUT_MS) {
-    gpio_put_oc(f->pins.motor_enable, 1);  // Motor off
+    uint32_t saved = save_and_disable_interrupts();
+    gpio_put_oc(f->pins.motor_enable, 1);
     f->motor_on = false;
-    gpio_put_oc(f->pins.drive_select, 1);  // Deselect
+    gpio_put_oc(f->pins.drive_select, 1);
     f->selected = false;
+    restore_interrupts(saved);
   }
 
   return true;
 }
 
-// ============== Auto Motor Helper ==============
-
-// Called before any operation that needs the drive
 static void floppy_prepare(floppy_t *f) {
   if (!f->auto_motor) return;
 
+  uint32_t saved = save_and_disable_interrupts();
   f->last_io_time_ms = to_ms_since_boot(get_absolute_time());
+  restore_interrupts(saved);
   floppy_select(f, true);
   floppy_motor_on(f);
 }
 
-// ============== GPIO Helpers ==============
-
 static void gpio_put_oc(uint pin, bool value) {
   if (value == 0) {
     gpio_put(pin, 0);
-    gpio_set_dir(pin, GPIO_OUT);  // Drive low
+    gpio_set_dir(pin, GPIO_OUT);
   } else {
-    gpio_set_dir(pin, GPIO_IN);   // High-Z (pulled high by drive)
+    gpio_set_dir(pin, GPIO_IN);
   }
 }
 
@@ -130,23 +121,21 @@ static void floppy_flux_write_start(floppy_t *f) {
 }
 
 static void floppy_flux_write_stop(floppy_t *f) {
-  // Drain FIFO
   while (!pio_sm_is_tx_fifo_empty(f->write.pio, f->write.sm)) {
     tight_loop_contents();
   }
-  // Wait for last pulse
   sleep_us(100);
   gpio_put_oc(f->pins.write_gate, 1);
   pio_sm_set_enabled(f->write.pio, f->write.sm, false);
 }
 
 static void floppy_wait_for_index(floppy_t *f) {
-  while (!gpio_get(f->pins.index)) tight_loop_contents();  // Wait for high (not at index)
-  while (gpio_get(f->pins.index)) tight_loop_contents();   // Wait for falling edge (index starts)
+  while (!gpio_get(f->pins.index)) tight_loop_contents();
+  while (gpio_get(f->pins.index)) tight_loop_contents();
 }
 
 static void floppy_side_select(floppy_t *f, uint8_t side) {
-  gpio_put_oc(f->pins.side_select, side == 0 ? 1 : 0);  // Side 0 = High, Side 1 = Low
+  gpio_put_oc(f->pins.side_select, side == 0 ? 1 : 0);
 }
 
 static void floppy_step(floppy_t *f, int direction) {
@@ -179,22 +168,13 @@ static floppy_status_t floppy_seek_track0(floppy_t *f) {
   return FLOPPY_ERR_NO_TRACK0;
 }
 #define FLOPPY_READ_TRACK_ATTEMPTS 20
-// Read track, only filling sectors that are not already valid
-static floppy_status_t floppy_complete_track(floppy_t *f, track_t *t) {
-  // Check if track is already complete - skip read entirely
-  bool complete = true;
-  for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-    if (!t->sectors[i].valid) {
-      complete = false;
-      break;
-    }
-  }
-  if (complete) {
-    return FLOPPY_OK;
-  }
 
-  floppy_seek(f, t->track);
-  floppy_side_select(f, t->side);
+typedef bool (*sector_callback_t)(sector_t *sector, void *ctx);
+
+static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
+                                        sector_callback_t cb, void *ctx) {
+  floppy_seek(f, track);
+  floppy_side_select(f, side);
   floppy_flux_read_start(f);
 
   mfm_t mfm;
@@ -204,8 +184,8 @@ static floppy_status_t floppy_complete_track(floppy_t *f, track_t *t) {
 
   uint16_t prev = flux_read_wait(f) >> 1;
   bool ix_prev = false;
-
   floppy_status_t res = FLOPPY_ERR_TIMEOUT;
+
   for (int ix_edges = 0; ix_edges < FLOPPY_READ_TRACK_ATTEMPTS * 2;) {
     uint16_t value = flux_read_wait(f);
     uint8_t ix = value & 1;
@@ -213,47 +193,61 @@ static floppy_status_t floppy_complete_track(floppy_t *f, track_t *t) {
     int delta = prev - cnt;
     if (delta < 0) delta += 0x8000;
 
-    if (ix != ix_prev) ix_edges++;  // Index pin status changed
+    if (ix != ix_prev) ix_edges++;
     ix_prev = ix;
 
     if (mfm_feed(&mfm, delta, &sector)) {
       if (sector.valid && sector.sector_n >= 1 && sector.sector_n <= SECTORS_PER_TRACK) {
-        if (sector.track != t->track) {
-          FLOPPY_ERR("[floppy] wrong track: expected %d, got %d\n", t->track, sector.track);
+        if (sector.track != track) {
+          FLOPPY_ERR("[floppy] wrong track: expected %d, got %d\n", track, sector.track);
           res = FLOPPY_ERR_WRONG_TRACK;
           break;
         }
-
-        if (sector.side != t->side) {
-          FLOPPY_ERR("[floppy] wrong side: expected %d, got %d\n", t->side, sector.side);
+        if (sector.side != side) {
+          FLOPPY_ERR("[floppy] wrong side: expected %d, got %d\n", side, sector.side);
           res = FLOPPY_ERR_WRONG_SIDE;
           break;
         }
-
-        // Only update missing sectors
-        if (!t->sectors[sector.sector_n - 1].valid) {
-          t->sectors[sector.sector_n - 1] = sector;
-        }
-
-        // Check if we have all sectors
-        bool complete = true;
-        for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-          if (!t->sectors[i].valid) {
-            complete = false;
-            break;
-          }
-        }
-        if (complete) {
+        if (cb(&sector, ctx)) {
           res = FLOPPY_OK;
           break;
         }
       }
     }
-
     prev = cnt;
   }
 
   floppy_flux_read_stop(f);
+  return res;
+}
+
+struct complete_track_ctx {
+  track_t *t;
+};
+
+static bool complete_track_cb(sector_t *sector, void *ctx) {
+  struct complete_track_ctx *c = (struct complete_track_ctx *)ctx;
+  track_t *t = c->t;
+
+  if (!t->sectors[sector->sector_n - 1].valid) {
+    t->sectors[sector->sector_n - 1] = *sector;
+  }
+
+  for (int i = 0; i < SECTORS_PER_TRACK; i++) {
+    if (!t->sectors[i].valid) return false;
+  }
+  return true;
+}
+
+static floppy_status_t floppy_complete_track(floppy_t *f, track_t *t) {
+  for (int i = 0; i < SECTORS_PER_TRACK; i++) {
+    if (!t->sectors[i].valid) goto need_read;
+  }
+  return FLOPPY_OK;
+
+need_read:;
+  struct complete_track_ctx ctx = { .t = t };
+  floppy_status_t res = floppy_read_flux(f, t->track, t->side, complete_track_cb, &ctx);
 
   if (res == FLOPPY_ERR_TIMEOUT) {
     FLOPPY_ERR("[floppy] timeout reading track %d side %d, missing sectors:", t->track, t->side);
@@ -262,72 +256,34 @@ static floppy_status_t floppy_complete_track(floppy_t *f, track_t *t) {
     }
     FLOPPY_ERR("\n");
   }
-
   return res;
 }
 
-// Internal read that returns status
-static floppy_status_t floppy_read_internal(floppy_t *f, int track, int side, int sector_n, sector_t *out) {
-  floppy_seek(f, track);
-  floppy_side_select(f, side);
+struct read_sector_ctx {
+  int sector_n;
+  sector_t *out;
+};
 
-  mfm_t mfm;
-  sector_t sector = {0};
-  mfm_init(&mfm);
-  mfm_reset(&mfm);
-
-  floppy_flux_read_start(f);
-
-  uint16_t prev = flux_read_wait(f) >> 1;
-  bool ix_prev = false;
-
-  floppy_status_t ret = FLOPPY_ERR_TIMEOUT;
-  // Try to read 4-5 revolutions (count each edge, so FLOPPY_READ_TRACK_ATTEMPTS *2)
-  for (int ix_edges = 0; ix_edges < FLOPPY_READ_TRACK_ATTEMPTS * 2;) {
-    uint16_t value = flux_read_wait(f);
-    uint8_t ix = value & 1;
-    uint16_t cnt = value >> 1;
-    int delta = prev - cnt;
-    if (delta < 0) delta += 0x8000;
-
-    if (ix != ix_prev) ix_edges++;  // Index pin status changed
-    ix_prev = ix;
-
-    if (mfm_feed(&mfm, delta, &sector)) {
-      if (sector.valid && sector.sector_n >= 1 && sector.sector_n <= SECTORS_PER_TRACK) {
-        if (sector.track != track) {
-          FLOPPY_ERR("[floppy] read sector: wrong track, expected %d got %d\n", track, sector.track);
-          ret = FLOPPY_ERR_WRONG_TRACK;
-          break;
-        }
-        if (sector.side != side) {
-          FLOPPY_ERR("[floppy] read sector: wrong side, expected %d got %d\n", side, sector.side);
-          ret = FLOPPY_ERR_WRONG_SIDE;
-          break;
-        }
-        if (sector.sector_n == sector_n) {
-          *out = sector;
-          ret = FLOPPY_OK;
-          break;
-        }
-      }
-    }
-    prev = cnt;
+static bool read_sector_cb(sector_t *sector, void *ctx) {
+  struct read_sector_ctx *c = (struct read_sector_ctx *)ctx;
+  if (sector->sector_n == c->sector_n) {
+    *c->out = *sector;
+    return true;
   }
-
-  floppy_flux_read_stop(f);
-
-  if (ret == FLOPPY_ERR_TIMEOUT) {
-    FLOPPY_ERR("[floppy] timeout reading track %d side %d sector %d\n", track, side, sector_n);
-  }
-
-  return ret;
+  return false;
 }
 
-// ============== Public API ==============
+static floppy_status_t floppy_read_internal(floppy_t *f, int track, int side, int sector_n, sector_t *out) {
+  struct read_sector_ctx ctx = { .sector_n = sector_n, .out = out };
+  floppy_status_t res = floppy_read_flux(f, track, side, read_sector_cb, &ctx);
+
+  if (res == FLOPPY_ERR_TIMEOUT) {
+    FLOPPY_ERR("[floppy] timeout reading track %d side %d sector %d\n", track, side, sector_n);
+  }
+  return res;
+}
 
 void floppy_init(floppy_t *f) {
-  // Initialize input pins
   uint inputs[] = {f->pins.index, f->pins.track0, f->pins.write_protect,
                    f->pins.read_data, f->pins.disk_change};
   for (int i = 0; i < 5; i++) {
@@ -336,17 +292,15 @@ void floppy_init(floppy_t *f) {
     gpio_pull_up(inputs[i]);
   }
 
-  // Initialize output pins (active low, start as high-Z)
   uint outputs[] = {f->pins.drive_select, f->pins.motor_enable, f->pins.direction,
                     f->pins.step, f->pins.write_data, f->pins.write_gate,
                     f->pins.side_select, f->pins.density};
   for (int i = 0; i < 8; i++) {
     gpio_init(outputs[i]);
     gpio_put(outputs[i], 0);
-    gpio_set_dir(outputs[i], GPIO_IN);  // Start as high-Z
+    gpio_set_dir(outputs[i], GPIO_IN);
   }
 
-  // Initialize read PIO
   f->read.pio = pio0;
   f->read.offset = pio_add_program(f->read.pio, &flux_read_program);
   f->read.sm = pio_claim_unused_sm(f->read.pio, true);
@@ -358,43 +312,40 @@ void floppy_init(floppy_t *f) {
   pio_sm_restart(f->read.pio, f->read.sm);
   pio_sm_set_enabled(f->read.pio, f->read.sm, false);
 
-  // Initialize write PIO
   f->write.pio = pio1;
   f->write.offset = pio_add_program(f->write.pio, &flux_write_program);
   f->write.sm = pio_claim_unused_sm(f->write.pio, true);
   f->write.half = 0;
   flux_write_program_init(f->write.pio, f->write.sm, f->write.offset, f->pins.write_data);
 
-  // Initialize state
   f->track = 0;
   f->track0_confirmed = false;
   f->disk_change_flag = false;
   f->motor_on = false;
   f->selected = false;
-  f->auto_motor = true;  // Enable auto motor management by default
+  f->auto_motor = true;
   f->last_io_time_ms = 0;
 
-  // Start idle timer for auto motor management
   add_repeating_timer_ms(IDLE_CHECK_INTERVAL_MS, floppy_idle_timer_callback, f, &f->idle_timer);
 }
 
 void floppy_select(floppy_t *f, bool on) {
-  if (f->selected == on) return;  // No change needed
+  if (f->selected == on) return;
   gpio_put_oc(f->pins.drive_select, !on);
   f->selected = on;
   sleep_ms(10);
 }
 
 void floppy_motor_on(floppy_t *f) {
-  if (f->motor_on) return;  // Already on
-  gpio_put_oc(f->pins.motor_enable, 0);  // Active low
+  if (f->motor_on) return;
+  gpio_put_oc(f->pins.motor_enable, 0);
   f->motor_on = true;
-  sleep_ms(750);  // Wait for spinup
+  sleep_ms(750);
 }
 
 void floppy_motor_off(floppy_t *f) {
-  if (!f->motor_on) return;  // Already off
-  gpio_put_oc(f->pins.motor_enable, 1);  // Inactive
+  if (!f->motor_on) return;
+  gpio_put_oc(f->pins.motor_enable, 1);
   f->motor_on = false;
 }
 
@@ -404,12 +355,13 @@ void floppy_set_density(floppy_t *f, bool hd) {
 }
 
 floppy_status_t floppy_seek(floppy_t *f, uint8_t target) {
-  if (target == 0) {
-    return floppy_seek_track0(f);
-  }
-
   if (target >= FLOPPY_TRACKS) {
     target = FLOPPY_TRACKS - 1;
+  }
+
+  if (!f->track0_confirmed) {
+    floppy_status_t s = floppy_seek_track0(f);
+    if (s != FLOPPY_OK) return s;
   }
 
   while (f->track < target) {
@@ -427,18 +379,13 @@ uint8_t floppy_current_track(floppy_t *f) {
 }
 
 bool floppy_at_track0(floppy_t *f) {
-  return !gpio_get(f->pins.track0);  // Active low
+  return !gpio_get(f->pins.track0);
 }
 
 bool floppy_disk_changed(floppy_t *f) {
-  // Disk change signal is active low and latched
-  // It goes low when a disk is removed/inserted
-  // Stepping the head clears the latch
   bool changed = !gpio_get(f->pins.disk_change);
 
   if (changed) {
-    // Clear the latch by stepping the head
-    // Step inward then back if not at track 0, or outward then back if at track 0
     if (f->track > 0) {
       floppy_step(f, DIR_OUTWARD);
       floppy_step(f, DIR_INWARD);
@@ -452,7 +399,7 @@ bool floppy_disk_changed(floppy_t *f) {
 }
 
 bool floppy_write_protected(floppy_t *f) {
-  return !gpio_get(f->pins.write_protect);  // Active low
+  return !gpio_get(f->pins.write_protect);
 }
 
 floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector) {
@@ -462,7 +409,6 @@ floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector) {
 }
 
 floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
-  // Check write protection
   if (floppy_write_protected(f)) {
     FLOPPY_ERR("[floppy] write track %d side %d: disk is write protected\n", t->track, t->side);
     return FLOPPY_ERR_WRITE_PROTECTED;
@@ -470,23 +416,19 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
 
   floppy_prepare(f);
 
-  // Complete any missing sectors by reading from disk
   floppy_status_t status = floppy_complete_track(f, t);
   if (status != FLOPPY_OK) {
     return status;
   }
 
-  // Encode track to flux
-  uint8_t flux_buf[200000];
+  static uint8_t flux_buf[200000];
   mfm_encode_t enc;
   mfm_encode_init(&enc, flux_buf, sizeof(flux_buf));
   mfm_encode_track(&enc, t);
 
-  // Seek and select side
   floppy_seek(f, t->track);
   floppy_side_select(f, t->side);
 
-  // Wait for index and write
   floppy_wait_for_index(f);
   floppy_flux_write_start(f);
 
@@ -498,8 +440,6 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
 
   return FLOPPY_OK;
 }
-
-// ============== f12 I/O Callbacks ==============
 
 bool floppy_io_read(void *ctx, sector_t *sector) {
   floppy_t *f = (floppy_t *)ctx;

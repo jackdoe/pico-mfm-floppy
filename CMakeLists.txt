@@ -13,6 +13,7 @@ pico_sdk_init()
 add_library(floppy_lib INTERFACE)
 
 target_sources(floppy_lib INTERFACE
+    ${CMAKE_CURRENT_LIST_DIR}/src/crc.c
     ${CMAKE_CURRENT_LIST_DIR}/src/floppy.c
     ${CMAKE_CURRENT_LIST_DIR}/src/f12.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fat12.c
@@ -52,4 +53,4 @@ pico_enable_stdio_uart(floppy_cli 0)
 pico_add_extra_outputs(floppy_cli)
 
 # Host-side tests are in tests/ directory
-# Build with: cd tests && make && ./test_mfm
+# Build with: cmake -S tests -B tests/build && cmake --build tests/build && ctest --test-dir tests/build
