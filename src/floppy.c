@@ -6,6 +6,7 @@
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "hardware/gpio.h"
+#include "hardware/sync.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
 #include "flux_read.pio.h"
