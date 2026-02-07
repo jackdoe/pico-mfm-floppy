@@ -497,7 +497,7 @@ TEST(test_format_fill_max_roundtrip) {
     uint32_t total_written = 0;
     int files_created = 0;
 
-    uint8_t *wbuf = malloc(65536);
+    uint8_t *wbuf = malloc(120000);
 
     for (int file_id = 0; file_id < 100; file_id++) {
         char name[13];

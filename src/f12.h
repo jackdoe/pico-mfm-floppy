@@ -44,6 +44,7 @@ typedef struct {
 
 typedef struct {
   bool (*read)(void *ctx, sector_t *sector);
+  bool (*read_track)(void *ctx, track_t *track);
   bool (*write)(void *ctx, track_t *track);
   bool (*disk_changed)(void *ctx);
   bool (*write_protected)(void *ctx);

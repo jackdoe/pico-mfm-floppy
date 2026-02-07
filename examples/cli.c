@@ -106,6 +106,7 @@ static const cmd_entry_t commands[] = {
 static f12_err_t do_mount(void) {
   f12_io_t io = {
     .read = floppy_io_read,
+    .read_track = floppy_io_read_track,
     .write = floppy_io_write,
     .disk_changed = floppy_io_disk_changed,
     .write_protected = floppy_io_write_protected,
@@ -117,6 +118,7 @@ static f12_err_t do_mount(void) {
 static void setup_io(void) {
   fs.io = (f12_io_t){
     .read = floppy_io_read,
+    .read_track = floppy_io_read_track,
     .write = floppy_io_write,
     .disk_changed = floppy_io_disk_changed,
     .write_protected = floppy_io_write_protected,

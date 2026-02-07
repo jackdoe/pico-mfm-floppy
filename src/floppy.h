@@ -102,10 +102,12 @@ bool floppy_disk_changed(floppy_t *f);
 bool floppy_write_protected(floppy_t *f);
 
 floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector);
+floppy_status_t floppy_read_track(floppy_t *f, track_t *t);
 
 floppy_status_t floppy_write_track(floppy_t *f, track_t *track);
 
 bool floppy_io_read(void *ctx, sector_t *sector);
+bool floppy_io_read_track(void *ctx, track_t *track);
 bool floppy_io_write(void *ctx, track_t *track);
 bool floppy_io_disk_changed(void *ctx);
 bool floppy_io_write_protected(void *ctx);

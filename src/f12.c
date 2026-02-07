@@ -56,6 +56,26 @@ static bool f12_cached_read(void *ctx, sector_t *sector) {
     return true;
   }
 
+  if (fs->io.read_track) {
+    static track_t track;
+    track.track = sector->track;
+    track.side = sector->side;
+    fs->io.read_track(fs->io.ctx, &track);
+    for (int i = 0; i < SECTORS_PER_TRACK; i++) {
+      if (track.sectors[i].valid) {
+        lru_set(fs->cache, lru_key(track.track, track.side, i + 1),
+                track.sectors[i].data);
+      }
+    }
+    cached = lru_get(fs->cache, key);
+    if (cached) {
+      memcpy(sector->data, cached, SECTOR_SIZE);
+      sector->valid = true;
+      return true;
+    }
+    return false;
+  }
+
   if (!fs->io.read(fs->io.ctx, sector)) {
     return false;
   }

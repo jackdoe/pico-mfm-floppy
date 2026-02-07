@@ -232,8 +232,6 @@ void pio_sm_put_blocking(PIO pio, uint sm, uint32_t data) {
     g_drive->write_capture[g_drive->write_capture_count++] = data & 0xFF;
 }
 
-floppy_t *pio_sim_floppy_ref = NULL;
-
 static pio_hw_t pio0_hw = { .id = 0 };
 static pio_hw_t pio1_hw = { .id = 1 };
 PIO pio0 = &pio0_hw;
