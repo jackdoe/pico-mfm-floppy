@@ -170,7 +170,8 @@ static floppy_status_t floppy_seek_track0(floppy_t *f) {
   }
   return FLOPPY_ERR_NO_TRACK0;
 }
-#define FLOPPY_READ_TRACK_ATTEMPTS 20
+#define FLOPPY_READ_TRACK_ATTEMPTS 15
+#define FLOPPY_HEAD_SETTLE_MS 20
 
 typedef bool (*sector_callback_t)(sector_t *sector, void *ctx);
 
@@ -250,16 +251,24 @@ static floppy_status_t floppy_complete_track(floppy_t *f, track_t *t) {
 
 need_read:;
   struct complete_track_ctx ctx = { .t = t };
-  floppy_status_t res = floppy_read_flux(f, t->track, t->side, complete_track_cb, &ctx);
+  uint8_t target = t->track;
+
+  floppy_status_t res = floppy_read_flux(f, target, t->side, complete_track_cb, &ctx);
+  if (res == FLOPPY_OK) return res;
+
+  floppy_seek(f, target >= 2 ? target - 2 : target + 2);
+  floppy_seek(f, target);
+  sleep_ms(FLOPPY_HEAD_SETTLE_MS);
+  res = floppy_read_flux(f, target, t->side, complete_track_cb, &ctx);
+  if (res == FLOPPY_OK) return res;
+
+  floppy_seek_track0(f);
+  floppy_seek(f, target);
+  sleep_ms(FLOPPY_HEAD_SETTLE_MS);
+  res = floppy_read_flux(f, target, t->side, complete_track_cb, &ctx);
 
   if (res == FLOPPY_ERR_TIMEOUT) {
-    uint8_t target = t->track;
-    floppy_seek(f, target >= 2 ? target - 2 : target + 2);
-    res = floppy_read_flux(f, t->track, t->side, complete_track_cb, &ctx);
-  }
-
-  if (res == FLOPPY_ERR_TIMEOUT) {
-    FLOPPY_ERR("[floppy] timeout reading track %d side %d, missing sectors:", t->track, t->side);
+    FLOPPY_ERR("[floppy] timeout reading track %d side %d, missing sectors:", target, t->side);
     for (int i = 0; i < SECTORS_PER_TRACK; i++) {
       if (!t->sectors[i].valid) FLOPPY_ERR(" %d", i + 1);
     }
@@ -414,13 +423,21 @@ bool floppy_write_protected(floppy_t *f) {
 floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector) {
   sector->valid = false;
   floppy_prepare(f);
-  floppy_status_t st = floppy_read_internal(f, sector->track, sector->side, sector->sector_n, sector);
-  if (st == FLOPPY_ERR_TIMEOUT) {
-    uint8_t target = sector->track;
-    floppy_seek(f, target >= 2 ? target - 2 : target + 2);
-    st = floppy_read_internal(f, sector->track, sector->side, sector->sector_n, sector);
-  }
-  return st;
+  uint8_t target = sector->track;
+
+  floppy_status_t st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
+  if (st != FLOPPY_ERR_TIMEOUT) return st;
+
+  floppy_seek(f, target >= 2 ? target - 2 : target + 2);
+  floppy_seek(f, target);
+  sleep_ms(FLOPPY_HEAD_SETTLE_MS);
+  st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
+  if (st != FLOPPY_ERR_TIMEOUT) return st;
+
+  floppy_seek_track0(f);
+  floppy_seek(f, target);
+  sleep_ms(FLOPPY_HEAD_SETTLE_MS);
+  return floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
 }
 
 floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
@@ -465,8 +482,7 @@ floppy_status_t floppy_read_track(floppy_t *f, track_t *t) {
 
 bool floppy_io_read_track(void *ctx, track_t *track) {
   floppy_t *f = (floppy_t *)ctx;
-  floppy_read_track(f, track);
-  return true;
+  return floppy_read_track(f, track) == FLOPPY_OK;
 }
 
 bool floppy_io_read(void *ctx, sector_t *sector) {

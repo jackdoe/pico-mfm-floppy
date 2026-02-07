@@ -73,7 +73,6 @@ static bool f12_cached_read(void *ctx, sector_t *sector) {
       sector->valid = true;
       return true;
     }
-    return false;
   }
 
   if (!fs->io.read(fs->io.ctx, sector)) {

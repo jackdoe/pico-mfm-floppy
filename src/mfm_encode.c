@@ -104,15 +104,16 @@ void mfm_encode_sector(mfm_encode_t *e, const sector_t *s) {
     mfm_encode_bytes(e, data_crc_bytes, 2);
 }
 
-static void mfm_encode_precomp(uint8_t *buf, size_t len) {
+static void mfm_encode_precomp(uint8_t *buf, size_t len, uint8_t track) {
     if (len < 3) return;
+    int shift = MFM_PRECOMP_SHIFT + (track - MFM_PRECOMP_START_TRACK) / 13;
     for (size_t i = 1; i < len - 1; i++) {
         if (buf[i] != MFM_PULSE_SHORT) continue;
         bool prev_long = (buf[i - 1] == MFM_PULSE_LONG);
         bool next_long = (buf[i + 1] == MFM_PULSE_LONG);
         if (prev_long && next_long) continue;
-        if (prev_long) buf[i] -= MFM_PRECOMP_SHIFT;
-        else if (next_long) buf[i] += MFM_PRECOMP_SHIFT;
+        if (prev_long) buf[i] -= shift;
+        else if (next_long) buf[i] += shift;
     }
 }
 
@@ -126,7 +127,7 @@ size_t mfm_encode_track(mfm_encode_t *e, const track_t *t) {
     }
 
     if (t->track >= MFM_PRECOMP_START_TRACK) {
-        mfm_encode_precomp(e->buf, e->pos);
+        mfm_encode_precomp(e->buf, e->pos, t->track);
     }
 
     return e->pos;

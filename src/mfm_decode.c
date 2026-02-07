@@ -5,7 +5,15 @@
 
 static int mfm_classify(mfm_t *m, uint16_t delta) {
   if (delta < MFM_PULSE_FLOOR) return -1;
-  if (delta <= m->T2_max) return MFM_SHORT;
+  if (delta <= m->T2_max) {
+    if (m->state >= MFM_DATA && m->t_cell > 0
+        && delta <= m->t_cell + (m->t_cell >> 3)) {
+      m->t_cell += ((int)delta - (int)m->t_cell + 8) >> 4;
+      m->T2_max = m->t_cell * 5 / 4;
+      m->T3_max = m->t_cell * 7 / 4;
+    }
+    return MFM_SHORT;
+  }
   if (delta <= m->T3_max) return MFM_MEDIUM;
   if (delta < MFM_PULSE_CEILING) return MFM_LONG;
   return -1;
@@ -54,9 +62,9 @@ bool mfm_feed(mfm_t *m, uint16_t delta, sector_t *out) {
         m->preamble_sum += delta;
       } else {
         if (m->short_count >= MFM_MIN_PREAMBLE) {
-          uint16_t t_cell = m->preamble_sum / m->short_count;
-          m->T2_max = t_cell * 5 / 4;
-          m->T3_max = t_cell * 7 / 4;
+          m->t_cell = m->preamble_sum / m->short_count;
+          m->T2_max = m->t_cell * 5 / 4;
+          m->T3_max = m->t_cell * 7 / 4;
           m->state = MFM_SYNCING;
           m->sync_stage = 0;
           if (p == MFM_MEDIUM) {

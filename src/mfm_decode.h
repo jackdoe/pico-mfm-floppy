@@ -6,7 +6,7 @@
 #include "mfm_encode.h"
 
 #define MFM_MIN_PREAMBLE 60
-#define MFM_PULSE_FLOOR 35
+#define MFM_PULSE_FLOOR 38
 #define MFM_PULSE_CEILING 120
 
 typedef enum { MFM_SHORT = 0, MFM_MEDIUM = 1, MFM_LONG = 2 } mfm_pulse_t;
@@ -24,6 +24,7 @@ typedef struct {
   bool overflow;
   uint8_t sync_stage;
 
+  uint16_t t_cell;
   uint16_t short_count;
   uint32_t preamble_sum;
 

@@ -126,7 +126,7 @@ static void setup_io(void) {
   };
 }
 
-static void f12_write_full(f12_file_t *f, const void *buf, uint32_t len) {
+static uint32_t f12_write_full(f12_file_t *f, const void *buf, uint32_t len) {
   uint32_t written = 0;
   while (written < len) {
     uint32_t chunk = len - written;
@@ -135,6 +135,7 @@ static void f12_write_full(f12_file_t *f, const void *buf, uint32_t len) {
     if (n <= 0) break;
     written += n;
   }
+  return written;
 }
 
 static uint32_t f12_read_full(f12_file_t *f, void *buf, uint32_t max_len) {
@@ -555,9 +556,12 @@ static void cmd_write(int argc, char **argv) {
     return;
   }
 
-  f12_write_full(file, self_buf, pos);
-  f12_close(file);
-  printf("Wrote %lu bytes to %s\n", pos, name);
+  uint32_t wrote = f12_write_full(file, self_buf, pos);
+  f12_err_t cerr = f12_close(file);
+  if (wrote != pos || cerr != F12_OK)
+    printf("Error writing %s: wrote %lu/%lu close=%s\n", name, wrote, pos, f12_strerror(cerr));
+  else
+    printf("Wrote %lu bytes to %s\n", pos, name);
 }
 
 static void cmd_rm(int argc, char **argv) {
@@ -1194,6 +1198,8 @@ static void cmd_selftest(int argc, char **argv) {
   };
 
   printf("\n--- Phase 3: Write %d Test Files ---\n", NUM_TEST_FILES);
+  uint32_t write_bytes = 0;
+  uint32_t write_start = to_ms_since_boot(get_absolute_time());
   for (int i = 0; i < NUM_TEST_FILES; i++) {
     fill_pattern(self_buf, i, tests[i].size);
     f12_file_t *f = f12_open(&fs, tests[i].name, "w");
@@ -1202,12 +1208,25 @@ static void cmd_selftest(int argc, char **argv) {
       fail++;
       continue;
     }
-    f12_write_full(f, self_buf, tests[i].size);
-    f12_close(f);
+    uint32_t wrote = f12_write_full(f, self_buf, tests[i].size);
+    f12_err_t cerr = f12_close(f);
+    if (wrote != tests[i].size || cerr != F12_OK) {
+      printf("  FAIL: %s wrote %lu/%lu close=%s\n",
+             tests[i].name, wrote, tests[i].size, f12_strerror(cerr));
+      fail++;
+      continue;
+    }
+    write_bytes += tests[i].size;
     printf("  wrote %s (%lu bytes)\n", tests[i].name, tests[i].size);
   }
+  uint32_t write_ms = to_ms_since_boot(get_absolute_time()) - write_start;
+  uint32_t write_bps = write_ms ? (write_bytes * 1000) / write_ms : 0;
+  printf("  Write: %lu bytes in %lu ms = %lu B/s (%lu kbit/s)\n",
+         write_bytes, write_ms, write_bps, (write_bps * 8) / 1000);
 
   printf("\n--- Phase 4: Read Back & Verify ---\n");
+  uint32_t read_bytes = 0;
+  uint32_t read_start = to_ms_since_boot(get_absolute_time());
   for (int i = 0; i < NUM_TEST_FILES; i++) {
     f12_file_t *f = f12_open(&fs, tests[i].name, "r");
     if (!f) {
@@ -1217,6 +1236,7 @@ static void cmd_selftest(int argc, char **argv) {
     }
     uint32_t got = f12_read_full(f, self_buf, tests[i].size);
     f12_close(f);
+    read_bytes += got;
 
     f12_stat_t st;
     f12_stat(&fs, tests[i].name, &st);
@@ -1229,6 +1249,10 @@ static void cmd_selftest(int argc, char **argv) {
              tests[i].name, got, checksum_buf(self_buf, got));
     check(size_ok && cksum_ok, tag, &pass, &fail);
   }
+  uint32_t read_ms = to_ms_since_boot(get_absolute_time()) - read_start;
+  uint32_t read_bps = read_ms ? (read_bytes * 1000) / read_ms : 0;
+  printf("  Read: %lu bytes in %lu ms = %lu B/s (%lu kbit/s)\n",
+         read_bytes, read_ms, read_bps, (read_bps * 8) / 1000);
 
   printf("\n--- Phase 5: Delete 5 Files ---\n");
   for (int i = 0; i < 5; i++) {
@@ -1261,8 +1285,14 @@ static void cmd_selftest(int argc, char **argv) {
       fail++;
       continue;
     }
-    f12_write_full(f, self_buf, new_files[i].size);
-    f12_close(f);
+    uint32_t wrote = f12_write_full(f, self_buf, new_files[i].size);
+    f12_err_t cerr = f12_close(f);
+    if (wrote != new_files[i].size || cerr != F12_OK) {
+      printf("  FAIL: %s wrote %lu/%lu close=%s\n",
+             new_files[i].name, wrote, new_files[i].size, f12_strerror(cerr));
+      fail++;
+      continue;
+    }
     printf("  wrote %s (%lu bytes)\n", new_files[i].name, new_files[i].size);
   }
 
@@ -1302,6 +1332,7 @@ static void cmd_selftest(int argc, char **argv) {
   int valid_sectors = 0;
   int invalid_sectors = 0;
   sector_t sector;
+  uint32_t scan_start = to_ms_since_boot(get_absolute_time());
 
   for (int track = 0; track < FLOPPY_TRACKS; track++) {
     for (int side = 0; side < 2; side++) {
@@ -1326,13 +1357,27 @@ static void cmd_selftest(int argc, char **argv) {
     if ((track + 1) % 10 == 0)
       printf("  ... %d tracks done\n", track + 1);
   }
+  uint32_t scan_ms = to_ms_since_boot(get_absolute_time()) - scan_start;
+  uint32_t scan_bytes = (uint32_t)valid_sectors * SECTOR_SIZE;
+  uint32_t scan_bps = scan_ms ? (scan_bytes * 1000) / scan_ms : 0;
   printf("  Valid: %d  Invalid: %d  Total: %d\n",
          valid_sectors, invalid_sectors, valid_sectors + invalid_sectors);
+  printf("  Scan: %lu bytes in %lu.%01lus = %lu B/s (%lu kbit/s)\n",
+         scan_bytes, scan_ms / 1000, (scan_ms % 1000) / 100,
+         scan_bps, (scan_bps * 8) / 1000);
+  printf("  Industry ref: 500 kbit/s raw, ~62.5 KB/s user data (single sector)\n");
+  printf("  Theoretical max: ~45 KB/s sequential (seek + rotational latency)\n");
   check(valid_sectors == 2880, "all 2880 sectors readable", &pass, &fail);
 
   f12_unmount(&fs);
   mounted = false;
   #undef NUM_TEST_FILES
+
+  printf("\n=== Throughput Summary ===\n");
+  printf("  File write:  %lu B/s (%lu kbit/s)\n", write_bps, (write_bps * 8) / 1000);
+  printf("  File read:   %lu B/s (%lu kbit/s)\n", read_bps, (read_bps * 8) / 1000);
+  printf("  Full scan:   %lu B/s (%lu kbit/s)\n", scan_bps, (scan_bps * 8) / 1000);
+  printf("  HD raw rate: 62500 B/s (500 kbit/s)\n");
 
   printf("\n  Results: %d passed, %d failed -- %s\n",
          pass, fail, fail == 0 ? "ALL PASSED" : "SOME FAILED");
