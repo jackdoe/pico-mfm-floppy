@@ -50,30 +50,30 @@ src/
 
 ## Hardware
 
-3.5" HD floppy drive connected to the Pico via 34-pin interface. All signals are active-low open-drain.
+3.5" HD floppy drive connected to the Pico 2 via 34-pin interface. All signals are active-low open-drain.
 
 ```
 Floppy Pin   Signal           Pico GPIO
 ────────────────────────────────────────
- 8           /INDEX           GP2
-26           /TRACK_0         GP3
+ 8           /INDEX           GP14
+26           /TRACK_0         GP5
 28           /WRITE_PROTECT   GP4
-30           /READ_DATA       GP5  ← 4.7kΩ pull-up to 3.3V required
-34           /DISK_CHANGE     GP6
-12           /DRIVE_SELECT    GP7
-10           /MOTOR_ENABLE    GP8
+30           /READ_DATA       GP3   ← 4.7kΩ pull-up to 3.3V required
+34           /DISK_CHANGE     GP1
+12           /DRIVE_SELECT_B  GP12
+16           /MOTOR_ENABLE_B  GP10
 18           /DIRECTION       GP9
-20           /STEP            GP10
-22           /WRITE_DATA      GP11
-24           /WRITE_GATE      GP12
-32           /SIDE_SELECT     GP13
- 2           /DENSITY         GP14
+20           /STEP            GP8
+22           /WRITE_DATA      GP7
+24           /WRITE_GATE      GP6
+32           /SIDE_SELECT     GP2
+ 2           /DENSITY         GP15  ← 4.7kΩ pull-up to 3.3V
 
 Odd pins (1-33): ground
 Power: separate 5V supply (up to 1A), grounds connected
 ```
 
-READ_DATA needs an external 4.7kΩ pull-up because the internal pull-ups (50kΩ) are too weak for 500 kHz MFM pulses.
+READ_DATA needs an external 4.7kΩ pull-up because the internal pull-ups (50kΩ) are too weak for 500 kHz MFM pulses. DENSITY also has a 4.7kΩ pull-up to 3.3V.
 
 ## Building
 

@@ -161,19 +161,19 @@ int main(void) {
 
     floppy_t floppy = {
         .pins = {
-            .index         = 2,
-            .track0        = 3,
+            .index         = 14,
+            .track0        = 5,
             .write_protect = 4,
-            .read_data     = 5,
-            .disk_change   = 6,
-            .drive_select  = 7,
-            .motor_enable  = 8,
+            .read_data     = 3,
+            .disk_change   = 1,
+            .drive_select  = 12,  // floppy pin 12 (DRVSB)
+            .motor_enable  = 10,  // floppy pin 16 (MOTEB)
             .direction     = 9,
-            .step          = 10,
-            .write_data    = 11,
-            .write_gate    = 12,
-            .side_select   = 13,
-            .density       = 14,
+            .step          = 8,
+            .write_data    = 7,
+            .write_gate    = 6,
+            .side_select   = 2,
+            .density       = 15,
         }
     };
 
