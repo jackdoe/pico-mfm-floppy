@@ -95,14 +95,7 @@ void mfm_encode_sector(mfm_encode_t *e, const sector_t *s) {
     mfm_encode_gap(e, 22);
 
     uint8_t data_mark = MFM_DATA_MARK;
-    uint16_t data_crc = 0xFFFF;
-    data_crc = crc16_update(data_crc, 0xA1);
-    data_crc = crc16_update(data_crc, 0xA1);
-    data_crc = crc16_update(data_crc, 0xA1);
-    data_crc = crc16_update(data_crc, data_mark);
-    for (int i = 0; i < SECTOR_SIZE; i++) {
-        data_crc = crc16_update(data_crc, s->data[i]);
-    }
+    uint16_t data_crc = crc16(s->data, SECTOR_SIZE, crc16_mfm(&data_mark, 1));
 
     mfm_encode_sync(e);
     mfm_encode_bytes(e, &data_mark, 1);
@@ -115,13 +108,11 @@ static void mfm_encode_precomp(uint8_t *buf, size_t len) {
     if (len < 3) return;
     for (size_t i = 1; i < len - 1; i++) {
         if (buf[i] != MFM_PULSE_SHORT) continue;
-        uint8_t prev = buf[i - 1];
-        uint8_t next = buf[i + 1];
-        if (prev >= MFM_PULSE_LONG && next <= MFM_PULSE_SHORT) {
-            buf[i] -= MFM_PRECOMP_SHIFT;
-        } else if (prev <= MFM_PULSE_SHORT && next >= MFM_PULSE_LONG) {
-            buf[i] += MFM_PRECOMP_SHIFT;
-        }
+        bool prev_long = (buf[i - 1] == MFM_PULSE_LONG);
+        bool next_long = (buf[i + 1] == MFM_PULSE_LONG);
+        if (prev_long && next_long) continue;
+        if (prev_long) buf[i] -= MFM_PRECOMP_SHIFT;
+        else if (next_long) buf[i] += MFM_PRECOMP_SHIFT;
     }
 }
 

@@ -818,71 +818,75 @@ static void fat12_build_volume_label(uint8_t *sector, const char *volume_label) 
   entry->attr = FAT12_ATTR_VOLUME_ID;
 }
 
+static void fat12_init_hd_layout(fat12_layout_t *lay) {
+  memset(lay, 0, sizeof(*lay));
+  lay->bpb.bytes_per_sector    = SECTOR_SIZE;
+  lay->bpb.sectors_per_cluster = 1;
+  lay->bpb.reserved_sectors    = 1;
+  lay->bpb.num_fats            = 2;
+  lay->bpb.root_entries        = 224;
+  lay->bpb.total_sectors       = 80 * 2 * 18;
+  lay->bpb.media_descriptor    = 0xF0;
+  lay->bpb.sectors_per_fat     = 9;
+  lay->bpb.sectors_per_track   = 18;
+  lay->bpb.num_heads           = 2;
+
+  lay->fat_start_sector = lay->bpb.reserved_sectors;
+  lay->root_dir_start_sector = lay->fat_start_sector +
+                               (lay->bpb.num_fats * lay->bpb.sectors_per_fat);
+  uint16_t root_dir_sectors = (lay->bpb.root_entries * FAT12_DIR_ENTRY_SIZE +
+                               SECTOR_SIZE - 1) / SECTOR_SIZE;
+  lay->root_dir_sectors = root_dir_sectors;
+  lay->data_start_sector = lay->root_dir_start_sector + root_dir_sectors;
+}
+
 static void fat12_fill_format_sector(sector_t *s, uint16_t lba,
-                                     const fat12_t *fat,
+                                     const fat12_layout_t *lay,
                                      const uint8_t *boot,
                                      const uint8_t *fat_sector,
                                      const uint8_t *root_first,
                                      const char *volume_label,
                                      bool write_all_tracks) {
-  uint16_t fat2_start = fat->fat_start_sector + fat->bpb.sectors_per_fat;
+  uint16_t fat2_start = lay->fat_start_sector + lay->bpb.sectors_per_fat;
 
   if (lba == 0) {
     memcpy(s->data, boot, SECTOR_SIZE);
-  } else if (lba >= fat->fat_start_sector && lba < fat2_start) {
-    if (lba == fat->fat_start_sector)
+  } else if (lba >= lay->fat_start_sector && lba < fat2_start) {
+    if (lba == lay->fat_start_sector)
       memcpy(s->data, fat_sector, SECTOR_SIZE);
     else
       memset(s->data, 0, SECTOR_SIZE);
-  } else if (lba >= fat2_start && lba < fat2_start + fat->bpb.sectors_per_fat) {
+  } else if (lba >= fat2_start && lba < fat2_start + lay->bpb.sectors_per_fat) {
     if (lba == fat2_start)
       memcpy(s->data, fat_sector, SECTOR_SIZE);
     else
       memset(s->data, 0, SECTOR_SIZE);
-  } else if (lba >= fat->root_dir_start_sector &&
-             lba < fat->root_dir_start_sector + fat->root_dir_sectors) {
-    if (lba == fat->root_dir_start_sector && volume_label)
+  } else if (lba >= lay->root_dir_start_sector &&
+             lba < lay->root_dir_start_sector + lay->root_dir_sectors) {
+    if (lba == lay->root_dir_start_sector && volume_label)
       memcpy(s->data, root_first, SECTOR_SIZE);
     else
       memset(s->data, 0, SECTOR_SIZE);
   } else {
     memset(s->data, 0, SECTOR_SIZE);
-    if (!write_all_tracks && lba >= fat->data_start_sector)
+    if (!write_all_tracks && lba >= lay->data_start_sector)
       s->valid = false;
   }
-}
-
-static fat12_t fat12_make_hd_layout(fat12_io_t io) {
-  fat12_t fat;
-  memset(&fat, 0, sizeof(fat));
-  fat.io = io;
-  fat.bpb.bytes_per_sector    = SECTOR_SIZE;
-  fat.bpb.sectors_per_cluster = 1;
-  fat.bpb.reserved_sectors    = 1;
-  fat.bpb.num_fats            = 2;
-  fat.bpb.root_entries        = 224;
-  fat.bpb.total_sectors       = 80 * 2 * 18;
-  fat.bpb.media_descriptor    = 0xF0;
-  fat.bpb.sectors_per_fat     = 9;
-  fat.bpb.sectors_per_track   = 18;
-  fat.bpb.num_heads           = 2;
-
-  fat12_compute_layout(&fat);
-  return fat;
 }
 
 fat12_err_t fat12_format(fat12_io_t io, const char *volume_label, bool write_all_tracks) {
   if (io.write == NULL)
     return FAT12_ERR_INVALID;
 
-  fat12_t fat = fat12_make_hd_layout(io);
+  fat12_layout_t lay;
+  fat12_init_hd_layout(&lay);
 
   uint8_t boot[SECTOR_SIZE];
-  fat12_build_boot_sector(boot, &fat.bpb, volume_label);
+  fat12_build_boot_sector(boot, &lay.bpb, volume_label);
 
   uint8_t fat_sector[SECTOR_SIZE];
   memset(fat_sector, 0, sizeof(fat_sector));
-  fat_sector[0] = fat.bpb.media_descriptor;
+  fat_sector[0] = lay.bpb.media_descriptor;
   fat_sector[1] = 0xFF;
   fat_sector[2] = 0xFF;
 
@@ -890,16 +894,16 @@ fat12_err_t fat12_format(fat12_io_t io, const char *volume_label, bool write_all
   fat12_build_volume_label(root_first, volume_label);
 
   for (uint8_t cyl = 0; cyl < 80; cyl++) {
-    for (uint8_t side = 0; side < fat.bpb.num_heads; side++) {
+    for (uint8_t side = 0; side < lay.bpb.num_heads; side++) {
       track_t t;
       memset(&t, 0, sizeof(t));
       t.track = cyl;
       t.side = side;
 
       bool has_valid = false;
-      for (uint8_t s = 0; s < fat.bpb.sectors_per_track; s++) {
-        uint16_t lba = (t.track * fat.bpb.num_heads + side) *
-                       fat.bpb.sectors_per_track + s;
+      for (uint8_t s = 0; s < lay.bpb.sectors_per_track; s++) {
+        uint16_t lba = (t.track * lay.bpb.num_heads + side) *
+                       lay.bpb.sectors_per_track + s;
 
         t.sectors[s].track = t.track;
         t.sectors[s].side = side;
@@ -907,7 +911,7 @@ fat12_err_t fat12_format(fat12_io_t io, const char *volume_label, bool write_all
         t.sectors[s].size_code = 2;
         t.sectors[s].valid = true;
 
-        fat12_fill_format_sector(&t.sectors[s], lba, &fat, boot,
+        fat12_fill_format_sector(&t.sectors[s], lba, &lay, boot,
                                  fat_sector, root_first, volume_label,
                                  write_all_tracks);
 
@@ -920,9 +924,9 @@ fat12_err_t fat12_format(fat12_io_t io, const char *volume_label, bool write_all
       }
 
       if (!write_all_tracks) {
-        uint16_t track_end_lba = (t.track * fat.bpb.num_heads + side + 1) *
-                                 fat.bpb.sectors_per_track;
-        if (track_end_lba > fat.data_start_sector)
+        uint16_t track_end_lba = (t.track * lay.bpb.num_heads + side + 1) *
+                                 lay.bpb.sectors_per_track;
+        if (track_end_lba > lay.data_start_sector)
           return FAT12_OK;
       }
     }

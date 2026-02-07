@@ -74,11 +74,11 @@ struct floppy {
   uint8_t track;
   bool track0_confirmed;
   bool disk_change_flag;
-  bool motor_on;
-  bool selected;
+  volatile bool motor_on;
+  volatile bool selected;
 
   bool auto_motor;
-  uint32_t last_io_time_ms;
+  volatile uint32_t last_io_time_ms;
   struct repeating_timer idle_timer;
 };
 

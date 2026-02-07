@@ -126,6 +126,14 @@ struct fat12 {
   bool batch_in_use;
 };
 
+typedef struct {
+  fat12_bpb_t bpb;
+  uint16_t fat_start_sector;
+  uint16_t root_dir_start_sector;
+  uint16_t root_dir_sectors;
+  uint16_t data_start_sector;
+} fat12_layout_t;
+
 typedef enum {
   FAT12_OK = 0,
   FAT12_ERR_READ,

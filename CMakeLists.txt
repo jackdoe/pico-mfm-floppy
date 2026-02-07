@@ -33,24 +33,19 @@ target_link_libraries(floppy_lib INTERFACE
     hardware_clocks
 )
 
-# CLI example
-add_executable(floppy_cli
-    examples/cli.c
-)
+function(add_floppy_example name source)
+    add_executable(${name} ${source})
+    target_link_libraries(${name} floppy_lib)
+    pico_generate_pio_header(${name}
+        ${CMAKE_CURRENT_LIST_DIR}/src/flux_read.pio
+        ${CMAKE_CURRENT_LIST_DIR}/src/flux_write.pio
+    )
+    pico_enable_stdio_usb(${name} 1)
+    pico_enable_stdio_uart(${name} 0)
+    pico_add_extra_outputs(${name})
+endfunction()
 
-target_link_libraries(floppy_cli
-    floppy_lib
-)
-
-pico_generate_pio_header(floppy_cli
-    ${CMAKE_CURRENT_LIST_DIR}/src/flux_read.pio
-    ${CMAKE_CURRENT_LIST_DIR}/src/flux_write.pio
-)
-
-pico_enable_stdio_usb(floppy_cli 1)
-pico_enable_stdio_uart(floppy_cli 0)
-
-pico_add_extra_outputs(floppy_cli)
-
-# Host-side tests are in tests/ directory
-# Build with: cmake -S tests -B tests/build && cmake --build tests/build && ctest --test-dir tests/build
+add_floppy_example(floppy_cli examples/cli.c)
+add_floppy_example(floppy_selftest examples/selftest.c)
+add_floppy_example(floppy_diskdump examples/diskdump.c)
+add_floppy_example(floppy_mfmstats examples/mfmstats.c)

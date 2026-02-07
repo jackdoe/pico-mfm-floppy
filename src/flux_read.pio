@@ -39,10 +39,10 @@ static inline void flux_read_program_init(PIO pio, uint sm, uint offset, uint pi
     sm_config_set_in_shift(&c, true, true, 32); // shift right, autopush
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
     pio_sm_set_pins_with_mask(pio, sm, 1 << pin, 1 << pin);
-    // 3 instructions per loop, target 24MHz effective sample rate -> 72MHz PIO clock
-    float div = (float)clock_get_hz(clk_sys) / (3.0f * 24000000.0f);
-    // printf("Clock: %lu, Divider: %f\n", clock_get_hz(clk_sys), div);
-    sm_config_set_clkdiv(&c, div);
+    uint32_t sys_hz = clock_get_hz(clk_sys);
+    uint16_t div_int = sys_hz / 72000000;
+    uint8_t div_frac = (uint8_t)((sys_hz % 72000000) * 256 / 72000000);
+    sm_config_set_clkdiv_int_frac(&c, div_int, div_frac);
 
     pio_gpio_init(pio, pin);
     pio_gpio_init(pio, index_pin);

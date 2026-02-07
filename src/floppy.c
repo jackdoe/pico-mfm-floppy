@@ -100,9 +100,11 @@ static inline uint16_t flux_read_wait(floppy_t *f) {
 }
 
 static void floppy_flux_read_start(floppy_t *f) {
-  pio_sm_exec(f->read.pio, f->read.sm, pio_encode_jmp(f->read.offset));
-  pio_sm_restart(f->read.pio, f->read.sm);
+  pio_sm_set_enabled(f->read.pio, f->read.sm, false);
   pio_sm_clear_fifos(f->read.pio, f->read.sm);
+  pio_sm_restart(f->read.pio, f->read.sm);
+  f->read.half = 0;
+  pio_sm_exec(f->read.pio, f->read.sm, pio_encode_set(pio_x, 0));
   pio_sm_set_enabled(f->read.pio, f->read.sm, true);
 }
 
@@ -125,7 +127,7 @@ static void floppy_flux_write_stop(floppy_t *f) {
   while (!pio_sm_is_tx_fifo_empty(f->write.pio, f->write.sm)) {
     tight_loop_contents();
   }
-  sleep_us(100);
+  sleep_us(5);
   gpio_put_oc(f->pins.write_gate, 1);
   pio_sm_set_enabled(f->write.pio, f->write.sm, false);
 }

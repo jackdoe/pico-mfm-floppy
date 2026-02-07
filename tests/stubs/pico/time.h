@@ -22,7 +22,4 @@ static inline bool add_repeating_timer_ms(int32_t delay_ms, repeating_timer_call
     return true;
 }
 
-static inline uint32_t save_and_disable_interrupts(void) { return 0; }
-static inline void restore_interrupts(uint32_t status) { (void)status; }
-
 #endif
