@@ -160,6 +160,9 @@ f12_err_t f12_mount(f12_t *fs, f12_io_t io) {
     return f12_set_error(fs, fat12_to_f12_err(err));
   }
 
+  if (fs->io.disk_changed)
+    fs->io.disk_changed(fs->io.ctx);
+
   fs->mounted = true;
   return F12_OK;
 }

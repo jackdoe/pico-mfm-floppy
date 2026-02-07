@@ -20,7 +20,7 @@ static bool mounted;
 
 #define CMD_BUF_SIZE  256
 #define IO_BUF_SIZE   512
-#define SELF_BUF_SIZE 8192
+#define SELF_BUF_SIZE 50000
 #define MAX_ARGS      4
 #define PULSE_BINS    128
 
@@ -64,6 +64,8 @@ static void cmd_seek(int argc, char **argv);
 static void cmd_dump(int argc, char **argv);
 static void cmd_mfm(int argc, char **argv);
 static void cmd_selftest(int argc, char **argv);
+static void cmd_diskdump(int argc, char **argv);
+static void cmd_mfmscan(int argc, char **argv);
 static void cmd_reboot(int argc, char **argv);
 
 // ============== Command Table ==============
@@ -92,6 +94,8 @@ static const cmd_entry_t commands[] = {
   {"dump",    NULL,    cmd_dump,    false, "dump <trk> <side> [sector]", "Raw sector hex dump"},
   {"mfm",     NULL,    cmd_mfm,    false, "mfm <track> <side>",  "MFM signal analysis"},
   {"selftest",NULL,    cmd_selftest,false, "selftest",            "Format + write/read/verify cycle"},
+  {"diskdump",NULL,    cmd_diskdump,false, "diskdump",            "Full disk sector scan + checksum"},
+  {"mfmscan", NULL,    cmd_mfmscan, false, "mfmscan",             "MFM signal quality across all tracks"},
   {"reboot",  NULL,    cmd_reboot,  false, "reboot",              "Reboot the Pico"},
 };
 
@@ -518,14 +522,10 @@ static void cmd_write(int argc, char **argv) {
   name[sizeof(name) - 1] = '\0';
   upcase(name);
 
-  f12_file_t *file = f12_open(&fs, name, "w");
-  if (!file) {
-    printf("Error: %s\n", f12_strerror(f12_errno(&fs)));
-    return;
-  }
-
   printf("Enter text (end with . on its own line):\n");
-  uint32_t total = 0;
+
+  // Buffer all input first, then write once
+  uint32_t pos = 0;
   char line[CMD_BUF_SIZE];
 
   for (;;) {
@@ -533,19 +533,29 @@ static void cmd_write(int argc, char **argv) {
     if (strcmp(line, ".") == 0) break;
 
     int len = strlen(line);
-    line[len] = '\n';
-    len++;
-
-    int n = f12_write(file, line, len);
-    if (n < 0) {
-      printf("Write error: %s\n", f12_strerror(f12_errno(&fs)));
-      break;
+    if (pos + len + 1 > SELF_BUF_SIZE) {
+      printf("Input too large (max %d bytes)\n", SELF_BUF_SIZE);
+      return;
     }
-    total += n;
+    memcpy(self_buf + pos, line, len);
+    pos += len;
+    self_buf[pos++] = '\n';
   }
 
+  if (pos == 0) {
+    printf("Nothing to write.\n");
+    return;
+  }
+
+  f12_file_t *file = f12_open(&fs, name, "w");
+  if (!file) {
+    printf("Error: %s\n", f12_strerror(f12_errno(&fs)));
+    return;
+  }
+
+  f12_write_full(file, self_buf, pos);
   f12_close(file);
-  printf("Wrote %lu bytes to %s\n", total, name);
+  printf("Wrote %lu bytes to %s\n", pos, name);
 }
 
 static void cmd_rm(int argc, char **argv) {
@@ -1103,10 +1113,25 @@ static void cmd_mfm(int argc, char **argv) {
   print_histogram(&stats);
 }
 
+static void fill_pattern(uint8_t *buf, int file_id, uint32_t size) {
+  for (uint32_t i = 0; i < size; i++)
+    buf[i] = gen_pattern_byte(file_id, i);
+}
+
+static void check(bool cond, const char *tag, int *pass, int *fail) {
+  if (cond) {
+    printf("  PASS: %s\n", tag);
+    (*pass)++;
+  } else {
+    printf("  FAIL: %s\n", tag);
+    (*fail)++;
+  }
+}
+
 static void cmd_selftest(int argc, char **argv) {
   (void)argc; (void)argv;
 
-  printf("This will FORMAT the disk and run write/read/verify.\n");
+  printf("This will FORMAT the disk and run full write/read/verify.\n");
   printf("Continue? [y/N] ");
 
   char line[CMD_BUF_SIZE];
@@ -1116,7 +1141,6 @@ static void cmd_selftest(int argc, char **argv) {
     return;
   }
 
-  // Unmount if mounted
   if (mounted) {
     f12_unmount(&fs);
     mounted = false;
@@ -1124,94 +1148,289 @@ static void cmd_selftest(int argc, char **argv) {
 
   int pass = 0, fail = 0;
 
-  // Format
-  printf("  Formatting...\n");
-  setup_io();
-  f12_err_t err = f12_format(&fs, "SELFTEST", false);
-  if (err != F12_OK) {
-    printf("  FAIL: format: %s\n", f12_strerror(err));
-    return;
+  printf("\n--- Phase 1: Mount Existing Disk ---\n");
+  f12_err_t err = do_mount();
+  if (err == F12_OK) {
+    printf("  Existing disk mounted, listing files:\n");
+    f12_dir_t dir;
+    f12_stat_t st;
+    f12_opendir(&fs, "/", &dir);
+    int count = 0;
+    while (f12_readdir(&dir, &st) == F12_OK) {
+      printf("    %-12s %8lu\n", st.name, st.size);
+      count++;
+    }
+    f12_closedir(&dir);
+    printf("  %d files found\n", count);
+    f12_unmount(&fs);
+  } else {
+    printf("  No existing filesystem (%s)\n", f12_strerror(err));
   }
-  printf("  PASS: format\n");
-  pass++;
 
-  // Mount
+  printf("\n--- Phase 2: Format ---\n");
+  setup_io();
+  err = f12_format(&fs, "SELFTEST", false);
+  check(err == F12_OK, "format quick", &pass, &fail);
+
   err = do_mount();
-  if (err != F12_OK) {
-    printf("  FAIL: mount: %s\n", f12_strerror(err));
-    return;
-  }
-  printf("  PASS: mount\n");
-  pass++;
+  check(err == F12_OK, "mount after format", &pass, &fail);
+  if (err != F12_OK) return;
   mounted = true;
 
-  // Test files
-  struct { const char *name; uint32_t size; } tests[] = {
-    {"TINY.BIN",  1},
-    {"SMALL.DAT", 100},
-    {"SECT.DAT",  512},
-    {"MULTI.DAT", 2048},
-    {"BIG.DAT",   SELF_BUF_SIZE},
+  #define NUM_TEST_FILES 10
+  struct { const char *name; uint32_t size; } tests[NUM_TEST_FILES] = {
+    {"TINY.BIN",   1},
+    {"SMALL.DAT",  100},
+    {"HALF.DAT",   256},
+    {"SECT.DAT",   512},
+    {"MULTI.DAT",  1024},
+    {"MED.DAT",    4096},
+    {"BIG.DAT",    10000},
+    {"LARGE.DAT",  20000},
+    {"HUGE.DAT",   35000},
+    {"MAX.DAT",    50000},
   };
-  int ntests = sizeof(tests) / sizeof(tests[0]);
 
-  // Write
-  printf("  Writing %d test files...\n", ntests);
-  for (int i = 0; i < ntests; i++) {
-    // Fill pattern into self_buf (up to SELF_BUF_SIZE)
-    uint32_t sz = tests[i].size;
-    for (uint32_t j = 0; j < sz; j++) {
-      self_buf[j] = gen_pattern_byte(i, j);
-    }
-
+  printf("\n--- Phase 3: Write %d Test Files ---\n", NUM_TEST_FILES);
+  for (int i = 0; i < NUM_TEST_FILES; i++) {
+    fill_pattern(self_buf, i, tests[i].size);
     f12_file_t *f = f12_open(&fs, tests[i].name, "w");
     if (!f) {
       printf("  FAIL: open %s for write: %s\n", tests[i].name, f12_strerror(f12_errno(&fs)));
       fail++;
       continue;
     }
-    f12_write_full(f, self_buf, sz);
+    f12_write_full(f, self_buf, tests[i].size);
     f12_close(f);
-    printf("    wrote %s (%lu bytes)\n", tests[i].name, sz);
+    printf("  wrote %s (%lu bytes)\n", tests[i].name, tests[i].size);
   }
 
-  // Read back + verify
-  printf("  Verifying...\n");
-  for (int i = 0; i < ntests; i++) {
-    uint32_t sz = tests[i].size;
-    uint32_t expected_cksum = pattern_checksum(i, sz);
-
+  printf("\n--- Phase 4: Read Back & Verify ---\n");
+  for (int i = 0; i < NUM_TEST_FILES; i++) {
     f12_file_t *f = f12_open(&fs, tests[i].name, "r");
     if (!f) {
       printf("  FAIL: open %s for read\n", tests[i].name);
       fail++;
       continue;
     }
-
-    uint32_t got = f12_read_full(f, self_buf, sz);
+    uint32_t got = f12_read_full(f, self_buf, tests[i].size);
     f12_close(f);
 
-    uint32_t actual_cksum = checksum_buf(self_buf, got);
-    bool ok = (got == sz && actual_cksum == expected_cksum);
-    printf("  %s: %s size=%lu cksum=0x%08lX\n",
-           ok ? "PASS" : "FAIL", tests[i].name, got, actual_cksum);
-    if (ok) pass++; else fail++;
+    f12_stat_t st;
+    f12_stat(&fs, tests[i].name, &st);
+
+    bool size_ok = (got == tests[i].size && st.size == tests[i].size);
+    bool cksum_ok = (checksum_buf(self_buf, got) == pattern_checksum(i, tests[i].size));
+
+    char tag[64];
+    snprintf(tag, sizeof(tag), "%s size=%lu cksum=0x%08lX",
+             tests[i].name, got, checksum_buf(self_buf, got));
+    check(size_ok && cksum_ok, tag, &pass, &fail);
   }
 
-  // Clean up
-  printf("  Cleaning up...\n");
-  for (int i = 0; i < ntests; i++) {
+  printf("\n--- Phase 5: Delete 5 Files ---\n");
+  for (int i = 0; i < 5; i++) {
     err = f12_delete(&fs, tests[i].name);
-    if (err != F12_OK) {
-      printf("  FAIL: delete %s: %s\n", tests[i].name, f12_strerror(err));
-      fail++;
-    } else {
-      pass++;
-    }
+    char tag[32];
+    snprintf(tag, sizeof(tag), "delete %s", tests[i].name);
+    check(err == F12_OK, tag, &pass, &fail);
   }
+  for (int i = 0; i < 5; i++) {
+    f12_stat_t st;
+    err = f12_stat(&fs, tests[i].name, &st);
+    char tag[32];
+    snprintf(tag, sizeof(tag), "%s gone", tests[i].name);
+    check(err == F12_ERR_NOT_FOUND, tag, &pass, &fail);
+  }
+
+  printf("\n--- Phase 6: Write 5 New Files in Freed Space ---\n");
+  struct { const char *name; uint32_t size; } new_files[5] = {
+    {"NEW01.DAT", 500},
+    {"NEW02.DAT", 2048},
+    {"NEW03.DAT", 8000},
+    {"NEW04.DAT", 15000},
+    {"NEW05.DAT", 30000},
+  };
+  for (int i = 0; i < 5; i++) {
+    fill_pattern(self_buf, 100 + i, new_files[i].size);
+    f12_file_t *f = f12_open(&fs, new_files[i].name, "w");
+    if (!f) {
+      printf("  FAIL: open %s for write\n", new_files[i].name);
+      fail++;
+      continue;
+    }
+    f12_write_full(f, self_buf, new_files[i].size);
+    f12_close(f);
+    printf("  wrote %s (%lu bytes)\n", new_files[i].name, new_files[i].size);
+  }
+
+  printf("\n--- Phase 7: Verify ALL Remaining Files ---\n");
+  for (int i = 5; i < NUM_TEST_FILES; i++) {
+    f12_file_t *f = f12_open(&fs, tests[i].name, "r");
+    if (!f) {
+      printf("  FAIL: open %s\n", tests[i].name);
+      fail++;
+      continue;
+    }
+    uint32_t got = f12_read_full(f, self_buf, tests[i].size);
+    f12_close(f);
+    bool ok = (got == tests[i].size) &&
+              (checksum_buf(self_buf, got) == pattern_checksum(i, tests[i].size));
+    char tag[64];
+    snprintf(tag, sizeof(tag), "original %s verified", tests[i].name);
+    check(ok, tag, &pass, &fail);
+  }
+  for (int i = 0; i < 5; i++) {
+    f12_file_t *f = f12_open(&fs, new_files[i].name, "r");
+    if (!f) {
+      printf("  FAIL: open %s\n", new_files[i].name);
+      fail++;
+      continue;
+    }
+    uint32_t got = f12_read_full(f, self_buf, new_files[i].size);
+    f12_close(f);
+    bool ok = (got == new_files[i].size) &&
+              (checksum_buf(self_buf, got) == pattern_checksum(100 + i, new_files[i].size));
+    char tag[64];
+    snprintf(tag, sizeof(tag), "new %s verified", new_files[i].name);
+    check(ok, tag, &pass, &fail);
+  }
+
+  printf("\n--- Phase 8: Read All 2880 Sectors ---\n");
+  int valid_sectors = 0;
+  int invalid_sectors = 0;
+  sector_t sector;
+
+  for (int track = 0; track < FLOPPY_TRACKS; track++) {
+    for (int side = 0; side < 2; side++) {
+      int track_valid = 0;
+      for (int s = 1; s <= SECTORS_PER_TRACK; s++) {
+        sector.track = track;
+        sector.side = side;
+        sector.sector_n = s;
+        sector.valid = false;
+        floppy_status_t st = floppy_read_sector(&floppy, &sector);
+        if (st == FLOPPY_OK && sector.valid) {
+          valid_sectors++;
+          track_valid++;
+        } else {
+          invalid_sectors++;
+        }
+      }
+      if (track_valid < SECTORS_PER_TRACK)
+        printf("  T%02d/S%d: %d/%d sectors\n", track, side,
+               track_valid, SECTORS_PER_TRACK);
+    }
+    if ((track + 1) % 10 == 0)
+      printf("  ... %d tracks done\n", track + 1);
+  }
+  printf("  Valid: %d  Invalid: %d  Total: %d\n",
+         valid_sectors, invalid_sectors, valid_sectors + invalid_sectors);
+  check(valid_sectors == 2880, "all 2880 sectors readable", &pass, &fail);
+
+  f12_unmount(&fs);
+  mounted = false;
+  #undef NUM_TEST_FILES
 
   printf("\n  Results: %d passed, %d failed -- %s\n",
          pass, fail, fail == 0 ? "ALL PASSED" : "SOME FAILED");
+}
+
+static void cmd_diskdump(int argc, char **argv) {
+  (void)argc; (void)argv;
+
+  int total_valid = 0;
+  int total_invalid = 0;
+  uint32_t disk_checksum = 0;
+  sector_t sector;
+
+  printf("  %-8s %-6s %-10s %-10s\n", "TRACK", "SIDE", "DECODED", "ERRORS");
+  printf("  %-8s %-6s %-10s %-10s\n", "-----", "----", "-------", "------");
+
+  for (int track = 0; track < FLOPPY_TRACKS; track++) {
+    for (int side = 0; side < 2; side++) {
+      int decoded = 0;
+      int errors = 0;
+
+      for (int s = 1; s <= SECTORS_PER_TRACK; s++) {
+        sector.track = track;
+        sector.side = side;
+        sector.sector_n = s;
+        sector.valid = false;
+
+        floppy_status_t st = floppy_read_sector(&floppy, &sector);
+        if (st == FLOPPY_OK && sector.valid) {
+          decoded++;
+          disk_checksum ^= checksum_buf(sector.data, SECTOR_SIZE);
+        } else {
+          errors++;
+        }
+      }
+
+      total_valid += decoded;
+      total_invalid += errors;
+
+      printf("  T%02d      %d      %2d/%-2d      %d\n",
+             track, side, decoded, SECTORS_PER_TRACK, errors);
+    }
+  }
+
+  printf("\n  Total decoded: %d / 2880\n", total_valid);
+  printf("  Errors:        %d\n", total_invalid);
+  printf("  Disk checksum: 0x%08lX\n", disk_checksum);
+}
+
+static void cmd_mfmscan(int argc, char **argv) {
+  (void)argc; (void)argv;
+
+  track_stats_t stats;
+
+  struct { int track; int side; const char *label; } targets[] = {
+    {0,  0, "Track 0 (outermost)"},
+    {39, 0, "Track 39 (mid-outer)"},
+    {79, 0, "Track 79 (innermost)"},
+  };
+
+  for (int t = 0; t < 3; t++) {
+    printf("\n  === %s ===\n", targets[t].label);
+    read_track_stats(targets[t].track, targets[t].side, &stats);
+
+    printf("    Pulses:   %lu total\n", stats.total_pulses);
+    printf("    Short:    %lu (%.1f%%)\n", stats.short_count,
+           stats.total_pulses ? stats.short_count * 100.0 / stats.total_pulses : 0);
+    printf("    Medium:   %lu (%.1f%%)\n", stats.medium_count,
+           stats.total_pulses ? stats.medium_count * 100.0 / stats.total_pulses : 0);
+    printf("    Long:     %lu (%.1f%%)\n", stats.long_count,
+           stats.total_pulses ? stats.long_count * 100.0 / stats.total_pulses : 0);
+    printf("    Invalid:  %lu (%.1f%%)\n", stats.invalid_count,
+           stats.total_pulses ? stats.invalid_count * 100.0 / stats.total_pulses : 0);
+    printf("    Syncs:    %lu\n", stats.syncs);
+    printf("    Sectors:  %lu / %d\n", stats.sectors, SECTORS_PER_TRACK);
+    printf("    CRC err:  %lu\n", stats.crc_errors);
+    printf("    Adaptive: T2_max=%d  T3_max=%d\n", stats.T2_max, stats.T3_max);
+    print_histogram(&stats);
+  }
+
+  printf("\n  === Per-Track Summary (side 0) ===\n");
+  printf("  %-6s %-8s %-8s %-8s %-8s %-5s %-5s\n",
+         "TRACK", "SHORT", "MEDIUM", "LONG", "INVALID", "SECT", "CRC");
+  printf("  %-6s %-8s %-8s %-8s %-8s %-5s %-5s\n",
+         "-----", "------", "------", "------", "-------", "----", "---");
+
+  int total_sectors = 0;
+  int total_crc = 0;
+
+  for (int track = 0; track < FLOPPY_TRACKS; track++) {
+    read_track_stats(track, 0, &stats);
+    printf("  T%02d    %-8lu %-8lu %-8lu %-8lu %-5lu %-5lu\n",
+           track, stats.short_count, stats.medium_count,
+           stats.long_count, stats.invalid_count,
+           stats.sectors, stats.crc_errors);
+    total_sectors += stats.sectors;
+    total_crc += stats.crc_errors;
+  }
+
+  printf("\n  Side 0 total: %d sectors decoded, %d CRC errors\n", total_sectors, total_crc);
 }
 
 static void cmd_reboot(int argc, char **argv) {

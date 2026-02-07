@@ -47,6 +47,3 @@ endfunction()
 
 add_floppy_example(floppy_cli examples/cli.c)
 target_link_libraries(floppy_cli hardware_watchdog)
-add_floppy_example(floppy_selftest examples/selftest.c)
-add_floppy_example(floppy_diskdump examples/diskdump.c)
-add_floppy_example(floppy_mfmstats examples/mfmstats.c)
