@@ -21,7 +21,7 @@ LRU Cache ── 54 sectors (3 tracks)
 FAT12 ────── BPB, FAT tables, directories, cluster chains, batched writes
     │
     ▼
-floppy ───── motor, seek, side select, sector read, track write
+floppy ───── motor, seek, side select, sector read, write-verify-retry
     │
     ▼
 MFM ──────── flux pulse intervals ↔ data bytes (adaptive timing, write precomp)
@@ -42,7 +42,7 @@ src/
 ├── mfm_decode.c/h      4-state MFM decoder with adaptive timing calibration
 ├── mfm_encode.c/h      MFM encoder with write precompensation
 ├── crc.c/h             CRC-16/CCITT (table lookup)
-├── floppy.c/h          Drive control: motor, seek, side, sector read, track write
+├── floppy.c/h          Drive control: motor, seek, side, sector read, write-verify-retry
 ├── fat12.c/h           FAT12 filesystem with batched sector writes
 ├── f12.c/h             High-level file API with LRU sector cache
 └── lru.c/h             Generic LRU cache (doubly-linked list over flat storage)
@@ -94,7 +94,9 @@ Tests (host-side, no hardware needed):
 
 **Write precompensation** — on inner tracks (≥40), adjacent flux transitions are shifted ±125ns to counteract magnetic bit shift. Without this, inner track writes have 5-15% error rates.
 
-**Batch-aware FAT writes** — the write batch system coalesces sector writes by track to minimize physical I/O. The free cluster search reads through the batch to see pending FAT updates, avoiding unnecessary flushes.
+**Write-verify-retry** — every track write is read back after recalibrating to track 0 and re-seeking, forcing maximum head displacement. All 18 sectors are compared byte-for-byte. Three attempts with escalating recovery: write+verify, write+verify, recalibrate+write+verify. Reports exactly which sectors failed on each attempt.
+
+**Batch-aware FAT writes** — the write batch system coalesces sector writes by track and deduplicates FAT sector updates in-place, minimizing physical I/O. The free cluster search reads through the batch to see pending FAT updates, avoiding unnecessary flushes.
 
 **Shared write batch** — a single 18KB write batch in `fat12_t` is shared across all writers, eliminating 166KB of wasted memory from per-file-handle batch storage.
 
@@ -115,8 +117,9 @@ tests/
 ├── test_scp_roundtrip.c   8 tests: decode→modify→encode→decode→verify + fuzz
 ├── test_pio_sim.c         4 tests: real floppy.c code with PIO hardware simulation
 ├── test_pio_emu.c         3 tests: cycle-accurate PIO instruction emulation
+├── test_write_verify.c    4 tests: write-verify-retry through full firmware + PIO sim
 ├── flux_sim.c/h          SCP file parser + synthetic flux with jitter/drift
-├── pio_sim.c/h           GPIO/PIO hardware simulator backed by SCP data
+├── pio_sim.c/h           GPIO/PIO hardware simulator with write-back and fault injection
 ├── pio_emu.c/h           RP2040 PIO instruction set emulator (9 opcodes)
 ├── scp_disk.h            Flux-to-sector IO adapter (MFM decode on demand)
 ├── vdisk.h               In-memory sector-level virtual disk
@@ -149,7 +152,7 @@ The fuzz roundtrip runs 100 iterations of: format → random creates/overwrites/
 
 Two levels of hardware simulation:
 
-**PIO Simulator** (`pio_sim.c`) — mocks the Pico SDK GPIO/PIO functions so the real `floppy.c` firmware code runs against SCP flux data. Tests the complete firmware path: `floppy_read_sector` → PIO FIFO unpacking → delta computation → MFM decode → FAT12 → file read.
+**PIO Simulator** (`pio_sim.c`) — mocks the Pico SDK GPIO/PIO functions so the real `floppy.c` firmware code runs against SCP flux data. Written flux data is captured and converted back to readable track deltas, enabling full write-verify testing. Fault injection simulates marginal media. Tests the complete firmware path: `floppy_read_sector` → PIO FIFO unpacking → delta computation → MFM decode → FAT12 → file read/write.
 
 **PIO Emulator** (`pio_emu.c`) — cycle-accurate execution of the actual `flux_read.pio` and `flux_write.pio` PIO instructions. Verifies the PIO programs produce correct counter values and FIFO output. Hand-assembled from the `.pio` source.
 
