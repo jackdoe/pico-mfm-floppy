@@ -64,6 +64,7 @@ static void cmd_seek(int argc, char **argv);
 static void cmd_dump(int argc, char **argv);
 static void cmd_mfm(int argc, char **argv);
 static void cmd_selftest(int argc, char **argv);
+static void cmd_selftest2(int argc, char **argv);
 static void cmd_diskdump(int argc, char **argv);
 static void cmd_mfmscan(int argc, char **argv);
 static void cmd_reboot(int argc, char **argv);
@@ -94,6 +95,7 @@ static const cmd_entry_t commands[] = {
   {"dump",    NULL,    cmd_dump,    false, "dump <trk> <side> [sector]", "Raw sector hex dump"},
   {"mfm",     NULL,    cmd_mfm,    false, "mfm <track> <side>",  "MFM signal analysis"},
   {"selftest",NULL,    cmd_selftest,false, "selftest",            "Format + write/read/verify cycle"},
+  {"selftest2",NULL,   cmd_selftest2,false,"selftest2 <n> <size>","Stress: n rounds of write/delete/verify"},
   {"diskdump",NULL,    cmd_diskdump,false, "diskdump",            "Full disk sector scan + checksum"},
   {"mfmscan", NULL,    cmd_mfmscan, false, "mfmscan",             "MFM signal quality across all tracks"},
   {"reboot",  NULL,    cmd_reboot,  false, "reboot",              "Reboot the Pico"},
@@ -1381,6 +1383,193 @@ static void cmd_selftest(int argc, char **argv) {
 
   printf("\n  Results: %d passed, %d failed -- %s\n",
          pass, fail, fail == 0 ? "ALL PASSED" : "SOME FAILED");
+}
+
+static void cmd_selftest2(int argc, char **argv) {
+  if (argc < 3) {
+    printf("Usage: selftest2 <iterations> <filesize>\n");
+    printf("  selftest2 30 1024    30 rounds of 1KB files\n");
+    printf("  selftest2 10 50000   10 rounds of 50KB files\n");
+    return;
+  }
+
+  int iterations = atoi(argv[1]);
+  int filesize = atoi(argv[2]);
+
+  if (iterations < 1 || iterations > 10000) {
+    printf("Iterations must be 1-10000\n");
+    return;
+  }
+  if (filesize < 1 || filesize > SELF_BUF_SIZE) {
+    printf("File size must be 1-%d\n", SELF_BUF_SIZE);
+    return;
+  }
+
+  printf("Stress test: %d iterations, %d byte files\n", iterations, filesize);
+  printf("This will FORMAT the disk. Continue? [y/N] ");
+
+  char line[CMD_BUF_SIZE];
+  cli_readline(line, sizeof(line));
+  if (line[0] != 'y' && line[0] != 'Y') {
+    printf("Cancelled.\n");
+    return;
+  }
+
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+
+  setup_io();
+  f12_err_t err = f12_format(&fs, "STRESS", false);
+  if (err != F12_OK) {
+    printf("Format failed: %s\n", f12_strerror(err));
+    return;
+  }
+  err = do_mount();
+  if (err != F12_OK) {
+    printf("Mount failed: %s\n", f12_strerror(err));
+    return;
+  }
+  mounted = true;
+  printf("  Formatted and mounted\n");
+
+  struct { const char *name; uint32_t size; int id; } anchors[] = {
+    {"ANCHOR1.DAT", 512, 9000},
+    {"ANCHOR2.DAT", 4096, 9001},
+    {"ANCHOR3.DAT", 10000, 9002},
+  };
+  int num_anchors = 3;
+
+  printf("\n--- Anchor Files ---\n");
+  for (int i = 0; i < num_anchors; i++) {
+    fill_pattern(self_buf, anchors[i].id, anchors[i].size);
+    f12_file_t *f = f12_open(&fs, anchors[i].name, "w");
+    if (!f) {
+      printf("  FATAL: cannot write %s\n", anchors[i].name);
+      return;
+    }
+    uint32_t wrote = f12_write_full(f, self_buf, anchors[i].size);
+    f12_err_t cerr = f12_close(f);
+    if (wrote != anchors[i].size || cerr != F12_OK) {
+      printf("  FATAL: %s write failed\n", anchors[i].name);
+      return;
+    }
+    printf("  %s (%lu bytes)\n", anchors[i].name, anchors[i].size);
+  }
+
+  uint16_t free_cl = count_free_clusters();
+  uint32_t free_bytes = (uint32_t)free_cl * 512;
+  int files_per_round = (free_bytes * 8 / 10) / filesize;
+  if (files_per_round > 200) files_per_round = 200;
+  if (files_per_round < 1) files_per_round = 1;
+
+  printf("  Free: %lu bytes, %d files per round\n\n", free_bytes, files_per_round);
+
+  int total_pass = 0, total_fail = 0;
+  uint32_t total_written = 0, total_verified = 0;
+  uint32_t test_start = to_ms_since_boot(get_absolute_time());
+
+  for (int iter = 0; iter < iterations; iter++) {
+    printf("--- Round %d/%d ---\n", iter + 1, iterations);
+
+    int written_count = 0;
+    uint32_t round_start = to_ms_since_boot(get_absolute_time());
+
+    for (int i = 0; i < files_per_round; i++) {
+      char name[13];
+      snprintf(name, sizeof(name), "T%03d.DAT", i);
+      int file_id = iter * 1000 + i;
+
+      fill_pattern(self_buf, file_id, filesize);
+      f12_file_t *f = f12_open(&fs, name, "w");
+      if (!f) break;
+
+      uint32_t wrote = f12_write_full(f, self_buf, filesize);
+      f12_err_t cerr = f12_close(f);
+      if (wrote != (uint32_t)filesize || cerr != F12_OK) {
+        printf("  write error: %s wrote %lu/%d close=%s\n",
+               name, wrote, filesize, f12_strerror(cerr));
+        break;
+      }
+      written_count++;
+      total_written += filesize;
+    }
+
+    uint32_t write_ms = to_ms_since_boot(get_absolute_time()) - round_start;
+
+    f12_unmount(&fs);
+    mounted = false;
+    err = do_mount();
+    if (err != F12_OK) {
+      printf("  FATAL: remount failed: %s\n", f12_strerror(err));
+      total_fail++;
+      break;
+    }
+    mounted = true;
+
+    int iter_fail = 0;
+
+    for (int i = 0; i < written_count; i++) {
+      char name[13];
+      snprintf(name, sizeof(name), "T%03d.DAT", i);
+      int file_id = iter * 1000 + i;
+
+      f12_file_t *f = f12_open(&fs, name, "r");
+      if (!f) { iter_fail++; printf("  FAIL: open %s\n", name); continue; }
+
+      uint32_t got = f12_read_full(f, self_buf, filesize);
+      f12_close(f);
+      total_verified += got;
+
+      if (got != (uint32_t)filesize ||
+          checksum_buf(self_buf, got) != pattern_checksum(file_id, filesize)) {
+        printf("  FAIL: %s cksum mismatch\n", name);
+        iter_fail++;
+      }
+    }
+
+    for (int i = 0; i < num_anchors; i++) {
+      f12_file_t *f = f12_open(&fs, anchors[i].name, "r");
+      if (!f) { iter_fail++; printf("  FAIL: anchor %s missing\n", anchors[i].name); continue; }
+
+      uint32_t got = f12_read_full(f, self_buf, anchors[i].size);
+      f12_close(f);
+
+      if (got != anchors[i].size ||
+          checksum_buf(self_buf, got) != pattern_checksum(anchors[i].id, anchors[i].size)) {
+        printf("  FAIL: anchor %s corrupted\n", anchors[i].name);
+        iter_fail++;
+      }
+    }
+
+    for (int i = 0; i < written_count; i++) {
+      char name[13];
+      snprintf(name, sizeof(name), "T%03d.DAT", i);
+      f12_delete(&fs, name);
+    }
+
+    if (iter_fail == 0) {
+      total_pass++;
+      printf("  PASS  %d files + %d anchors  write=%lu.%01lus\n",
+             written_count, num_anchors, write_ms / 1000, (write_ms % 1000) / 100);
+    } else {
+      total_fail++;
+      printf("  FAIL  %d errors\n", iter_fail);
+    }
+  }
+
+  uint32_t test_ms = to_ms_since_boot(get_absolute_time()) - test_start;
+
+  printf("\n=== Stress Test Complete ===\n");
+  printf("  Rounds:   %d passed, %d failed\n", total_pass, total_fail);
+  printf("  Written:  %lu bytes total\n", total_written);
+  printf("  Verified: %lu bytes total\n", total_verified);
+  printf("  Duration: %lu.%01lus\n", test_ms / 1000, (test_ms % 1000) / 100);
+  printf("  Result:   %s\n", total_fail == 0 ? "ALL PASSED" : "SOME FAILED");
+
+  f12_unmount(&fs);
+  mounted = false;
 }
 
 static void cmd_diskdump(int argc, char **argv) {
