@@ -171,6 +171,7 @@ static floppy_status_t floppy_seek_track0(floppy_t *f) {
   return FLOPPY_ERR_NO_TRACK0;
 }
 #define FLOPPY_READ_TRACK_ATTEMPTS 15
+#define FLOPPY_WRITE_ATTEMPTS 3
 #define FLOPPY_HEAD_SETTLE_MS 20
 
 typedef bool (*sector_callback_t)(sector_t *sector, void *ctx);
@@ -440,6 +441,26 @@ floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector) {
   return floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
 }
 
+struct verify_ctx {
+  const track_t *expected;
+  bool verified[SECTORS_PER_TRACK];
+};
+
+static bool verify_track_cb(sector_t *sector, void *ctx) {
+  struct verify_ctx *v = (struct verify_ctx *)ctx;
+  int idx = sector->sector_n - 1;
+
+  if (!v->verified[idx] &&
+      memcmp(sector->data, v->expected->sectors[idx].data, SECTOR_SIZE) == 0) {
+    v->verified[idx] = true;
+  }
+
+  for (int i = 0; i < SECTORS_PER_TRACK; i++) {
+    if (!v->verified[i]) return false;
+  }
+  return true;
+}
+
 floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
   if (floppy_write_protected(f)) {
     FLOPPY_ERR("[floppy] write track %d side %d: disk is write protected\n", t->track, t->side);
@@ -458,19 +479,38 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
   mfm_encode_init(&enc, flux_buf, sizeof(flux_buf));
   mfm_encode_track(&enc, t);
 
-  floppy_seek(f, t->track);
-  floppy_side_select(f, t->side);
+  for (int attempt = 0; attempt < FLOPPY_WRITE_ATTEMPTS; attempt++) {
+    if (attempt == 2) {
+      floppy_seek_track0(f);
+    }
 
-  floppy_wait_for_index(f);
-  floppy_flux_write_start(f);
+    floppy_seek(f, t->track);
+    floppy_side_select(f, t->side);
+    floppy_wait_for_index(f);
+    floppy_flux_write_start(f);
+    for (size_t i = 0; i < enc.pos; i++) {
+      pio_sm_put_blocking(f->write.pio, f->write.sm, flux_buf[i]);
+    }
+    floppy_flux_write_stop(f);
 
-  for (size_t i = 0; i < enc.pos; i++) {
-    pio_sm_put_blocking(f->write.pio, f->write.sm, flux_buf[i]);
+    floppy_seek(f, t->track >= 2 ? t->track - 2 : t->track + 2);
+    floppy_seek(f, t->track);
+    sleep_ms(FLOPPY_HEAD_SETTLE_MS);
+
+    struct verify_ctx vctx = { .expected = t };
+    if (floppy_read_flux(f, t->track, t->side, verify_track_cb, &vctx) == FLOPPY_OK) {
+      return FLOPPY_OK;
+    }
+
+    FLOPPY_ERR("[floppy] verify failed track %d side %d attempt %d, bad sectors:",
+               t->track, t->side, attempt + 1);
+    for (int i = 0; i < SECTORS_PER_TRACK; i++) {
+      if (!vctx.verified[i]) FLOPPY_ERR(" %d", i + 1);
+    }
+    FLOPPY_ERR("\n");
   }
 
-  floppy_flux_write_stop(f);
-
-  return FLOPPY_OK;
+  return FLOPPY_ERR_VERIFY;
 }
 
 floppy_status_t floppy_read_track(floppy_t *f, track_t *t) {

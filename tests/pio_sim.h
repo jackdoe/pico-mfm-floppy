@@ -32,6 +32,9 @@ typedef struct {
     uint8_t *write_capture;
     uint32_t write_capture_count;
     uint32_t write_capture_capacity;
+
+    uint32_t index_poll_count;
+    int fault_writes_remaining;
 } pio_sim_drive_t;
 
 void pio_sim_init(pio_sim_drive_t *drive);

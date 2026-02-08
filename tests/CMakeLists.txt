@@ -57,3 +57,8 @@ add_test(NAME test_pio_sim COMMAND test_pio_sim)
 add_executable(test_pio_emu test_pio_emu.c pio_emu.c flux_sim.c ${SRCS})
 target_include_directories(test_pio_emu PRIVATE ${STUBS} ${SRCDIR})
 add_test(NAME test_pio_emu COMMAND test_pio_emu)
+
+add_executable(test_write_verify test_write_verify.c pio_sim.c flux_sim.c ${SRCS} ${SRCDIR}/floppy.c)
+target_include_directories(test_write_verify PRIVATE ${STUBS} ${SRCDIR})
+target_compile_definitions(test_write_verify PRIVATE FLOPPY_DEBUG=0)
+add_test(NAME test_write_verify COMMAND test_write_verify)

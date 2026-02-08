@@ -1,6 +1,7 @@
 #include "pio_sim.h"
 #include "flux_sim.h"
 #include "../src/floppy.h"
+#include "../src/mfm_encode.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -115,6 +116,23 @@ void gpio_set_dir(uint pin, bool out) {
             g_drive->head_side = new_side;
             pio_sim_load_track();
         }
+    } else if (pin == f->pins.write_gate) {
+        if (going_low) {
+            g_drive->write_capture_count = 0;
+        } else if (g_drive->write_capture_count > 0) {
+            if (g_drive->fault_writes_remaining > 0) {
+                g_drive->fault_writes_remaining--;
+            } else {
+                pio_sim_track_t *t = &g_drive->tracks[g_drive->head_track][g_drive->head_side];
+                free(t->deltas);
+                t->deltas = malloc(g_drive->write_capture_count * sizeof(uint16_t));
+                t->count = g_drive->write_capture_count;
+                for (uint32_t i = 0; i < g_drive->write_capture_count; i++) {
+                    t->deltas[i] = g_drive->write_capture[i] + MFM_PIO_OVERHEAD;
+                }
+                pio_sim_load_track();
+            }
+        }
     }
 }
 void gpio_pull_up(uint pin) { (void)pin; }
@@ -131,7 +149,8 @@ bool gpio_get(uint pin) {
         return g_drive->head_track != 0;
     }
     if (pin == f->pins.index) {
-        return g_drive->index_state;
+        g_drive->index_poll_count++;
+        return (g_drive->index_poll_count & 0x100) != 0;
     }
     if (pin == f->pins.disk_change) {
         return true;
@@ -186,12 +205,15 @@ void pio_gpio_init(PIO pio, uint pin) { (void)pio; (void)pin; }
 bool pio_sm_is_rx_fifo_empty(PIO pio, uint sm) {
     (void)pio; (void)sm;
     if (!g_drive || !g_drive->read_buf) return true;
-    return g_drive->read_pos >= g_drive->read_count;
+    return g_drive->read_count == 0;
 }
 
 static uint16_t pio_sim_next_sample(void) {
-    if (!g_drive || !g_drive->read_buf || g_drive->read_pos >= g_drive->read_count)
+    if (!g_drive || !g_drive->read_buf || g_drive->read_count == 0)
         return (0x7FFF << 1) | 1;
+
+    if (g_drive->read_pos >= g_drive->read_count)
+        g_drive->read_pos = 0;
 
     uint16_t delta = g_drive->read_buf[g_drive->read_pos++];
     g_drive->counter -= delta;

@@ -24,3 +24,4 @@ done
 ./test_scp_roundtrip "$@"
 ./test_pio_sim
 ./test_pio_emu
+./test_write_verify

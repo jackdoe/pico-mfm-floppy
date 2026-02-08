@@ -53,6 +53,7 @@ typedef enum {
   FLOPPY_ERR_TIMEOUT,
   FLOPPY_ERR_NO_TRACK0,
   FLOPPY_ERR_WRITE_PROTECTED,
+  FLOPPY_ERR_VERIFY,
 } floppy_status_t;
 
 typedef struct {
