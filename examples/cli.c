@@ -65,6 +65,7 @@ static void cmd_dump(int argc, char **argv);
 static void cmd_mfm(int argc, char **argv);
 static void cmd_selftest(int argc, char **argv);
 static void cmd_selftest2(int argc, char **argv);
+static void cmd_starwars(int argc, char **argv);
 static void cmd_diskdump(int argc, char **argv);
 static void cmd_mfmscan(int argc, char **argv);
 static void cmd_reboot(int argc, char **argv);
@@ -96,6 +97,7 @@ static const cmd_entry_t commands[] = {
   {"mfm",     NULL,    cmd_mfm,    false, "mfm <track> <side>",  "MFM signal analysis"},
   {"selftest",NULL,    cmd_selftest,false, "selftest",            "Format + write/read/verify cycle"},
   {"selftest2",NULL,   cmd_selftest2,false,"selftest2 <n> <size>","Stress: n rounds of write/delete/verify"},
+  {"starwars", NULL,   cmd_starwars, false,"starwars",            "Imperial March on the stepper motor"},
   {"diskdump",NULL,    cmd_diskdump,false, "diskdump",            "Full disk sector scan + checksum"},
   {"mfmscan", NULL,    cmd_mfmscan, false, "mfmscan",             "MFM signal quality across all tracks"},
   {"reboot",  NULL,    cmd_reboot,  false, "reboot",              "Reboot the Pico"},
@@ -1570,6 +1572,78 @@ static void cmd_selftest2(int argc, char **argv) {
 
   f12_unmount(&fs);
   mounted = false;
+}
+
+static void floppy_play_note(uint16_t freq, uint16_t ms) {
+  if (freq == 0) {
+    sleep_ms(ms);
+    return;
+  }
+  uint32_t period = 1000000 / freq;
+  uint32_t end = to_ms_since_boot(get_absolute_time()) + ms;
+  uint8_t pos = floppy.track;
+  bool inward = (pos < 40);
+
+  while (to_ms_since_boot(get_absolute_time()) < end) {
+    if (pos >= 78) inward = false;
+    if (pos <= 1) inward = true;
+
+    gpio_put_oc(floppy.pins.direction, inward ? 0 : 1);
+    gpio_put_oc(floppy.pins.step, 0);
+    sleep_us(1);
+    gpio_put_oc(floppy.pins.step, 1);
+
+    if (inward) pos++; else pos--;
+
+    uint32_t delay = period > 5 ? period - 5 : 1;
+    sleep_us(delay);
+  }
+  floppy.track = pos;
+}
+
+static const struct { uint16_t freq; uint16_t ms; } imperial_march[] = {
+  {392, 550}, {0, 30}, {392, 550}, {0, 30}, {392, 550}, {0, 30},
+  {311, 412}, {466, 138}, {0, 30},
+  {392, 550}, {0, 30},
+  {311, 412}, {466, 138}, {0, 30},
+  {392, 1100}, {0, 80},
+
+  {587, 550}, {0, 30}, {587, 550}, {0, 30}, {587, 550}, {0, 30},
+  {622, 412}, {466, 138}, {0, 30},
+  {370, 550}, {0, 30},
+  {311, 412}, {466, 138}, {0, 30},
+  {392, 1100}, {0, 80},
+
+  {784, 550}, {0, 30}, {392, 412}, {392, 138}, {0, 30},
+  {784, 550}, {0, 30},
+  {740, 412}, {698, 138}, {659, 138}, {622, 138},
+  {659, 275}, {0, 138},
+  {415, 275}, {587, 550}, {0, 30},
+  {554, 412}, {523, 138}, {466, 138}, {440, 138},
+  {466, 275}, {0, 138},
+  {311, 275}, {370, 550}, {0, 30},
+  {311, 412}, {370, 138},
+  {466, 550}, {0, 30}, {392, 412}, {466, 138},
+  {587, 1100},
+
+  {0, 0}
+};
+
+static void cmd_starwars(int argc, char **argv) {
+  (void)argc; (void)argv;
+
+  floppy_select(&floppy, true);
+  floppy_motor_on(&floppy);
+  floppy_seek(&floppy, 40);
+
+  printf("  Playing Imperial March...\n");
+
+  for (int i = 0; imperial_march[i].freq || imperial_march[i].ms; i++) {
+    floppy_play_note(imperial_march[i].freq, imperial_march[i].ms);
+  }
+
+  floppy.track0_confirmed = false;
+  printf("  Done.\n");
 }
 
 static void cmd_diskdump(int argc, char **argv) {

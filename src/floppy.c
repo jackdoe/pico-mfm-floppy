@@ -174,6 +174,13 @@ static floppy_status_t floppy_seek_track0(floppy_t *f) {
 #define FLOPPY_WRITE_ATTEMPTS 3
 #define FLOPPY_HEAD_SETTLE_MS 20
 
+static void floppy_jog(floppy_t *f, uint8_t track, uint8_t distance) {
+  uint8_t away = (track <= distance) ? track + distance : track - distance;
+  floppy_seek(f, away);
+  floppy_seek(f, track);
+  sleep_ms(FLOPPY_HEAD_SETTLE_MS);
+}
+
 typedef bool (*sector_callback_t)(sector_t *sector, void *ctx);
 
 static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
@@ -257,15 +264,11 @@ need_read:;
   floppy_status_t res = floppy_read_flux(f, target, t->side, complete_track_cb, &ctx);
   if (res == FLOPPY_OK) return res;
 
-  floppy_seek(f, target >= 2 ? target - 2 : target + 2);
-  floppy_seek(f, target);
-  sleep_ms(FLOPPY_HEAD_SETTLE_MS);
+  floppy_jog(f, target, 10);
   res = floppy_read_flux(f, target, t->side, complete_track_cb, &ctx);
   if (res == FLOPPY_OK) return res;
 
-  floppy_seek_track0(f);
-  floppy_seek(f, target);
-  sleep_ms(FLOPPY_HEAD_SETTLE_MS);
+  floppy_jog(f, target, 20);
   res = floppy_read_flux(f, target, t->side, complete_track_cb, &ctx);
 
   if (res == FLOPPY_ERR_TIMEOUT) {
@@ -429,15 +432,11 @@ floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector) {
   floppy_status_t st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
   if (st != FLOPPY_ERR_TIMEOUT) return st;
 
-  floppy_seek(f, target >= 2 ? target - 2 : target + 2);
-  floppy_seek(f, target);
-  sleep_ms(FLOPPY_HEAD_SETTLE_MS);
+  floppy_jog(f, target, 10);
   st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
   if (st != FLOPPY_ERR_TIMEOUT) return st;
 
-  floppy_seek_track0(f);
-  floppy_seek(f, target);
-  sleep_ms(FLOPPY_HEAD_SETTLE_MS);
+  floppy_jog(f, target, 20);
   return floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
 }
 
@@ -493,9 +492,7 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
     }
     floppy_flux_write_stop(f);
 
-    floppy_seek_track0(f);
-    floppy_seek(f, t->track);
-    sleep_ms(FLOPPY_HEAD_SETTLE_MS);
+    floppy_jog(f, t->track, 10);
 
     struct verify_ctx vctx = { .expected = t };
     if (floppy_read_flux(f, t->track, t->side, verify_track_cb, &vctx) == FLOPPY_OK) {
