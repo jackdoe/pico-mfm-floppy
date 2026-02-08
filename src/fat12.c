@@ -308,6 +308,12 @@ static void fat12_write_batch_init(fat12_write_batch_t *batch, fat12_t *fat) {
 }
 
 static fat12_err_t fat12_write_batch_add(fat12_write_batch_t *batch, uint16_t lba, const uint8_t *data) {
+  for (uint8_t i = 0; i < batch->count; i++) {
+    if (batch->lbas[i] == lba) {
+      memcpy(batch->data[i], data, SECTOR_SIZE);
+      return FAT12_OK;
+    }
+  }
   if (batch->count >= FAT12_WRITE_BATCH_MAX) {
     return FAT12_ERR_FULL;
   }

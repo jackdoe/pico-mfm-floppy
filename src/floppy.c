@@ -493,7 +493,7 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
     }
     floppy_flux_write_stop(f);
 
-    floppy_seek(f, t->track >= 2 ? t->track - 2 : t->track + 2);
+    floppy_seek_track0(f);
     floppy_seek(f, t->track);
     sleep_ms(FLOPPY_HEAD_SETTLE_MS);
 
