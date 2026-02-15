@@ -403,6 +403,39 @@ TEST(test_large_file) {
   f12_unmount(&fs);
 }
 
+TEST(test_multiple_small_writes) {
+  vdisk_init(&vdisk);
+
+  f12_t fs;
+  memset(&fs, 0, sizeof(fs));
+  fs.io = vdisk_f12_io();
+  f12_format(&fs, "TEST", false);
+  f12_mount(&fs, vdisk_f12_io());
+
+  f12_file_t *f = f12_open(&fs, "MULTI.TXT", "w");
+  ASSERT(f != NULL);
+
+  const char *lines[] = { "a\n", "b\n", "c\n", "d\n", "e\n", "f\n" };
+  for (int i = 0; i < 6; i++) {
+    int n = f12_write(f, lines[i], 2);
+    ASSERT_EQ(n, 2);
+  }
+
+  f12_err_t err = f12_close(f);
+  ASSERT_EQ(err, F12_OK);
+
+  f = f12_open(&fs, "MULTI.TXT", "r");
+  ASSERT(f != NULL);
+
+  char buf[64];
+  int n = f12_read(f, buf, sizeof(buf));
+  ASSERT_EQ(n, 12);
+  ASSERT_MEM_EQ(buf, "a\nb\nc\nd\ne\nf\n", 12);
+
+  f12_close(f);
+  f12_unmount(&fs);
+}
+
 TEST(test_strerror) {
   ASSERT_STR_EQ(f12_strerror(F12_OK), "Success");
   ASSERT_STR_EQ(f12_strerror(F12_ERR_NOT_FOUND), "File not found");
@@ -458,6 +491,7 @@ int main(void) {
   RUN_TEST(test_read_at);
   RUN_TEST(test_file_not_found);
   RUN_TEST(test_large_file);
+  RUN_TEST(test_multiple_small_writes);
   RUN_TEST(test_strerror);
   RUN_TEST(test_list_callback_proper);
 

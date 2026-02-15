@@ -541,6 +541,85 @@ TEST(test_format_write_read_file) {
   ASSERT(strcmp(buf, content) == 0);
 }
 
+TEST(test_multiple_small_writes) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t writer;
+  fat12_err_t err = fat12_open_write(&fat, "SMALL.TXT", &writer);
+  ASSERT_EQ(err, FAT12_OK);
+
+  const char *lines[] = { "a\n", "b\n", "c\n", "d\n", "e\n", "f\n" };
+  for (int i = 0; i < 6; i++) {
+    int n = fat12_write(&writer, (const uint8_t *)lines[i], 2);
+    ASSERT_EQ(n, 2);
+  }
+
+  err = fat12_close_write(&writer);
+  ASSERT_EQ(err, FAT12_OK);
+
+  fat12_dirent_t entry;
+  err = fat12_find(&fat, "SMALL.TXT", &entry);
+  ASSERT_EQ(err, FAT12_OK);
+  ASSERT_EQ(entry.size, 12);
+
+  fat12_file_t file;
+  fat12_open(&fat, &entry, &file);
+
+  char buf[64] = {0};
+  int n = fat12_read(&file, (uint8_t *)buf, sizeof(buf));
+  ASSERT_EQ(n, 12);
+  ASSERT_MEM_EQ(buf, "a\nb\nc\nd\ne\nf\n", 12);
+}
+
+TEST(test_multiple_small_writes_cross_cluster) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t writer;
+  fat12_err_t err = fat12_open_write(&fat, "CROSS.BIN", &writer);
+  ASSERT_EQ(err, FAT12_OK);
+
+  uint8_t chunk[100];
+  uint32_t written = 0;
+  for (int i = 0; i < 20; i++) {
+    for (int j = 0; j < 100; j++)
+      chunk[j] = (uint8_t)(written + j);
+    int n = fat12_write(&writer, chunk, 100);
+    ASSERT_EQ(n, 100);
+    written += 100;
+  }
+
+  err = fat12_close_write(&writer);
+  ASSERT_EQ(err, FAT12_OK);
+
+  fat12_dirent_t entry;
+  fat12_find(&fat, "CROSS.BIN", &entry);
+  ASSERT_EQ(entry.size, 2000);
+
+  fat12_file_t file;
+  fat12_open(&fat, &entry, &file);
+
+  uint8_t buf[2000];
+  int n = fat12_read(&file, buf, sizeof(buf));
+  ASSERT_EQ(n, 2000);
+
+  for (int i = 0; i < 2000; i++) {
+    if (buf[i] != (uint8_t)i) {
+      printf("FAIL\n  Byte %d: expected %02X, got %02X\n", i, (uint8_t)i, buf[i]);
+      exit(1);
+    }
+  }
+}
+
 TEST(test_format_null_write_callback) {
   fat12_io_t io = { .read = vdisk_read, .write = NULL, .ctx = NULL };
 
@@ -565,6 +644,10 @@ int main(void) {
   RUN_TEST(test_cluster_chain);
   RUN_TEST(test_reuse_deleted_entry);
   RUN_TEST(test_fat_entry_manipulation);
+
+  printf("\n--- Small Writes Tests ---\n");
+  RUN_TEST(test_multiple_small_writes);
+  RUN_TEST(test_multiple_small_writes_cross_cluster);
 
   printf("\n--- Format Tests ---\n");
   RUN_TEST(test_format_quick);

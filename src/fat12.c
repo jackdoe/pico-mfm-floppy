@@ -674,7 +674,7 @@ int fat12_write(fat12_writer_t *writer, const uint8_t *buf, uint16_t len) {
       uint16_t lba = fat12_cluster_to_lba(fat, writer->current_cluster);
       for (uint8_t i = 0; i < fat->bpb.sectors_per_cluster; i++) {
         sector_t sector;
-        if (!fat12_read_sector(fat, lba + i, &sector)) {
+        if (!fat12_read_sector_batched(writer->batch, lba + i, &sector)) {
           memset(cluster_buf + i * SECTOR_SIZE, 0, SECTOR_SIZE);
         } else {
           memcpy(cluster_buf + i * SECTOR_SIZE, sector.data, SECTOR_SIZE);
