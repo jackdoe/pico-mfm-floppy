@@ -505,8 +505,8 @@ static fat12_err_t fat12_write_cluster(fat12_write_batch_t *batch,
 }
 
 static fat12_err_t fat12_write_root_entry(fat12_write_batch_t *batch,
-                                          uint16_t index,
-                                          fat12_dirent_t *entry) {
+                                           uint16_t index,
+                                           fat12_dirent_t *entry) {
   fat12_t *fat = batch->fat;
 
   if (index >= fat->bpb.root_entries) {
@@ -518,7 +518,7 @@ static fat12_err_t fat12_write_root_entry(fat12_write_batch_t *batch,
   uint16_t offset = (index * FAT12_DIR_ENTRY_SIZE) % SECTOR_SIZE;
 
   sector_t sector;
-  if (!fat12_read_sector(fat, sector_lba, &sector)) {
+  if (!fat12_read_sector_batched(batch, sector_lba, &sector)) {
     return FAT12_ERR_READ;
   }
 

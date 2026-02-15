@@ -576,6 +576,141 @@ TEST(test_multiple_small_writes) {
   ASSERT_MEM_EQ(buf, "a\nb\nc\nd\ne\nf\n", 12);
 }
 
+TEST(test_single_byte_writes) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t writer;
+  fat12_err_t err = fat12_open_write(&fat, "BYTE.BIN", &writer);
+  ASSERT_EQ(err, FAT12_OK);
+
+  for (int i = 0; i < 256; i++) {
+    uint8_t b = (uint8_t)i;
+    int n = fat12_write(&writer, &b, 1);
+    ASSERT_EQ(n, 1);
+  }
+
+  err = fat12_close_write(&writer);
+  ASSERT_EQ(err, FAT12_OK);
+
+  fat12_dirent_t entry;
+  fat12_find(&fat, "BYTE.BIN", &entry);
+  ASSERT_EQ(entry.size, 256);
+
+  fat12_file_t file;
+  fat12_open(&fat, &entry, &file);
+
+  uint8_t buf[256];
+  int n = fat12_read(&file, buf, sizeof(buf));
+  ASSERT_EQ(n, 256);
+
+  for (int i = 0; i < 256; i++) {
+    if (buf[i] != (uint8_t)i) {
+      printf("FAIL\n  Byte %d: expected %02X, got %02X\n", i, (uint8_t)i, buf[i]);
+      exit(1);
+    }
+  }
+}
+
+TEST(test_write_exact_cluster_boundary) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t writer;
+  fat12_err_t err = fat12_open_write(&fat, "BOUND.BIN", &writer);
+  ASSERT_EQ(err, FAT12_OK);
+
+  uint8_t buf[128];
+  for (int chunk = 0; chunk < 8; chunk++) {
+    for (int i = 0; i < 128; i++)
+      buf[i] = (uint8_t)(chunk * 128 + i);
+    int n = fat12_write(&writer, buf, 128);
+    ASSERT_EQ(n, 128);
+  }
+
+  err = fat12_close_write(&writer);
+  ASSERT_EQ(err, FAT12_OK);
+
+  fat12_dirent_t entry;
+  fat12_find(&fat, "BOUND.BIN", &entry);
+  ASSERT_EQ(entry.size, 1024);
+
+  fat12_file_t file;
+  fat12_open(&fat, &entry, &file);
+
+  uint8_t readbuf[1024];
+  int n = fat12_read(&file, readbuf, sizeof(readbuf));
+  ASSERT_EQ(n, 1024);
+
+  for (int i = 0; i < 1024; i++) {
+    if (readbuf[i] != (uint8_t)i) {
+      printf("FAIL\n  Byte %d: expected %02X, got %02X\n", i, (uint8_t)i, readbuf[i]);
+      exit(1);
+    }
+  }
+}
+
+TEST(test_many_small_writes_large_file) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t writer;
+  fat12_err_t err = fat12_open_write(&fat, "BIG.BIN", &writer);
+  ASSERT_EQ(err, FAT12_OK);
+
+  uint32_t total = 10000;
+  uint32_t written = 0;
+  uint8_t chunk[121];
+  while (written < total) {
+    uint16_t len = total - written;
+    if (len > 121) len = 121;
+    for (uint16_t i = 0; i < len; i++)
+      chunk[i] = (uint8_t)(written + i);
+    int n = fat12_write(&writer, chunk, len);
+    ASSERT_EQ(n, (int)len);
+    written += len;
+  }
+
+  err = fat12_close_write(&writer);
+  ASSERT_EQ(err, FAT12_OK);
+
+  fat12_dirent_t entry;
+  fat12_find(&fat, "BIG.BIN", &entry);
+  ASSERT_EQ(entry.size, total);
+
+  fat12_file_t file;
+  fat12_open(&fat, &entry, &file);
+
+  uint8_t buf[512];
+  uint32_t verified = 0;
+  while (verified < total) {
+    uint16_t want = total - verified;
+    if (want > 512) want = 512;
+    int n = fat12_read(&file, buf, want);
+    ASSERT(n > 0);
+    for (int i = 0; i < n; i++) {
+      if (buf[i] != (uint8_t)(verified + i)) {
+        printf("FAIL\n  Byte %lu: expected %02X, got %02X\n",
+               (unsigned long)(verified + i), (uint8_t)(verified + i), buf[i]);
+        exit(1);
+      }
+    }
+    verified += n;
+  }
+}
+
 TEST(test_multiple_small_writes_cross_cluster) {
   vdisk_t disk;
   vdisk_format_valid(&disk);
@@ -645,8 +780,11 @@ int main(void) {
   RUN_TEST(test_reuse_deleted_entry);
   RUN_TEST(test_fat_entry_manipulation);
 
-  printf("\n--- Small Writes Tests ---\n");
+  printf("\n--- Incremental Write Tests ---\n");
   RUN_TEST(test_multiple_small_writes);
+  RUN_TEST(test_single_byte_writes);
+  RUN_TEST(test_write_exact_cluster_boundary);
+  RUN_TEST(test_many_small_writes_large_file);
   RUN_TEST(test_multiple_small_writes_cross_cluster);
 
   printf("\n--- Format Tests ---\n");

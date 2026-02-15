@@ -436,6 +436,102 @@ TEST(test_multiple_small_writes) {
   f12_unmount(&fs);
 }
 
+TEST(test_single_byte_writes) {
+  vdisk_init(&vdisk);
+
+  f12_t fs;
+  memset(&fs, 0, sizeof(fs));
+  fs.io = vdisk_f12_io();
+  f12_format(&fs, "TEST", false);
+  f12_mount(&fs, vdisk_f12_io());
+
+  f12_file_t *f = f12_open(&fs, "BYTES.BIN", "w");
+  ASSERT(f != NULL);
+
+  for (int i = 0; i < 256; i++) {
+    uint8_t b = (uint8_t)i;
+    int n = f12_write(f, &b, 1);
+    ASSERT_EQ(n, 1);
+  }
+
+  f12_err_t err = f12_close(f);
+  ASSERT_EQ(err, F12_OK);
+
+  f = f12_open(&fs, "BYTES.BIN", "r");
+  ASSERT(f != NULL);
+
+  uint8_t buf[256];
+  int n = f12_read(f, buf, sizeof(buf));
+  ASSERT_EQ(n, 256);
+
+  for (int i = 0; i < 256; i++) {
+    if (buf[i] != (uint8_t)i) {
+      printf("FAIL\n  Byte %d: expected %02X, got %02X\n", i, (uint8_t)i, buf[i]);
+      exit(1);
+    }
+  }
+
+  f12_close(f);
+  f12_unmount(&fs);
+}
+
+TEST(test_rpc_chunk_writes) {
+  vdisk_init(&vdisk);
+
+  f12_t fs;
+  memset(&fs, 0, sizeof(fs));
+  fs.io = vdisk_f12_io();
+  f12_format(&fs, "TEST", false);
+  f12_mount(&fs, vdisk_f12_io());
+
+  f12_file_t *f = f12_open(&fs, "RPC.BIN", "w");
+  ASSERT(f != NULL);
+
+  uint32_t total = 10000;
+  uint32_t written = 0;
+  uint8_t chunk[121];
+  while (written < total) {
+    uint32_t len = total - written;
+    if (len > 121) len = 121;
+    for (uint32_t i = 0; i < len; i++)
+      chunk[i] = (uint8_t)(written + i);
+    int n = f12_write(f, chunk, len);
+    ASSERT_EQ(n, (int)len);
+    written += len;
+  }
+
+  f12_err_t err = f12_close(f);
+  ASSERT_EQ(err, F12_OK);
+
+  f12_stat_t stat;
+  err = f12_stat(&fs, "RPC.BIN", &stat);
+  ASSERT_EQ(err, F12_OK);
+  ASSERT_EQ(stat.size, total);
+
+  f = f12_open(&fs, "RPC.BIN", "r");
+  ASSERT(f != NULL);
+
+  uint8_t buf[512];
+  uint32_t verified = 0;
+  while (verified < total) {
+    uint32_t want = total - verified;
+    if (want > 512) want = 512;
+    int n = f12_read(f, buf, want);
+    ASSERT(n > 0);
+    for (int i = 0; i < n; i++) {
+      if (buf[i] != (uint8_t)(verified + i)) {
+        printf("FAIL\n  Byte %lu: expected %02X, got %02X\n",
+               (unsigned long)(verified + i), (uint8_t)(verified + i), buf[i]);
+        exit(1);
+      }
+    }
+    verified += n;
+  }
+
+  f12_close(f);
+  f12_unmount(&fs);
+}
+
 TEST(test_strerror) {
   ASSERT_STR_EQ(f12_strerror(F12_OK), "Success");
   ASSERT_STR_EQ(f12_strerror(F12_ERR_NOT_FOUND), "File not found");
@@ -492,6 +588,8 @@ int main(void) {
   RUN_TEST(test_file_not_found);
   RUN_TEST(test_large_file);
   RUN_TEST(test_multiple_small_writes);
+  RUN_TEST(test_single_byte_writes);
+  RUN_TEST(test_rpc_chunk_writes);
   RUN_TEST(test_strerror);
   RUN_TEST(test_list_callback_proper);
 
