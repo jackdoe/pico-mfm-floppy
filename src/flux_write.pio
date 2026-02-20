@@ -47,7 +47,7 @@ static inline void flux_write_program_init(PIO pio, uint sm, uint offset, uint p
 
     uint32_t sys_hz = clock_get_hz(clk_sys);
     uint16_t div_int = sys_hz / 24000000;
-    uint8_t div_frac = (uint8_t)((sys_hz % 24000000) * 256 / 24000000);
+    uint8_t div_frac = (uint8_t)((uint64_t)(sys_hz % 24000000) * 256 / 24000000);
     sm_config_set_clkdiv_int_frac(&c, div_int, div_frac);
 
     // Initialize the pin

@@ -495,11 +495,13 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
     floppy_seek(f, t->track);
     floppy_side_select(f, t->side);
     floppy_wait_for_index(f);
+    uint32_t irq_state = save_and_disable_interrupts();
     floppy_flux_write_start(f);
     for (size_t i = 0; i < enc.pos; i++) {
       pio_sm_put_blocking(f->write.pio, f->write.sm, flux_buf[i]);
     }
     floppy_flux_write_stop(f);
+    restore_interrupts(irq_state);
 
     floppy_jog(f, t->track, 10);
 
