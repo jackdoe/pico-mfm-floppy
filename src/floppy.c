@@ -194,6 +194,8 @@ static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
   mfm_init(&mfm);
   mfm_reset(&mfm);
 
+  uint32_t irq_state = save_and_disable_interrupts();
+
   uint16_t prev = flux_read_wait(f) >> 1;
   bool ix_prev = false;
   floppy_status_t res = FLOPPY_ERR_TIMEOUT;
@@ -211,14 +213,16 @@ static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
     if (mfm_feed(&mfm, delta, &sector)) {
       if (sector.valid && sector.sector_n >= 1 && sector.sector_n <= SECTORS_PER_TRACK) {
         if (sector.track != track) {
+          restore_interrupts(irq_state);
           FLOPPY_ERR("[floppy] wrong track: expected %d, got %d\n", track, sector.track);
-          res = FLOPPY_ERR_WRONG_TRACK;
-          break;
+          floppy_flux_read_stop(f);
+          return FLOPPY_ERR_WRONG_TRACK;
         }
         if (sector.side != side) {
+          restore_interrupts(irq_state);
           FLOPPY_ERR("[floppy] wrong side: expected %d, got %d\n", side, sector.side);
-          res = FLOPPY_ERR_WRONG_SIDE;
-          break;
+          floppy_flux_read_stop(f);
+          return FLOPPY_ERR_WRONG_SIDE;
         }
         if (cb(&sector, ctx)) {
           res = FLOPPY_OK;
@@ -229,6 +233,7 @@ static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
     prev = cnt;
   }
 
+  restore_interrupts(irq_state);
   floppy_flux_read_stop(f);
   return res;
 }
