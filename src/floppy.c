@@ -473,7 +473,11 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
     return status;
   }
 
+#if PICO_RP2040
+  static uint8_t flux_buf[110000];
+#else
   static uint8_t flux_buf[200000];
+#endif
   mfm_encode_t enc;
   mfm_encode_init(&enc, flux_buf, sizeof(flux_buf));
   mfm_encode_track(&enc, t);

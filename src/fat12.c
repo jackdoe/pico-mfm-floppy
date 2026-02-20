@@ -332,7 +332,7 @@ static fat12_err_t fat12_write_batch_flush(fat12_write_batch_t *batch) {
     uint8_t c, h, s;
     fat12_lba_to_chs(fat, batch->lbas[0], &c, &h, &s);
 
-    track_t track;
+    static track_t track;
     memset(&track, 0, sizeof(track));
     track.track = c;
     track.side = h;
@@ -901,7 +901,7 @@ fat12_err_t fat12_format(fat12_io_t io, const char *volume_label, bool write_all
 
   for (uint8_t cyl = 0; cyl < 80; cyl++) {
     for (uint8_t side = 0; side < lay.bpb.num_heads; side++) {
-      track_t t;
+      static track_t t;
       memset(&t, 0, sizeof(t));
       t.track = cyl;
       t.side = side;

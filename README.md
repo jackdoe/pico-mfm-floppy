@@ -1,6 +1,6 @@
 # Pico Floppy
 
-A bare-metal 3.5" HD floppy disk driver for the Raspberry Pi Pico 2 (RP2350). MFM encoding/decoding and FAT12 filesystem with no dedicated floppy controller hardware — just PIO and software.
+A bare-metal 3.5" HD floppy disk driver for the Raspberry Pi Pico (RP2040) and Pico 2 (RP2350). MFM encoding/decoding and FAT12 filesystem with no dedicated floppy controller hardware — just PIO and software.
 
 Verified against 9 real floppy disks (System Shock, 1994) decoded from raw magnetic flux captures.
 
@@ -50,7 +50,7 @@ src/
 
 ## Hardware
 
-3.5" HD floppy drive connected to the Pico 2 via 34-pin interface. All signals are active-low open-drain.
+3.5" HD floppy drive connected to the Pico or Pico 2 via 34-pin interface. All signals are active-low open-drain.
 
 ```
 Floppy Pin   Signal           Pico GPIO
@@ -80,8 +80,16 @@ READ_DATA needs an external 4.7kΩ pull-up because the internal pull-ups (50kΩ)
 Firmware (requires Pico SDK):
 ```sh
 mkdir build && cd build
-cmake .. && make
+cmake .. && make        # builds for Pico 2 (RP2350) by default
 ```
+
+To build for the original Pico (RP2040), change `PICO_BOARD` in `CMakeLists.txt`:
+```cmake
+set(PICO_BOARD pico)    # RP2040
+set(PICO_BOARD pico2)   # RP2350 (default)
+```
+
+The only difference is the MFM flux buffer size (110 KB on RP2040 vs 200 KB on RP2350), adjusted automatically via `#if PICO_RP2040`. All other buffers (LRU cache, write batch) are identical.
 
 Tests (host-side, no hardware needed):
 ```sh
@@ -102,7 +110,7 @@ Tests (host-side, no hardware needed):
 
 ## Testing
 
-106 unit tests, 12,001 fuzz iterations, 100 SCP roundtrip fuzz iterations. Tested against real 1994 floppy disks.
+112 unit tests, 12,001 fuzz iterations, 100 SCP roundtrip fuzz iterations. Tested against real 1994 floppy disks. Tests run for both RP2040 and RP2350 configurations.
 
 ```
 tests/
