@@ -9,7 +9,11 @@
 #include "lru.h"
 
 #define F12_MAX_OPEN_FILES 10
+#if PICO_RP2040
+#define F12_CACHE_SIZE 18
+#else
 #define F12_CACHE_SIZE 54
+#endif
 
 typedef enum {
   F12_OK = 0,

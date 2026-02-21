@@ -194,8 +194,6 @@ static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
   mfm_init(&mfm);
   mfm_reset(&mfm);
 
-  uint32_t irq_state = save_and_disable_interrupts();
-
   uint16_t prev = flux_read_wait(f) >> 1;
   bool ix_prev = false;
   floppy_status_t res = FLOPPY_ERR_TIMEOUT;
@@ -213,13 +211,11 @@ static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
     if (mfm_feed(&mfm, delta, &sector)) {
       if (sector.valid && sector.sector_n >= 1 && sector.sector_n <= SECTORS_PER_TRACK) {
         if (sector.track != track) {
-          restore_interrupts(irq_state);
           FLOPPY_ERR("[floppy] wrong track: expected %d, got %d\n", track, sector.track);
           floppy_flux_read_stop(f);
           return FLOPPY_ERR_WRONG_TRACK;
         }
         if (sector.side != side) {
-          restore_interrupts(irq_state);
           FLOPPY_ERR("[floppy] wrong side: expected %d, got %d\n", side, sector.side);
           floppy_flux_read_stop(f);
           return FLOPPY_ERR_WRONG_SIDE;
@@ -233,7 +229,6 @@ static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
     prev = cnt;
   }
 
-  restore_interrupts(irq_state);
   floppy_flux_read_stop(f);
   return res;
 }
@@ -479,7 +474,7 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
   }
 
 #if PICO_RP2040
-  static uint8_t flux_buf[110000];
+  static uint8_t flux_buf[130000];
 #else
   static uint8_t flux_buf[200000];
 #endif
@@ -495,13 +490,11 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
     floppy_seek(f, t->track);
     floppy_side_select(f, t->side);
     floppy_wait_for_index(f);
-    uint32_t irq_state = save_and_disable_interrupts();
     floppy_flux_write_start(f);
     for (size_t i = 0; i < enc.pos; i++) {
       pio_sm_put_blocking(f->write.pio, f->write.sm, flux_buf[i]);
     }
     floppy_flux_write_stop(f);
-    restore_interrupts(irq_state);
 
     floppy_jog(f, t->track, 10);
 
