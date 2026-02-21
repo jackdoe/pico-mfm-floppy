@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include "pico/stdlib.h"
 #include "pico/time.h"
+#include "hardware/clocks.h"
 #include "hardware/pio.h"
 #include "hardware/gpio.h"
 #include "hardware/watchdog.h"
