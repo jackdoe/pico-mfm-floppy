@@ -1754,6 +1754,12 @@ static void cmd_reboot(int argc, char **argv) {
 // ============== Main ==============
 
 int main(void) {
+#if PICO_RP2040
+  // Overclock to 144MHz so PIO dividers are exact integers:
+  // read PIO: 144/72 = 2.0, write PIO: 144/24 = 6.0
+  // Avoids massive jitter from fractional divider with div_int=1
+  set_sys_clock_khz(144000, true);
+#endif
   stdio_init_all();
   sleep_ms(2000);
 
