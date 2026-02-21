@@ -474,7 +474,7 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
   }
 
 #if PICO_RP2040
-  static uint8_t flux_buf[130000];
+  static uint8_t flux_buf[110000];
 #else
   static uint8_t flux_buf[200000];
 #endif
@@ -496,11 +496,12 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
     }
     floppy_flux_write_stop(f);
 
-    floppy_jog(f, t->track, 10);
-
     struct verify_ctx vctx = { .expected = t };
-    if (floppy_read_flux(f, t->track, t->side, verify_track_cb, &vctx) == FLOPPY_OK) {
-      return FLOPPY_OK;
+    for (int verify = 0; verify < 3; verify++) {
+      floppy_jog(f, t->track, 10);
+      if (floppy_read_flux(f, t->track, t->side, verify_track_cb, &vctx) == FLOPPY_OK) {
+        return FLOPPY_OK;
+      }
     }
 
     FLOPPY_ERR("[floppy] verify failed track %d side %d attempt %d, bad sectors:",
