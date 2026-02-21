@@ -89,7 +89,9 @@ set(PICO_BOARD pico)    # RP2040
 set(PICO_BOARD pico2)   # RP2350 (default)
 ```
 
-The only difference is the MFM flux buffer size (110 KB on RP2040 vs 200 KB on RP2350), adjusted automatically via `#if PICO_RP2040`. All other buffers (LRU cache, write batch) are identical.
+RP2040 differences (handled automatically via `#if PICO_RP2040`):
+- MFM flux buffer: 110 KB (vs 200 KB on RP2350)
+- System clock: overclocked to 144 MHz so PIO dividers are exact integers (read: 144/72 = 2, write: 144/24 = 6), avoiding the massive jitter from fractional dividers with `div_int=1` at 125 MHz
 
 Tests (host-side, no hardware needed):
 ```sh
@@ -102,7 +104,7 @@ Tests (host-side, no hardware needed):
 
 **Write precompensation** — on inner tracks (≥40), adjacent flux transitions are shifted ±125ns to counteract magnetic bit shift. Without this, inner track writes have 5-15% error rates.
 
-**Write-verify-retry** — every track write is read back after recalibrating to track 0 and re-seeking, forcing maximum head displacement. All 18 sectors are compared byte-for-byte. Three attempts with escalating recovery: write+verify, write+verify, recalibrate+write+verify. Reports exactly which sectors failed on each attempt.
+**Write-verify-retry** — every track write is verified by reading back and comparing all 18 sectors byte-for-byte. Each write attempt retries the verify read up to 3 times (with head jog between each) before re-writing. Three write attempts with escalating recovery: write+verify, write+verify, recalibrate+write+verify. Reports exactly which sectors failed.
 
 **Batch-aware FAT writes** — the write batch system coalesces sector writes by track and deduplicates FAT sector updates in-place, minimizing physical I/O. The free cluster search reads through the batch to see pending FAT updates, avoiding unnecessary flushes.
 
