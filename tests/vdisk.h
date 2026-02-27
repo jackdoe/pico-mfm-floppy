@@ -110,4 +110,41 @@ static inline void vdisk_format_valid(vdisk_t *disk) {
   disk->data[10][2] = 0xFF;
 }
 
+#define VDISK_FAT1_START 1
+#define VDISK_FAT2_START 10
+#define VDISK_SECTORS_PER_FAT 9
+
+static inline void vdisk_set_fat_entry(vdisk_t *disk, uint16_t cluster, uint16_t value) {
+  uint32_t fat_offset = cluster + (cluster / 2);
+  uint16_t sector_lba = VDISK_FAT1_START + (fat_offset / SECTOR_SIZE);
+  uint16_t offset = fat_offset % SECTOR_SIZE;
+  uint8_t *s = disk->data[sector_lba];
+
+  if (offset == SECTOR_SIZE - 1) {
+    uint8_t *s2 = disk->data[sector_lba + 1];
+    if (cluster & 1) {
+      s[offset] = (s[offset] & 0x0F) | ((value & 0x0F) << 4);
+      s2[0] = value >> 4;
+    } else {
+      s[offset] = value & 0xFF;
+      s2[0] = (s2[0] & 0xF0) | ((value >> 8) & 0x0F);
+    }
+    uint16_t f2 = VDISK_FAT2_START + (fat_offset / SECTOR_SIZE);
+    disk->data[f2][offset] = s[offset];
+    disk->data[f2 + 1][0] = s2[0];
+  } else {
+    uint16_t existing = s[offset] | (s[offset + 1] << 8);
+    if (cluster & 1) {
+      existing = (existing & 0x000F) | (value << 4);
+    } else {
+      existing = (existing & 0xF000) | (value & 0x0FFF);
+    }
+    s[offset] = existing & 0xFF;
+    s[offset + 1] = existing >> 8;
+    uint16_t f2 = VDISK_FAT2_START + (fat_offset / SECTOR_SIZE);
+    disk->data[f2][offset] = s[offset];
+    disk->data[f2][offset + 1] = s[offset + 1];
+  }
+}
+
 #endif

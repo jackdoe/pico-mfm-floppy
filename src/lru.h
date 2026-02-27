@@ -10,6 +10,7 @@ typedef struct lru_entry {
   struct lru_entry *prev;
   struct lru_entry *next;
   bool occupied;
+  bool pinned;
 } lru_entry_t;
 
 typedef struct {
@@ -33,6 +34,8 @@ void *lru_set(lru_t *lru, uint32_t key, const void *value);
 void *lru_get_or_create(lru_t *lru, uint32_t key, bool *is_new);
 
 bool lru_remove(lru_t *lru, uint32_t key);
+
+bool lru_pin(lru_t *lru, uint32_t key);
 
 void lru_clear(lru_t *lru);
 

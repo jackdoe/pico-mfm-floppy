@@ -257,6 +257,49 @@ TEST(test_mfm_encode_null_sector) {
   ASSERT(enc.pos > 0);
 }
 
+TEST(test_fat12_fat_mismatch_detection) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+  ASSERT(!fat.fat_mismatch);
+
+  disk.data[VDISK_FAT2_START][3] ^= 0xFF;
+
+  fat12_init(&fat, io);
+  ASSERT(fat.fat_mismatch);
+}
+
+TEST(test_fat12_delete_loop_detection) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t writer;
+  fat12_open_write(&fat, "LOOP.TXT", &writer);
+  uint8_t data[1024];
+  memset(data, 0xAA, sizeof(data));
+  fat12_write(&writer, data, sizeof(data));
+  fat12_close_write(&writer);
+
+  fat12_dirent_t entry;
+  fat12_find(&fat, "LOOP.TXT", &entry);
+  uint16_t start = entry.start_cluster;
+  ASSERT(start >= 2);
+
+  vdisk_set_fat_entry(&disk, start, start + 1);
+  vdisk_set_fat_entry(&disk, start + 1, start);
+
+  fat12_init(&fat, io);
+
+  fat12_delete(&fat, "LOOP.TXT");
+}
+
 int main(void) {
   printf("=== Robustness Tests ===\n\n");
 
@@ -267,6 +310,8 @@ int main(void) {
   RUN_TEST(test_fat12_zero_sectors_per_cluster);
   RUN_TEST(test_fat12_null_read_callback);
   RUN_TEST(test_fat12_cluster_underflow);
+  RUN_TEST(test_fat12_delete_loop_detection);
+  RUN_TEST(test_fat12_fat_mismatch_detection);
 
   printf("\n--- MFM Decoder Edge Cases ---\n");
   RUN_TEST(test_mfm_decode_large_size_code);

@@ -56,6 +56,13 @@ static lru_entry_t *lru_find_free(lru_t *lru) {
   return NULL;
 }
 
+static lru_entry_t *lru_find_evictable(lru_t *lru) {
+  for (lru_entry_t *e = lru->tail; e; e = e->prev) {
+    if (!e->pinned) return e;
+  }
+  return NULL;
+}
+
 lru_t *lru_init(uint32_t max_entries, uint32_t elem_size) {
   if (max_entries == 0 || elem_size == 0) return NULL;
 
@@ -120,7 +127,7 @@ void *lru_set(lru_t *lru, uint32_t key, const void *value) {
 
   entry = lru_find_free(lru);
   if (!entry) {
-    entry = lru->tail;
+    entry = lru_find_evictable(lru);
     if (!entry) return NULL;
 
     lru_unlink(lru, entry);
@@ -129,6 +136,7 @@ void *lru_set(lru_t *lru, uint32_t key, const void *value) {
 
   entry->key = key;
   entry->occupied = true;
+  entry->pinned = false;
   void *dest = lru_entry_value(entry);
   if (value) {
     memcpy(dest, value, lru->elem_size);
@@ -159,7 +167,7 @@ void *lru_get_or_create(lru_t *lru, uint32_t key, bool *is_new) {
 
   entry = lru_find_free(lru);
   if (!entry) {
-    entry = lru->tail;
+    entry = lru_find_evictable(lru);
     if (!entry) return NULL;
 
     lru_unlink(lru, entry);
@@ -168,12 +176,21 @@ void *lru_get_or_create(lru_t *lru, uint32_t key, bool *is_new) {
 
   entry->key = key;
   entry->occupied = true;
+  entry->pinned = false;
   void *dest = lru_entry_value(entry);
   memset(dest, 0, lru->elem_size);
   lru_push_front(lru, entry);
   lru->count++;
 
   return dest;
+}
+
+bool lru_pin(lru_t *lru, uint32_t key) {
+  if (!lru) return false;
+  lru_entry_t *entry = lru_find(lru, key);
+  if (!entry) return false;
+  entry->pinned = true;
+  return true;
 }
 
 bool lru_remove(lru_t *lru, uint32_t key) {
@@ -198,6 +215,7 @@ void lru_clear(lru_t *lru) {
     if (entry->occupied) {
       entry->key = 0;
       entry->occupied = false;
+      entry->pinned = false;
       entry->prev = NULL;
       entry->next = NULL;
     }

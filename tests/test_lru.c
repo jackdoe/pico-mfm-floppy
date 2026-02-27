@@ -364,6 +364,46 @@ TEST(test_direct_write_to_slot) {
   lru_free(lru);
 }
 
+TEST(test_pin_survives_eviction) {
+  lru_t *lru = lru_init(3, sizeof(int));
+
+  int v1 = 1, v2 = 2, v3 = 3, v4 = 4;
+  lru_set(lru, 1, &v1);
+  lru_set(lru, 2, &v2);
+  lru_set(lru, 3, &v3);
+
+  lru_pin(lru, 1);
+
+  lru_set(lru, 4, &v4);
+  ASSERT_EQ(lru_count(lru), 3);
+
+  ASSERT_NOT_NULL(lru_get(lru, 1));
+  ASSERT_EQ(*(int *)lru_get(lru, 1), 1);
+
+  ASSERT_NULL(lru_get(lru, 2));
+
+  ASSERT_NOT_NULL(lru_get(lru, 3));
+  ASSERT_NOT_NULL(lru_get(lru, 4));
+
+  lru_free(lru);
+}
+
+TEST(test_pin_cleared_on_clear) {
+  lru_t *lru = lru_init(3, sizeof(int));
+
+  int v1 = 1, v2 = 2, v3 = 3, v4 = 4;
+  lru_set(lru, 1, &v1);
+  lru_pin(lru, 1);
+  lru_clear(lru);
+
+  lru_set(lru, 2, &v2);
+  lru_set(lru, 3, &v3);
+  lru_set(lru, 4, &v4);
+  ASSERT_NULL(lru_get(lru, 1));
+
+  lru_free(lru);
+}
+
 int main(void) {
   printf("=== LRU Cache Tests ===\n\n");
 
@@ -388,6 +428,8 @@ int main(void) {
   RUN_TEST(test_set_null_value);
   RUN_TEST(test_large_elem_size);
   RUN_TEST(test_direct_write_to_slot);
+  RUN_TEST(test_pin_survives_eviction);
+  RUN_TEST(test_pin_cleared_on_clear);
 
   TEST_RESULTS();
 }

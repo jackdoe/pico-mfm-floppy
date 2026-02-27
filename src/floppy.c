@@ -450,6 +450,8 @@ static bool verify_track_cb(sector_t *sector, void *ctx) {
   int idx = sector->sector_n - 1;
 
   if (!v->verified[idx] &&
+      sector->track == v->expected->sectors[idx].track &&
+      sector->side == v->expected->sectors[idx].side &&
       memcmp(sector->data, v->expected->sectors[idx].data, SECTOR_SIZE) == 0) {
     v->verified[idx] = true;
   }

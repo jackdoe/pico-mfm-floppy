@@ -106,7 +106,7 @@ typedef struct fat12 fat12_t;
 typedef struct {
   fat12_t *fat;
   uint16_t lbas[FAT12_WRITE_BATCH_MAX];
-  uint8_t data[FAT12_WRITE_BATCH_MAX][SECTOR_SIZE];
+  uint8_t (*data)[SECTOR_SIZE];
   uint8_t count;
 } fat12_write_batch_t;
 
@@ -124,6 +124,10 @@ struct fat12 {
 
   fat12_write_batch_t batch;
   bool batch_in_use;
+
+  uint16_t next_free_hint;
+  track_t *track_buf;
+  bool fat_mismatch;
 };
 
 typedef struct {
@@ -146,6 +150,7 @@ typedef enum {
 
 typedef struct {
   fat12_t *fat;
+  uint16_t start_cluster;
   uint16_t current_cluster;
   uint32_t file_size;
   uint32_t bytes_read;
@@ -161,7 +166,6 @@ typedef struct {
   uint16_t prev_cluster;
   uint32_t bytes_written;
   uint16_t cluster_offset;
-  uint16_t next_free_hint;
 } fat12_writer_t;
 
 fat12_err_t fat12_init(fat12_t *fat, fat12_io_t io);
@@ -176,6 +180,7 @@ bool fat12_entry_is_end(fat12_dirent_t *entry);
 fat12_err_t fat12_find(fat12_t *fat, const char *filename, fat12_dirent_t *entry);
 
 fat12_err_t fat12_open(fat12_t *fat, fat12_dirent_t *entry, fat12_file_t *file);
+fat12_err_t fat12_seek(fat12_file_t *file, uint32_t offset);
 int fat12_read(fat12_file_t *file, uint8_t *buf, uint16_t len);
 fat12_err_t fat12_read_cluster(fat12_t *fat, uint16_t cluster, uint8_t *buf);
 

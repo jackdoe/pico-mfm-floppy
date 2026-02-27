@@ -56,15 +56,21 @@ static bool f12_cached_read(void *ctx, sector_t *sector) {
     return true;
   }
 
-  if (fs->io.read_track) {
-    static track_t track;
-    track.track = sector->track;
-    track.side = sector->side;
-    fs->io.read_track(fs->io.ctx, &track);
+  if (fs->io.read_track && fs->fat.track_buf) {
+    track_t *track = fs->fat.track_buf;
+    track->track = sector->track;
+    track->side = sector->side;
+    fs->io.read_track(fs->io.ctx, track);
+    uint16_t pin_limit = fs->fat.root_dir_start_sector + fs->fat.root_dir_sectors;
+    uint16_t track_lba_base = (track->track * fs->fat.bpb.num_heads + track->side)
+                              * fs->fat.bpb.sectors_per_track;
     for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-      if (track.sectors[i].valid) {
-        lru_set(fs->cache, lru_key(track.track, track.side, i + 1),
-                track.sectors[i].data);
+      if (track->sectors[i].valid) {
+        uint32_t k = lru_key(track->track, track->side, i + 1);
+        lru_set(fs->cache, k, track->sectors[i].data);
+        if (track_lba_base + i < pin_limit) {
+          lru_pin(fs->cache, k);
+        }
       }
     }
     cached = lru_get(fs->cache, key);
@@ -81,6 +87,11 @@ static bool f12_cached_read(void *ctx, sector_t *sector) {
 
   if (sector->valid) {
     lru_set(fs->cache, key, sector->data);
+    uint16_t lba = (sector->track * fs->fat.bpb.num_heads + sector->side)
+                   * fs->fat.bpb.sectors_per_track + (sector->sector_n - 1);
+    if (lba < fs->fat.root_dir_start_sector + fs->fat.root_dir_sectors) {
+      lru_pin(fs->cache, key);
+    }
   }
 
   return true;
@@ -199,6 +210,9 @@ void f12_unmount(f12_t *fs) {
     lru_free(fs->cache);
     fs->cache = NULL;
   }
+
+  free(fs->fat.track_buf);
+  fs->fat.track_buf = NULL;
 
   fs->mounted = false;
 }
@@ -372,21 +386,12 @@ f12_err_t f12_seek(f12_file_t *file, uint32_t offset) {
   f12_err_t err = f12_check_disk(file->fs);
   if (err != F12_OK) return err;
 
-  fat12_err_t ferr = fat12_open(&file->fs->fat, &file->dirent, &file->reader);
+  fat12_err_t ferr = fat12_seek(&file->reader, offset);
   if (ferr != FAT12_OK) {
     return f12_set_error(file->fs, fat12_to_f12_err(ferr));
   }
 
-  uint8_t skip_buf[64];
-  uint32_t to_skip = offset;
-  while (to_skip > 0) {
-    uint16_t chunk = (to_skip > sizeof(skip_buf)) ? sizeof(skip_buf) : to_skip;
-    int n = fat12_read(&file->reader, skip_buf, chunk);
-    if (n <= 0) break;
-    to_skip -= n;
-  }
-
-  file->position = offset - to_skip;
+  file->position = file->reader.bytes_read;
   return F12_OK;
 }
 
