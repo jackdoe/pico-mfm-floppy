@@ -41,6 +41,11 @@ fat12_err_t fat12_init(fat12_t *fat, fat12_io_t io) {
     return FAT12_ERR_INVALID;
   }
 
+  if (!fat->track_buf) {
+    fat->track_buf = (track_t *)malloc(sizeof(track_t));
+    if (!fat->track_buf) return FAT12_ERR_READ;
+  }
+
   fat->sector_buf.track = 0;
   fat->sector_buf.side = 0;
   fat->sector_buf.sector_n = 1;
@@ -75,11 +80,6 @@ fat12_err_t fat12_init(fat12_t *fat, fat12_io_t io) {
         fat12_read_sector(fat, fat->fat_start_sector + fat->bpb.sectors_per_fat, &fat2)) {
       fat->fat_mismatch = memcmp(fat1.data, fat2.data, SECTOR_SIZE) != 0;
     }
-  }
-
-  if (!fat->track_buf) {
-    fat->track_buf = (track_t *)malloc(sizeof(track_t));
-    if (!fat->track_buf) return FAT12_ERR_READ;
   }
 
   return FAT12_OK;
