@@ -56,18 +56,18 @@ static bool f12_cached_read(void *ctx, sector_t *sector) {
     return true;
   }
 
-  if (fs->io.read_track && fs->fat.track_buf) {
-    track_t *track = fs->fat.track_buf;
-    track->track = sector->track;
-    track->side = sector->side;
-    fs->io.read_track(fs->io.ctx, track);
+  if (fs->io.read_track) {
+    static track_t track;
+    track.track = sector->track;
+    track.side = sector->side;
+    fs->io.read_track(fs->io.ctx, &track);
     uint16_t pin_limit = fs->fat.root_dir_start_sector + fs->fat.root_dir_sectors;
-    uint16_t track_lba_base = (track->track * fs->fat.bpb.num_heads + track->side)
+    uint16_t track_lba_base = (track.track * fs->fat.bpb.num_heads + track.side)
                               * fs->fat.bpb.sectors_per_track;
     for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-      if (track->sectors[i].valid) {
-        uint32_t k = lru_key(track->track, track->side, i + 1);
-        lru_set(fs->cache, k, track->sectors[i].data);
+      if (track.sectors[i].valid) {
+        uint32_t k = lru_key(track.track, track.side, i + 1);
+        lru_set(fs->cache, k, track.sectors[i].data);
         if (track_lba_base + i < pin_limit) {
           lru_pin(fs->cache, k);
         }
@@ -210,9 +210,6 @@ void f12_unmount(f12_t *fs) {
     lru_free(fs->cache);
     fs->cache = NULL;
   }
-
-  free(fs->fat.track_buf);
-  fs->fat.track_buf = NULL;
 
   fs->mounted = false;
 }

@@ -126,7 +126,6 @@ struct fat12 {
   bool batch_in_use;
 
   uint16_t next_free_hint;
-  track_t *track_buf;
   bool fat_mismatch;
 };
 

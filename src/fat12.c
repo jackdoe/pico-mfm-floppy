@@ -41,11 +41,6 @@ fat12_err_t fat12_init(fat12_t *fat, fat12_io_t io) {
     return FAT12_ERR_INVALID;
   }
 
-  if (!fat->track_buf) {
-    fat->track_buf = (track_t *)malloc(sizeof(track_t));
-    if (!fat->track_buf) return FAT12_ERR_READ;
-  }
-
   fat->sector_buf.track = 0;
   fat->sector_buf.side = 0;
   fat->sector_buf.sector_n = 1;
@@ -400,16 +395,16 @@ static fat12_err_t fat12_write_batch_flush(fat12_write_batch_t *batch) {
     uint8_t c, h, s;
     fat12_lba_to_chs(fat, batch->lbas[0], &c, &h, &s);
 
-    track_t *track = fat->track_buf;
-    memset(track, 0, sizeof(*track));
-    track->track = c;
-    track->side = h;
+    static track_t track;
+    memset(&track, 0, sizeof(track));
+    track.track = c;
+    track.side = h;
 
     for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-      track->sectors[i].track = c;
-      track->sectors[i].side = h;
-      track->sectors[i].sector_n = i + 1;
-      track->sectors[i].valid = false;
+      track.sectors[i].track = c;
+      track.sectors[i].side = h;
+      track.sectors[i].sector_n = i + 1;
+      track.sectors[i].valid = false;
     }
 
     uint8_t new_count = 0;
@@ -419,9 +414,9 @@ static fat12_err_t fat12_write_batch_flush(fat12_write_batch_t *batch) {
 
       if (bc == c && bh == h && bs >= 1 && bs <= SECTORS_PER_TRACK) {
         int idx = bs - 1;
-        memcpy(track->sectors[idx].data, batch->data[i], SECTOR_SIZE);
-        track->sectors[idx].valid = true;
-        track->sectors[idx].size_code = 2;
+        memcpy(track.sectors[idx].data, batch->data[i], SECTOR_SIZE);
+        track.sectors[idx].valid = true;
+        track.sectors[idx].size_code = 2;
       } else if (bc != c || bh != h) {
         if (new_count != i) {
           batch->lbas[new_count] = batch->lbas[i];
@@ -432,7 +427,7 @@ static fat12_err_t fat12_write_batch_flush(fat12_write_batch_t *batch) {
     }
     batch->count = new_count;
 
-    if (!fat->io.write(fat->io.ctx, track)) {
+    if (!fat->io.write(fat->io.ctx, &track)) {
       return FAT12_ERR_WRITE;
     }
   }
