@@ -290,7 +290,7 @@ f12_file_t *f12_open(f12_t *fs, const char *path, const char *mode) {
       return NULL;
     }
 
-    ferr = fat12_open(&fs->fat, &file->dirent, &file->reader);
+    ferr = fat12_open(&fs->fat, &file->dirent, &file->io.reader);
     if (ferr != FAT12_OK) {
       f12_set_error(fs, fat12_to_f12_err(ferr));
       return NULL;
@@ -300,7 +300,7 @@ f12_file_t *f12_open(f12_t *fs, const char *path, const char *mode) {
     file->position = 0;
 
   } else {
-    fat12_err_t ferr = fat12_open_write(&fs->fat, path, &file->writer);
+    fat12_err_t ferr = fat12_open_write(&fs->fat, path, &file->io.writer);
     if (ferr != FAT12_OK) {
       f12_set_error(fs, fat12_to_f12_err(ferr));
       return NULL;
@@ -321,7 +321,7 @@ f12_err_t f12_close(f12_file_t *file) {
   f12_t *fs = file->fs;
 
   if (file->mode == F12_MODE_WRITE) {
-    fat12_err_t ferr = fat12_close_write(&file->writer);
+    fat12_err_t ferr = fat12_close_write(&file->io.writer);
     if (ferr != FAT12_OK) {
       file->mode = F12_MODE_CLOSED;
       return f12_set_error(fs, fat12_to_f12_err(ferr));
@@ -344,7 +344,7 @@ int f12_read(f12_file_t *file, void *buf, size_t len) {
     return -1;
   }
 
-  int n = fat12_read(&file->reader, buf, len);
+  int n = fat12_read(&file->io.reader, buf, len);
   if (n < 0) {
     f12_set_error(file->fs, fat12_to_f12_err((fat12_err_t)(-n)));
     return -1;
@@ -366,7 +366,7 @@ int f12_write(f12_file_t *file, const void *buf, size_t len) {
     return -1;
   }
 
-  int n = fat12_write(&file->writer, buf, len);
+  int n = fat12_write(&file->io.writer, buf, len);
   if (n < 0) {
     f12_set_error(file->fs, fat12_to_f12_err((fat12_err_t)(-n)));
     return -1;
@@ -386,12 +386,12 @@ f12_err_t f12_seek(f12_file_t *file, uint32_t offset) {
   f12_err_t err = f12_check_disk(file->fs);
   if (err != F12_OK) return err;
 
-  fat12_err_t ferr = fat12_seek(&file->reader, offset);
+  fat12_err_t ferr = fat12_seek(&file->io.reader, offset);
   if (ferr != FAT12_OK) {
     return f12_set_error(file->fs, fat12_to_f12_err(ferr));
   }
 
-  file->position = file->reader.bytes_read;
+  file->position = file->io.reader.bytes_read;
   return F12_OK;
 }
 

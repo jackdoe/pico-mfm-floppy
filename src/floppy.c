@@ -46,6 +46,18 @@
 #endif
 #endif
 
+#ifndef FLOPPY_FLUX_WAIT_TIMEOUT_MS
+#define FLOPPY_FLUX_WAIT_TIMEOUT_MS 250
+#endif
+
+#ifndef FLOPPY_INDEX_TIMEOUT_MS
+#define FLOPPY_INDEX_TIMEOUT_MS 500
+#endif
+
+#ifndef FLOPPY_TX_DRAIN_TIMEOUT_MS
+#define FLOPPY_TX_DRAIN_TIMEOUT_MS 100
+#endif
+
 static void gpio_put_oc(uint pin, bool value);
 
 static bool floppy_idle_timer_callback(struct repeating_timer *t) {
@@ -102,11 +114,16 @@ static inline uint16_t flux_read(floppy_t *f) {
   return pv & 0xffff;
 }
 
-static inline uint16_t flux_read_wait(floppy_t *f) {
+static inline bool flux_read_wait(floppy_t *f, uint16_t *out) {
+  uint32_t start_ms = to_ms_since_boot(get_absolute_time());
   while (!flux_data_available(f)) {
+    if ((uint32_t)(to_ms_since_boot(get_absolute_time()) - start_ms) >= FLOPPY_FLUX_WAIT_TIMEOUT_MS) {
+      return false;
+    }
     tight_loop_contents();
   }
-  return flux_read(f);
+  *out = flux_read(f);
+  return true;
 }
 
 static void floppy_flux_read_start(floppy_t *f) {
@@ -133,18 +150,38 @@ static void floppy_flux_write_start(floppy_t *f) {
   pio_sm_set_enabled(f->write.pio, f->write.sm, true);
 }
 
-static void floppy_flux_write_stop(floppy_t *f) {
+static bool floppy_flux_write_stop(floppy_t *f) {
+  uint32_t start_ms = to_ms_since_boot(get_absolute_time());
   while (!pio_sm_is_tx_fifo_empty(f->write.pio, f->write.sm)) {
+    if ((uint32_t)(to_ms_since_boot(get_absolute_time()) - start_ms) >= FLOPPY_TX_DRAIN_TIMEOUT_MS) {
+      return false;
+    }
     tight_loop_contents();
   }
   sleep_us(5);
   gpio_put_oc(f->pins.write_gate, 1);
   pio_sm_set_enabled(f->write.pio, f->write.sm, false);
+  return true;
 }
 
-static void floppy_wait_for_index(floppy_t *f) {
-  while (!gpio_get(f->pins.index)) tight_loop_contents();
-  while (gpio_get(f->pins.index)) tight_loop_contents();
+static bool floppy_wait_for_index(floppy_t *f) {
+  uint32_t start_ms = to_ms_since_boot(get_absolute_time());
+  while (!gpio_get(f->pins.index)) {
+    if ((uint32_t)(to_ms_since_boot(get_absolute_time()) - start_ms) >= FLOPPY_INDEX_TIMEOUT_MS) {
+      return false;
+    }
+    tight_loop_contents();
+  }
+
+  start_ms = to_ms_since_boot(get_absolute_time());
+  while (gpio_get(f->pins.index)) {
+    if ((uint32_t)(to_ms_since_boot(get_absolute_time()) - start_ms) >= FLOPPY_INDEX_TIMEOUT_MS) {
+      return false;
+    }
+    tight_loop_contents();
+  }
+
+  return true;
 }
 
 static void floppy_side_select(floppy_t *f, uint8_t side) {
@@ -218,12 +255,21 @@ static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
   mfm_init(&mfm);
   mfm_reset(&mfm);
 
-  uint16_t prev = flux_read_wait(f) >> 1;
+  uint16_t initial;
+  if (!flux_read_wait(f, &initial)) {
+    floppy_flux_read_stop(f);
+    return FLOPPY_ERR_TIMEOUT;
+  }
+  uint16_t prev = initial >> 1;
   bool ix_prev = false;
   floppy_status_t res = FLOPPY_ERR_TIMEOUT;
 
   for (int ix_edges = 0; ix_edges < FLOPPY_READ_TRACK_ATTEMPTS * 2;) {
-    uint16_t value = flux_read_wait(f);
+    uint16_t value;
+    if (!flux_read_wait(f, &value)) {
+      res = FLOPPY_ERR_TIMEOUT;
+      break;
+    }
     uint8_t ix = value & 1;
     uint16_t cnt = value >> 1;
     int delta = prev - cnt;
@@ -531,12 +577,16 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
       return status;
     }
     floppy_side_select(f, t->side);
-    floppy_wait_for_index(f);
+    if (!floppy_wait_for_index(f)) {
+      return FLOPPY_ERR_TIMEOUT;
+    }
     floppy_flux_write_start(f);
     for (size_t i = 0; i < enc.pos; i++) {
       pio_sm_put_blocking(f->write.pio, f->write.sm, flux_buf[i]);
     }
-    floppy_flux_write_stop(f);
+    if (!floppy_flux_write_stop(f)) {
+      return FLOPPY_ERR_TIMEOUT;
+    }
 
     struct verify_ctx vctx = { .expected = t };
     for (int verify = 0; verify < 3; verify++) {

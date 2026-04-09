@@ -26,3 +26,4 @@ done
 ./test_pio_emu
 ./test_write_verify
 ./test_floppy_overflow
+./test_floppy_timeouts

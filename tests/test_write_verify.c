@@ -187,6 +187,75 @@ TEST(test_write_verify_permanent_fail) {
     f12_unmount(&fs);
 }
 
+TEST(test_write_verify_overwrite_existing_file) {
+    setup_formatted_disk();
+
+    f12_t fs;
+    memset(&fs, 0, sizeof(fs));
+    ASSERT_EQ(f12_mount(&fs, make_floppy_io()), F12_OK);
+
+    f12_file_t *f = f12_open(&fs, "SAFE.TXT", "w");
+    ASSERT(f != NULL);
+    ASSERT_EQ(f12_write(f, "old", 3), 3);
+    ASSERT_EQ(f12_close(f), F12_OK);
+
+    f = f12_open(&fs, "SAFE.TXT", "w");
+    ASSERT(f != NULL);
+    const char *msg = "new content survives overwrite through encode, write, readback, and remount.";
+    ASSERT_EQ(f12_write(f, msg, strlen(msg)), (int)strlen(msg));
+    ASSERT_EQ(f12_close(f), F12_OK);
+
+    f12_unmount(&fs);
+    ASSERT_EQ(f12_mount(&fs, make_floppy_io()), F12_OK);
+
+    f = f12_open(&fs, "SAFE.TXT", "r");
+    ASSERT(f != NULL);
+    char buf[256];
+    int n = f12_read(f, buf, sizeof(buf));
+    ASSERT_EQ(n, (int)strlen(msg));
+    ASSERT_MEM_EQ(buf, msg, strlen(msg));
+    ASSERT_EQ(f12_close(f), F12_OK);
+
+    f12_unmount(&fs);
+}
+
+TEST(test_write_verify_overwrite_preserves_old_on_fail) {
+    setup_formatted_disk();
+
+    f12_t fs;
+    memset(&fs, 0, sizeof(fs));
+    ASSERT_EQ(f12_mount(&fs, make_floppy_io()), F12_OK);
+
+    f12_file_t *f = f12_open(&fs, "SAFE.TXT", "w");
+    ASSERT(f != NULL);
+    const char *old_msg = "old content";
+    ASSERT_EQ(f12_write(f, old_msg, strlen(old_msg)), (int)strlen(old_msg));
+    ASSERT_EQ(f12_close(f), F12_OK);
+
+    sim_drive.fault_writes_remaining = 100;
+
+    f = f12_open(&fs, "SAFE.TXT", "w");
+    ASSERT(f != NULL);
+    const char *new_msg = "new content that should not replace the old file after a failed close";
+    ASSERT_EQ(f12_write(f, new_msg, strlen(new_msg)), (int)strlen(new_msg));
+    ASSERT_EQ(f12_close(f), F12_ERR_IO);
+
+    sim_drive.fault_writes_remaining = 0;
+
+    f12_unmount(&fs);
+    ASSERT_EQ(f12_mount(&fs, make_floppy_io()), F12_OK);
+
+    f = f12_open(&fs, "SAFE.TXT", "r");
+    ASSERT(f != NULL);
+    char buf[256];
+    int n = f12_read(f, buf, sizeof(buf));
+    ASSERT_EQ(n, (int)strlen(old_msg));
+    ASSERT_MEM_EQ(buf, old_msg, strlen(old_msg));
+    ASSERT_EQ(f12_close(f), F12_OK);
+
+    f12_unmount(&fs);
+}
+
 int main(void) {
     printf("=== Write Verification Tests ===\n\n");
 
@@ -194,6 +263,8 @@ int main(void) {
     RUN_TEST(test_write_verify_large_file);
     RUN_TEST(test_write_verify_retry);
     RUN_TEST(test_write_verify_permanent_fail);
+    RUN_TEST(test_write_verify_overwrite_existing_file);
+    RUN_TEST(test_write_verify_overwrite_preserves_old_on_fail);
 
     pio_sim_free(&sim_drive);
 

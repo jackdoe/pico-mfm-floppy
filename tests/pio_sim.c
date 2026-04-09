@@ -149,6 +149,9 @@ bool gpio_get(uint pin) {
         return g_drive->head_track != 0;
     }
     if (pin == f->pins.index) {
+        if (g_drive->index_stuck) {
+            return g_drive->index_value;
+        }
         g_drive->index_poll_count++;
         return (g_drive->index_poll_count & 0x100) != 0;
     }

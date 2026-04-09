@@ -151,8 +151,11 @@ typedef struct {
   fat12_t *fat;
   uint16_t start_cluster;
   uint16_t current_cluster;
+  uint16_t buffer_cluster;
   uint32_t file_size;
   uint32_t bytes_read;
+  bool buffer_valid;
+  uint8_t cluster_buf[FAT12_MAX_CLUSTER_SECTORS * SECTOR_SIZE];
 } fat12_file_t;
 
 typedef struct {
@@ -162,9 +165,16 @@ typedef struct {
   fat12_dirent_t dirent;
   uint16_t first_cluster;
   uint16_t current_cluster;
+  uint16_t old_start_cluster;
   uint16_t prev_cluster;
   uint32_t bytes_written;
   uint16_t cluster_offset;
+  fat12_err_t error;
+  bool replacing_existing;
+  bool overwrite_in_place;
+  bool cluster_loaded;
+  bool cluster_dirty;
+  uint8_t cluster_buf[FAT12_MAX_CLUSTER_SECTORS * SECTOR_SIZE];
 } fat12_writer_t;
 
 fat12_err_t fat12_init(fat12_t *fat, fat12_io_t io);

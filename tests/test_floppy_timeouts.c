@@ -47,22 +47,42 @@ static void fill_track(track_t *track) {
   }
 }
 
-TEST(test_write_track_aborts_on_encode_overflow) {
+TEST(test_read_sector_times_out_without_flux) {
   setup_floppy();
+
+  sector_t sector = {
+    .track = 0,
+    .side = 0,
+    .sector_n = 1,
+    .size_code = 2,
+    .valid = false,
+  };
+
+  ASSERT_EQ(floppy_read_sector(&floppy, &sector), FLOPPY_ERR_TIMEOUT);
+  ASSERT(!sector.valid);
+
+  pio_sim_free(&sim_drive);
+}
+
+TEST(test_write_track_times_out_without_index) {
+  setup_floppy();
+  sim_drive.index_stuck = true;
+  sim_drive.index_value = false;
 
   track_t track;
   fill_track(&track);
 
-  ASSERT_EQ(floppy_write_track(&floppy, &track), FLOPPY_ERR_ENCODE_OVERFLOW);
+  ASSERT_EQ(floppy_write_track(&floppy, &track), FLOPPY_ERR_TIMEOUT);
   ASSERT_EQ(sim_drive.write_capture_count, 0);
 
   pio_sim_free(&sim_drive);
 }
 
 int main(void) {
-  printf("=== Floppy Overflow Tests ===\n\n");
+  printf("=== Floppy Timeout Tests ===\n\n");
 
-  RUN_TEST(test_write_track_aborts_on_encode_overflow);
+  RUN_TEST(test_read_sector_times_out_without_flux);
+  RUN_TEST(test_write_track_times_out_without_index);
 
   TEST_RESULTS();
 }

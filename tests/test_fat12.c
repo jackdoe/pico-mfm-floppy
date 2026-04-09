@@ -5,6 +5,7 @@
 typedef struct {
   vdisk_t disk;
   int fail_after_reads;
+  int fail_after_track_writes;
 } fault_vdisk_t;
 
 static bool fault_vdisk_read(void *ctx, sector_t *sector) {
@@ -21,7 +22,27 @@ static bool fault_vdisk_read(void *ctx, sector_t *sector) {
 
 static bool fault_vdisk_write(void *ctx, track_t *track) {
   fault_vdisk_t *disk = (fault_vdisk_t *)ctx;
+  if (disk->fail_after_track_writes == 0) {
+    return false;
+  }
+  if (disk->fail_after_track_writes > 0) {
+    disk->fail_after_track_writes--;
+  }
   return vdisk_write(&disk->disk, track);
+}
+
+static uint16_t count_free_clusters(fat12_t *fat) {
+  uint16_t free_clusters = 0;
+
+  for (uint16_t cluster = 2; cluster < fat->total_clusters + 2; cluster++) {
+    uint16_t next = 0;
+    ASSERT_EQ(fat12_get_entry(fat, cluster, &next), FAT12_OK);
+    if (next == 0) {
+      free_clusters++;
+    }
+  }
+
+  return free_clusters;
 }
 
 TEST(test_init) {
@@ -79,6 +100,7 @@ TEST(test_create_propagates_find_error) {
   memset(&disk, 0, sizeof(disk));
   vdisk_format_valid(&disk.disk);
   disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
 
   fat12_t fat;
   fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
@@ -99,6 +121,7 @@ TEST(test_open_write_failure_cleans_up_batch) {
   memset(&disk, 0, sizeof(disk));
   vdisk_format_valid(&disk.disk);
   disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
 
   fat12_t fat;
   fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
@@ -153,6 +176,37 @@ TEST(test_write_small_file) {
   int n = fat12_read(&file, (uint8_t *)buf, sizeof(buf));
   ASSERT_EQ(n, (int)strlen(msg));
   ASSERT_MEM_EQ(buf, msg, strlen(msg));
+}
+
+TEST(test_small_reads_use_cluster_buffer) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t writer;
+  ASSERT_EQ(fat12_open_write(&fat, "READBUF.TXT", &writer), FAT12_OK);
+
+  const char *msg = "Buffered single-byte reads should only hit the disk once per cluster.";
+  ASSERT_EQ(fat12_write(&writer, (const uint8_t *)msg, strlen(msg)), (int)strlen(msg));
+  ASSERT_EQ(fat12_close_write(&writer), FAT12_OK);
+
+  fat12_dirent_t entry;
+  ASSERT_EQ(fat12_find(&fat, "READBUF.TXT", &entry), FAT12_OK);
+
+  fat12_file_t file;
+  ASSERT_EQ(fat12_open(&fat, &entry, &file), FAT12_OK);
+  disk.read_count = 0;
+
+  for (size_t i = 0; i < strlen(msg); i++) {
+    char ch = 0;
+    ASSERT_EQ(fat12_read(&file, (uint8_t *)&ch, 1), 1);
+    ASSERT_EQ(ch, msg[i]);
+  }
+
+  ASSERT_EQ(disk.read_count, 1);
 }
 
 TEST(test_write_large_file) {
@@ -262,6 +316,92 @@ TEST(test_overwrite_file) {
   char buf[64] = {0};
   fat12_read(&file, (uint8_t *)buf, sizeof(buf));
   ASSERT_MEM_EQ(buf, "Second", 6);
+}
+
+TEST(test_overwrite_failure_preserves_existing_file) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t writer;
+  ASSERT_EQ(fat12_open_write(&fat, "SAFE.TXT", &writer), FAT12_OK);
+  ASSERT_EQ(fat12_write(&writer, (const uint8_t *)"old data", 8), 8);
+  ASSERT_EQ(fat12_close_write(&writer), FAT12_OK);
+
+  disk.fail_after_track_writes = 0;
+
+  ASSERT_EQ(fat12_open_write(&fat, "SAFE.TXT", &writer), FAT12_OK);
+  ASSERT_EQ(fat12_write(&writer, (const uint8_t *)"new data that should not stick", 30), 30);
+  ASSERT_EQ(fat12_close_write(&writer), FAT12_ERR_WRITE);
+  ASSERT(!fat.batch_in_use);
+  ASSERT_NULL(fat.batch.data);
+
+  disk.fail_after_track_writes = -1;
+
+  fat12_dirent_t entry;
+  ASSERT_EQ(fat12_find(&fat, "SAFE.TXT", &entry), FAT12_OK);
+  ASSERT_EQ(entry.size, 8);
+
+  fat12_file_t file;
+  ASSERT_EQ(fat12_open(&fat, &entry, &file), FAT12_OK);
+  char buf[32] = {0};
+  ASSERT_EQ(fat12_read(&file, (uint8_t *)buf, sizeof(buf)), 8);
+  ASSERT_MEM_EQ(buf, "old data", 8);
+}
+
+TEST(test_overwrite_succeeds_without_spare_clusters) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  uint8_t original[1024];
+  uint8_t updated[1024];
+  for (size_t i = 0; i < sizeof(original); i++) {
+    original[i] = (uint8_t)(i & 0xFF);
+    updated[i] = (uint8_t)(0xFF - (i & 0xFF));
+  }
+
+  fat12_writer_t writer;
+  ASSERT_EQ(fat12_open_write(&fat, "TARGET.BIN", &writer), FAT12_OK);
+  ASSERT_EQ(fat12_write(&writer, original, sizeof(original)), (int)sizeof(original));
+  ASSERT_EQ(fat12_close_write(&writer), FAT12_OK);
+
+  uint16_t free_clusters = count_free_clusters(&fat);
+  ASSERT(free_clusters > 0);
+
+  uint8_t cluster_buf[FAT12_MAX_CLUSTER_SECTORS * SECTOR_SIZE];
+  memset(cluster_buf, 0xA5, sizeof(cluster_buf));
+
+  ASSERT_EQ(fat12_open_write(&fat, "FILLER.BIN", &writer), FAT12_OK);
+  size_t cluster_size = fat.bpb.sectors_per_cluster * SECTOR_SIZE;
+  for (uint16_t i = 0; i < free_clusters; i++) {
+    ASSERT_EQ(fat12_write(&writer, cluster_buf, cluster_size), (int)cluster_size);
+  }
+  ASSERT_EQ(fat12_close_write(&writer), FAT12_OK);
+  ASSERT_EQ(count_free_clusters(&fat), 0);
+
+  ASSERT_EQ(fat12_open_write(&fat, "TARGET.BIN", &writer), FAT12_OK);
+  ASSERT_EQ(fat12_write(&writer, updated, sizeof(updated)), (int)sizeof(updated));
+  ASSERT_EQ(fat12_close_write(&writer), FAT12_OK);
+
+  fat12_dirent_t entry;
+  ASSERT_EQ(fat12_find(&fat, "TARGET.BIN", &entry), FAT12_OK);
+  ASSERT_EQ(entry.size, sizeof(updated));
+
+  fat12_file_t file;
+  ASSERT_EQ(fat12_open(&fat, &entry, &file), FAT12_OK);
+  uint8_t buf[sizeof(updated)];
+  ASSERT_EQ(fat12_read(&file, buf, sizeof(buf)), (int)sizeof(buf));
+  ASSERT_MEM_EQ(buf, updated, sizeof(updated));
 }
 
 TEST(test_delete_file) {
@@ -876,9 +1016,12 @@ int main(void) {
   RUN_TEST(test_create_propagates_find_error);
   RUN_TEST(test_open_write_failure_cleans_up_batch);
   RUN_TEST(test_write_small_file);
+  RUN_TEST(test_small_reads_use_cluster_buffer);
   RUN_TEST(test_write_large_file);
   RUN_TEST(test_write_read_large_single_call);
   RUN_TEST(test_overwrite_file);
+  RUN_TEST(test_overwrite_failure_preserves_existing_file);
+  RUN_TEST(test_overwrite_succeeds_without_spare_clusters);
   RUN_TEST(test_delete_file);
   RUN_TEST(test_multiple_files);
   RUN_TEST(test_case_insensitive);

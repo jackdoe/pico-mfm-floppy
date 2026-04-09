@@ -35,6 +35,8 @@ typedef struct {
 
     uint32_t index_poll_count;
     int fault_writes_remaining;
+    bool index_stuck;
+    bool index_value;
 } pio_sim_drive_t;
 
 void pio_sim_init(pio_sim_drive_t *drive);

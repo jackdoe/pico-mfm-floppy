@@ -83,6 +83,7 @@ static void f12_write_full(f12_file_t *f, const void *buf, uint32_t len) {
         if (n <= 0) break;
         written += n;
     }
+    ASSERT_EQ(written, len);
 }
 
 static uint32_t f12_read_full(f12_file_t *f, void *buf, uint32_t max_len) {
@@ -93,6 +94,13 @@ static uint32_t f12_read_full(f12_file_t *f, void *buf, uint32_t max_len) {
         if (total >= max_len) break;
     }
     return total;
+}
+
+static void f12_delete_if_present(f12_t *fs, const char *name) {
+    f12_stat_t stat;
+    if (f12_stat(fs, name, &stat) == F12_OK) {
+        ASSERT_EQ(f12_delete(fs, name), F12_OK);
+    }
 }
 
 TEST(test_decode_original) {
@@ -138,7 +146,7 @@ TEST(test_f12_heavy_modifications) {
     uint32_t readme_size = f12_read_full(f, readme_content, stat.size);
     ASSERT_EQ(readme_size, stat.size);
     readme_content[stat.size] = '\0';
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
 
     char *target = NULL;
     for (uint32_t i = 0; i + 6 <= readme_size; i++) {
@@ -153,7 +161,7 @@ TEST(test_f12_heavy_modifications) {
     f = f12_open(&fs, "README.SS", "w");
     ASSERT(f != NULL);
     f12_write_full(f, readme_content, readme_size);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     printf("  [MODIFY] README.SS: 'System' -> 'Floppy'\n");
 
     f12_stat(&fs, "README.SS", &stat);
@@ -174,7 +182,7 @@ TEST(test_f12_heavy_modifications) {
     ASSERT(f != NULL);
     const char *hello = "Hello from the floppy controller! This file was created by our FAT12 implementation.";
     f12_write_full(f, hello, strlen(hello));
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     printf("  [CREATE] HELLO.TXT (%zu bytes)\n", strlen(hello));
 
     f12_stat(&fs, "HELLO.TXT", &stat);
@@ -185,7 +193,7 @@ TEST(test_f12_heavy_modifications) {
     uint8_t pattern[10000];
     for (int i = 0; i < 10000; i++) pattern[i] = (i * 7 + 13) & 0xFF;
     f12_write_full(f, pattern, sizeof(pattern));
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     printf("  [CREATE] BIG.DAT (10000 bytes)\n");
 
     f12_stat(&fs, "BIG.DAT", &stat);
@@ -196,19 +204,19 @@ TEST(test_f12_heavy_modifications) {
     uint8_t one_byte = 0x42;
     n = f12_write(f, &one_byte, 1);
     ASSERT_EQ(n, 1);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     printf("  [CREATE] TINY.BIN (1 byte)\n");
 
     f = f12_open(&fs, "EMPTY.TXT", "w");
     ASSERT(f != NULL);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     printf("  [CREATE] EMPTY.TXT (0 bytes)\n");
 
     f = f12_open(&fs, "CYB.CFG", "w");
     ASSERT(f != NULL);
     const char *new_cfg = "overwritten_config_data_here_1234567890";
     f12_write_full(f, new_cfg, strlen(new_cfg));
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     printf("  [OVERWRITE] CYB.CFG: 54 -> %zu bytes\n", strlen(new_cfg));
 
     f12_stat(&fs, "CYB.CFG", &stat);
@@ -220,7 +228,7 @@ TEST(test_f12_heavy_modifications) {
     ASSERT(f != NULL);
     uint8_t *check = malloc(readme_size + 1);
     uint32_t t = f12_read_full(f, check, readme_size);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     ASSERT_EQ(t, readme_size);
     ASSERT_MEM_EQ(readme_content, check, readme_size);
     printf("  README.SS: content verified\n");
@@ -238,7 +246,7 @@ TEST(test_f12_heavy_modifications) {
     ASSERT(f != NULL);
     char hello_buf[256] = {0};
     t = f12_read_full(f, hello_buf, sizeof(hello_buf));
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     ASSERT_EQ(t, (uint32_t)strlen(hello));
     ASSERT(memcmp(hello_buf, hello, strlen(hello)) == 0);
     printf("  HELLO.TXT: content verified\n");
@@ -247,7 +255,7 @@ TEST(test_f12_heavy_modifications) {
     ASSERT(f != NULL);
     uint8_t *big_buf = malloc(10000);
     t = f12_read_full(f, big_buf, 10000);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     ASSERT_EQ(t, 10000);
     ASSERT_MEM_EQ(big_buf, pattern, 10000);
     printf("  BIG.DAT: 10000 bytes verified\n");
@@ -257,7 +265,7 @@ TEST(test_f12_heavy_modifications) {
     ASSERT(f != NULL);
     uint8_t tiny_buf;
     n = f12_read(f, &tiny_buf, 1);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     ASSERT_EQ(n, 1);
     ASSERT_EQ(tiny_buf, 0x42);
     printf("  TINY.BIN: 1 byte verified\n");
@@ -270,7 +278,7 @@ TEST(test_f12_heavy_modifications) {
     ASSERT(f != NULL);
     char cfg_buf[256] = {0};
     t = f12_read_full(f, cfg_buf, sizeof(cfg_buf));
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     ASSERT_EQ(t, (uint32_t)strlen(new_cfg));
     ASSERT(memcmp(cfg_buf, new_cfg, strlen(new_cfg)) == 0);
     printf("  CYB.CFG: overwritten content verified\n");
@@ -280,7 +288,7 @@ TEST(test_f12_heavy_modifications) {
     f12_stat(&fs, "INSTALL.EXE", &stat);
     uint8_t *install_buf = malloc(stat.size);
     t = f12_read_full(f, install_buf, stat.size);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     ASSERT_EQ(t, stat.size);
     printf("  INSTALL.EXE: %u bytes readable (untouched)\n", t);
     ASSERT_EQ(checksum_buf(install_buf, t), 0xD3FA0E4E);
@@ -358,7 +366,7 @@ TEST(test_verify_all_after_roundtrip) {
     f12_stat(&fs, "README.SS", &stat);
     char *readme = malloc(stat.size + 1);
     uint32_t t = f12_read_full(f, readme, stat.size);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     readme[t] = '\0';
     char *found = strstr(readme, "Floppy");
     ASSERT(found != NULL);
@@ -376,7 +384,7 @@ TEST(test_verify_all_after_roundtrip) {
     f12_stat(&fs, "HELLO.TXT", &stat);
     char *hello = malloc(stat.size + 1);
     t = f12_read_full(f, hello, stat.size);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     hello[t] = '\0';
     ASSERT(strstr(hello, "floppy controller") != NULL);
     printf("  HELLO.TXT: content survived (%u bytes)\n", t);
@@ -388,7 +396,7 @@ TEST(test_verify_all_after_roundtrip) {
     ASSERT_EQ(stat.size, 10000);
     uint8_t *big = malloc(10000);
     t = f12_read_full(f, big, 10000);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     ASSERT_EQ(t, 10000);
     uint8_t expected[10000];
     for (int i = 0; i < 10000; i++) expected[i] = (i * 7 + 13) & 0xFF;
@@ -401,7 +409,7 @@ TEST(test_verify_all_after_roundtrip) {
     uint8_t byte;
     ASSERT_EQ(f12_read(f, &byte, 1), 1);
     ASSERT_EQ(byte, 0x42);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     printf("  TINY.BIN: 0x42 verified\n");
 
     f12_stat(&fs, "EMPTY.TXT", &stat);
@@ -413,7 +421,7 @@ TEST(test_verify_all_after_roundtrip) {
     f12_stat(&fs, "CYB.CFG", &stat);
     char *cfg = malloc(stat.size + 1);
     t = f12_read_full(f, cfg, stat.size);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     cfg[t] = '\0';
     ASSERT(strstr(cfg, "overwritten_config") != NULL);
     printf("  CYB.CFG: overwritten content survived (%u bytes)\n", t);
@@ -424,7 +432,7 @@ TEST(test_verify_all_after_roundtrip) {
     f12_stat(&fs, "INSTALL.EXE", &stat);
     uint8_t *exe = malloc(stat.size);
     t = f12_read_full(f, exe, stat.size);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     ASSERT_EQ(checksum_buf(exe, t), 0xD3FA0E4E);
     printf("  INSTALL.EXE: checksum 0xD3FA0E4E (untouched)\n");
     free(exe);
@@ -434,7 +442,7 @@ TEST(test_verify_all_after_roundtrip) {
     f12_stat(&fs, "BASE.LZH", &stat);
     uint8_t *lzh = malloc(stat.size);
     t = f12_read_full(f, lzh, stat.size);
-    f12_close(f);
+    ASSERT_EQ(f12_close(f), F12_OK);
     ASSERT_EQ(checksum_buf(lzh, t), 0x49532436);
     printf("  BASE.LZH: checksum 0x49532436 (untouched)\n");
     free(lzh);
@@ -532,10 +540,15 @@ TEST(test_format_fill_max_roundtrip) {
             if (n <= 0) { write_ok = false; break; }
             written += n;
         }
-        f12_close(f);
+        f12_err_t close_err = f12_close(f);
+        if (write_ok) {
+            ASSERT_EQ(close_err, F12_OK);
+        } else {
+            ASSERT(close_err == F12_OK || close_err == F12_ERR_FULL);
+        }
 
-        if (!write_ok || written == 0) {
-            f12_delete(&fs, name);
+        if (!write_ok || close_err != F12_OK || written == 0) {
+            f12_delete_if_present(&fs, name);
             break;
         }
 
@@ -565,7 +578,7 @@ TEST(test_format_fill_max_roundtrip) {
         f12_file_t *f = f12_open(&fs, manifest[i].name, "r");
         ASSERT(f != NULL);
         uint32_t t = f12_read_full(f, wbuf, manifest[i].size);
-        f12_close(f);
+        ASSERT_EQ(f12_close(f), F12_OK);
         ASSERT_EQ(t, manifest[i].size);
         ASSERT_EQ(checksum_buf(wbuf, t), manifest[i].checksum);
         verified++;
@@ -626,7 +639,7 @@ TEST(test_format_fill_max_roundtrip) {
         f12_file_t *f = f12_open(&fs, manifest[i].name, "r");
         if (!f) { fail++; continue; }
         uint32_t t = f12_read_full(f, wbuf, manifest[i].size);
-        f12_close(f);
+        ASSERT_EQ(f12_close(f), F12_OK);
         if (t != manifest[i].size || checksum_buf(wbuf, t) != manifest[i].checksum) {
             printf("  FAIL: %s (size %u/%u, cksum 0x%08X/0x%08X)\n",
                    manifest[i].name, t, manifest[i].size,
@@ -680,7 +693,7 @@ TEST(test_format_fill_delete_refill_roundtrip) {
         uint32_t sz = 5000 + i * 200;
         for (uint32_t j = 0; j < sz; j++) wbuf[j] = gen_pattern_byte(i + 1000, j);
         f12_write_full(f, wbuf, sz);
-        f12_close(f);
+        ASSERT_EQ(f12_close(f), F12_OK);
     }
 
     f12_dir_t dir;
@@ -711,15 +724,24 @@ TEST(test_format_fill_delete_refill_roundtrip) {
         if (!f) break;
         for (uint32_t j = 0; j < sz; j++) wbuf[j] = gen_pattern_byte(i + 2000, j);
         uint32_t written = 0;
+        bool write_ok = true;
         while (written < sz) {
             uint32_t chunk = sz - written;
             if (chunk > 512) chunk = 512;
             int n = f12_write(f, wbuf + written, chunk);
-            if (n <= 0) break;
+            if (n <= 0) { write_ok = false; break; }
             written += n;
         }
-        f12_close(f);
-        if (written == 0) break;
+        f12_err_t close_err = f12_close(f);
+        if (write_ok) {
+            ASSERT_EQ(close_err, F12_OK);
+        } else {
+            ASSERT(close_err == F12_OK || close_err == F12_ERR_FULL);
+        }
+        if (!write_ok || close_err != F12_OK || written == 0) {
+            f12_delete_if_present(&fs, name);
+            break;
+        }
 
         memcpy(manifest[mc].name, name, 13);
         manifest[mc].size = written;
@@ -788,7 +810,7 @@ TEST(test_format_fill_delete_refill_roundtrip) {
         f12_file_t *f = f12_open(&fs, manifest[i].name, "r");
         ASSERT(f != NULL);
         uint32_t t = f12_read_full(f, wbuf, manifest[i].size);
-        f12_close(f);
+        ASSERT_EQ(f12_close(f), F12_OK);
         ASSERT_EQ(t, manifest[i].size);
         ASSERT_EQ(checksum_buf(wbuf, t), manifest[i].checksum);
         pass++;
@@ -803,7 +825,7 @@ TEST(test_format_fill_delete_refill_roundtrip) {
         if (!f) continue;
         uint32_t sz = 5000 + i * 200;
         uint32_t t = f12_read_full(f, wbuf, sz);
-        f12_close(f);
+        ASSERT_EQ(f12_close(f), F12_OK);
         if (t != sz) continue;
         bool ok = true;
         for (uint32_t j = 0; j < sz; j++) {
@@ -911,18 +933,27 @@ TEST(test_fuzz_roundtrip) {
                 if (!f) continue;
 
                 uint32_t written = 0;
+                bool write_ok = true;
                 while (written < sz) {
                     uint32_t chunk = sz - written;
                     if (chunk > 512) chunk = 512;
                     for (uint32_t j = 0; j < chunk; j++)
                         wbuf[j] = gen_pattern_byte(iter * 1000 + op, written + j);
                     int n = f12_write(f, wbuf, chunk);
-                    if (n <= 0) break;
+                    if (n <= 0) { write_ok = false; break; }
                     written += n;
                 }
-                f12_close(f);
+                f12_err_t close_err = f12_close(f);
+                if (write_ok) {
+                    ASSERT_EQ(close_err, F12_OK);
+                } else {
+                    ASSERT(close_err == F12_OK || close_err == F12_ERR_FULL);
+                }
 
-                if (written == 0 && sz > 0) continue;
+                if (!write_ok || close_err != F12_OK || (written == 0 && sz > 0)) {
+                    f12_delete_if_present(&fs, name);
+                    continue;
+                }
 
                 bool replaced = false;
                 for (int m = 0; m < mc; m++) {
@@ -1007,7 +1038,7 @@ TEST(test_fuzz_roundtrip) {
                     exit(1);
                 }
                 uint32_t t = f12_read_full(f, wbuf, manifest[m].size);
-                f12_close(f);
+                ASSERT_EQ(f12_close(f), F12_OK);
 
                 if (t != manifest[m].size) {
                     printf("  iter %d: file '%s' read %u != size %u\n",
