@@ -62,3 +62,8 @@ add_executable(test_write_verify test_write_verify.c pio_sim.c flux_sim.c ${SRCS
 target_include_directories(test_write_verify PRIVATE ${STUBS} ${SRCDIR})
 target_compile_definitions(test_write_verify PRIVATE FLOPPY_DEBUG=0)
 add_test(NAME test_write_verify COMMAND test_write_verify)
+
+add_executable(test_floppy_overflow test_floppy_overflow.c pio_sim.c ${SRCS} ${SRCDIR}/floppy.c)
+target_include_directories(test_floppy_overflow PRIVATE ${STUBS} ${SRCDIR})
+target_compile_definitions(test_floppy_overflow PRIVATE FLOPPY_DEBUG=0 FLOPPY_FLUX_BUF_SIZE=64)
+add_test(NAME test_floppy_overflow COMMAND test_floppy_overflow)

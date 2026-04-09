@@ -276,6 +276,33 @@ TEST(test_disk_changed) {
   f12_unmount(&fs);
 }
 
+TEST(test_disk_changed_aborts_pending_write) {
+  vdisk_init(&vdisk);
+
+  f12_t fs;
+  memset(&fs, 0, sizeof(fs));
+  fs.io = vdisk_f12_io();
+  f12_format(&fs, "TEST", false);
+  f12_mount(&fs, vdisk_f12_io());
+
+  f12_file_t *f = f12_open(&fs, "PEND.TXT", "w");
+  ASSERT(f != NULL);
+  ASSERT_EQ(f12_write(f, "hello", 5), 5);
+  ASSERT(fs.fat.batch_in_use);
+  ASSERT_NOT_NULL(fs.fat.batch.data);
+
+  vdisk.disk_changed = true;
+
+  ASSERT_EQ(f12_write(f, "!", 1), -1);
+  ASSERT_EQ(f12_errno(&fs), F12_ERR_DISK_CHANGED);
+  ASSERT(!fs.mounted);
+  ASSERT(!fs.fat.batch_in_use);
+  ASSERT_NULL(fs.fat.batch.data);
+  ASSERT_EQ(f->mode, F12_MODE_CLOSED);
+
+  f12_unmount(&fs);
+}
+
 TEST(test_seek_and_tell) {
   vdisk_init(&vdisk);
 
@@ -326,16 +353,19 @@ TEST(test_read_at) {
   ASSERT(f != NULL);
 
   char buf[5];
+  ASSERT_EQ(f12_tell(f), 0);
 
   int n = f12_read_at(f, 4, buf, 4);
   ASSERT_EQ(n, 4);
   buf[4] = '\0';
   ASSERT_STR_EQ(buf, "BBBB");
+  ASSERT_EQ(f12_tell(f), 0);
 
   n = f12_read_at(f, 12, buf, 4);
   ASSERT_EQ(n, 4);
   buf[4] = '\0';
   ASSERT_STR_EQ(buf, "DDDD");
+  ASSERT_EQ(f12_tell(f), 0);
 
   f12_close(f);
   f12_unmount(&fs);
@@ -400,6 +430,45 @@ TEST(test_large_file) {
   }
 
   f12_close(f);
+  f12_unmount(&fs);
+}
+
+TEST(test_large_single_call_io) {
+  vdisk_init(&vdisk);
+
+  f12_t fs;
+  memset(&fs, 0, sizeof(fs));
+  fs.io = vdisk_f12_io();
+  f12_format(&fs, "TEST", false);
+  f12_mount(&fs, vdisk_f12_io());
+
+  size_t size = 70000;
+  uint8_t *write_buf = malloc(size);
+  uint8_t *read_buf = malloc(size);
+  ASSERT_NOT_NULL(write_buf);
+  ASSERT_NOT_NULL(read_buf);
+
+  for (size_t i = 0; i < size; i++) {
+    write_buf[i] = (uint8_t)((i * 17u + 3u) & 0xFF);
+  }
+
+  f12_file_t *f = f12_open(&fs, "BIGCALL.BIN", "w");
+  ASSERT(f != NULL);
+  ASSERT_EQ(f12_write(f, write_buf, size), (int)size);
+  ASSERT_EQ(f12_close(f), F12_OK);
+
+  f12_stat_t stat;
+  ASSERT_EQ(f12_stat(&fs, "BIGCALL.BIN", &stat), F12_OK);
+  ASSERT_EQ(stat.size, size);
+
+  f = f12_open(&fs, "BIGCALL.BIN", "r");
+  ASSERT(f != NULL);
+  ASSERT_EQ(f12_read(f, read_buf, size), (int)size);
+  ASSERT_MEM_EQ(read_buf, write_buf, size);
+  ASSERT_EQ(f12_close(f), F12_OK);
+
+  free(read_buf);
+  free(write_buf);
   f12_unmount(&fs);
 }
 
@@ -583,10 +652,12 @@ int main(void) {
   RUN_TEST(test_too_many_open_files);
   RUN_TEST(test_write_protected);
   RUN_TEST(test_disk_changed);
+  RUN_TEST(test_disk_changed_aborts_pending_write);
   RUN_TEST(test_seek_and_tell);
   RUN_TEST(test_read_at);
   RUN_TEST(test_file_not_found);
   RUN_TEST(test_large_file);
+  RUN_TEST(test_large_single_call_io);
   RUN_TEST(test_multiple_small_writes);
   RUN_TEST(test_single_byte_writes);
   RUN_TEST(test_rpc_chunk_writes);

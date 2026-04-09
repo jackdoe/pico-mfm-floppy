@@ -228,6 +228,7 @@ TEST(test_mfm_encode_buffer_overflow) {
   mfm_encode_sector(&enc, &s);
 
   ASSERT(enc.pos <= sizeof(tiny_buf));
+  ASSERT(enc.overflow);
 }
 
 TEST(test_mfm_decode_rapid_state_changes) {

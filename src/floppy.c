@@ -12,7 +12,9 @@
 #include "flux_read.pio.h"
 #include "flux_write.pio.h"
 
+#ifndef FLOPPY_DEBUG
 #define FLOPPY_DEBUG 1
+#endif
 
 #if FLOPPY_DEBUG >= 1
 #define FLOPPY_ERR(fmt, ...) printf(fmt, ##__VA_ARGS__)
@@ -35,6 +37,14 @@
 #define DIR_INWARD 1
 #define DIR_OUTWARD 2
 #define IDLE_CHECK_INTERVAL_MS 1000
+
+#ifndef FLOPPY_FLUX_BUF_SIZE
+#if PICO_RP2040
+#define FLOPPY_FLUX_BUF_SIZE 110000
+#else
+#define FLOPPY_FLUX_BUF_SIZE 200000
+#endif
+#endif
 
 static void gpio_put_oc(uint pin, bool value);
 
@@ -174,18 +184,32 @@ static floppy_status_t floppy_seek_track0(floppy_t *f) {
 #define FLOPPY_WRITE_ATTEMPTS 3
 #define FLOPPY_HEAD_SETTLE_MS 20
 
-static void floppy_jog(floppy_t *f, uint8_t track, uint8_t distance) {
+static bool floppy_status_retryable(floppy_status_t status) {
+  return status == FLOPPY_ERR_TIMEOUT ||
+         status == FLOPPY_ERR_WRONG_TRACK ||
+         status == FLOPPY_ERR_WRONG_SIDE;
+}
+
+static floppy_status_t floppy_jog(floppy_t *f, uint8_t track, uint8_t distance) {
   uint8_t away = (track <= distance) ? track + distance : track - distance;
-  floppy_seek(f, away);
-  floppy_seek(f, track);
+  floppy_status_t status = floppy_seek(f, away);
+  if (status != FLOPPY_OK) return status;
+
+  status = floppy_seek(f, track);
+  if (status != FLOPPY_OK) return status;
+
   sleep_ms(FLOPPY_HEAD_SETTLE_MS);
+  return FLOPPY_OK;
 }
 
 typedef bool (*sector_callback_t)(sector_t *sector, void *ctx);
 
 static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
                                         sector_callback_t cb, void *ctx) {
-  floppy_seek(f, track);
+  floppy_status_t status = floppy_seek(f, track);
+  if (status != FLOPPY_OK) {
+    return status;
+  }
   floppy_side_select(f, side);
   floppy_flux_read_start(f);
 
@@ -263,18 +287,24 @@ need_read:;
 
   floppy_status_t res = floppy_read_flux(f, target, t->side, complete_track_cb, &ctx);
   if (res == FLOPPY_OK) return res;
+  if (!floppy_status_retryable(res)) return res;
 
-  floppy_jog(f, target, 10);
+  res = floppy_jog(f, target, 10);
+  if (res != FLOPPY_OK) return res;
   res = floppy_read_flux(f, target, t->side, complete_track_cb, &ctx);
   if (res == FLOPPY_OK) return res;
+  if (!floppy_status_retryable(res)) return res;
 
-  floppy_jog(f, target, 20);
+  res = floppy_jog(f, target, 20);
+  if (res != FLOPPY_OK) return res;
   res = floppy_read_flux(f, target, t->side, complete_track_cb, &ctx);
 
   if (res == FLOPPY_ERR_TIMEOUT) {
     FLOPPY_ERR("[floppy] timeout reading track %d side %d, missing sectors:", target, t->side);
     for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-      if (!t->sectors[i].valid) FLOPPY_ERR(" %d", i + 1);
+      if (!t->sectors[i].valid) {
+        FLOPPY_ERR(" %d", i + 1);
+      }
     }
     FLOPPY_ERR("\n");
   }
@@ -430,13 +460,17 @@ floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector) {
   uint8_t target = sector->track;
 
   floppy_status_t st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
-  if (st != FLOPPY_ERR_TIMEOUT) return st;
+  if (!floppy_status_retryable(st)) return st;
+  if (st == FLOPPY_OK) return st;
 
-  floppy_jog(f, target, 10);
+  st = floppy_jog(f, target, 10);
+  if (st != FLOPPY_OK) return st;
   st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
-  if (st != FLOPPY_ERR_TIMEOUT) return st;
+  if (!floppy_status_retryable(st)) return st;
+  if (st == FLOPPY_OK) return st;
 
-  floppy_jog(f, target, 20);
+  st = floppy_jog(f, target, 20);
+  if (st != FLOPPY_OK) return st;
   return floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
 }
 
@@ -475,21 +509,27 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
     return status;
   }
 
-#if PICO_RP2040
-  static uint8_t flux_buf[110000];
-#else
-  static uint8_t flux_buf[200000];
-#endif
+  static uint8_t flux_buf[FLOPPY_FLUX_BUF_SIZE];
   mfm_encode_t enc;
   mfm_encode_init(&enc, flux_buf, sizeof(flux_buf));
   mfm_encode_track(&enc, t);
+  if (enc.overflow) {
+    FLOPPY_ERR("[floppy] encode overflow track %d side %d\n", t->track, t->side);
+    return FLOPPY_ERR_ENCODE_OVERFLOW;
+  }
 
   for (int attempt = 0; attempt < FLOPPY_WRITE_ATTEMPTS; attempt++) {
     if (attempt == 2) {
-      floppy_seek_track0(f);
+      status = floppy_seek_track0(f);
+      if (status != FLOPPY_OK) {
+        return status;
+      }
     }
 
-    floppy_seek(f, t->track);
+    status = floppy_seek(f, t->track);
+    if (status != FLOPPY_OK) {
+      return status;
+    }
     floppy_side_select(f, t->side);
     floppy_wait_for_index(f);
     floppy_flux_write_start(f);
@@ -500,16 +540,27 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
 
     struct verify_ctx vctx = { .expected = t };
     for (int verify = 0; verify < 3; verify++) {
-      floppy_jog(f, t->track, 10);
-      if (floppy_read_flux(f, t->track, t->side, verify_track_cb, &vctx) == FLOPPY_OK) {
+      status = floppy_jog(f, t->track, 10);
+      if (status != FLOPPY_OK) {
+        return status;
+      }
+
+      floppy_status_t verify_status =
+          floppy_read_flux(f, t->track, t->side, verify_track_cb, &vctx);
+      if (verify_status == FLOPPY_OK) {
         return FLOPPY_OK;
+      }
+      if (!floppy_status_retryable(verify_status)) {
+        return verify_status;
       }
     }
 
     FLOPPY_ERR("[floppy] verify failed track %d side %d attempt %d, bad sectors:",
                t->track, t->side, attempt + 1);
     for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-      if (!vctx.verified[i]) FLOPPY_ERR(" %d", i + 1);
+      if (!vctx.verified[i]) {
+        FLOPPY_ERR(" %d", i + 1);
+      }
     }
     FLOPPY_ERR("\n");
   }

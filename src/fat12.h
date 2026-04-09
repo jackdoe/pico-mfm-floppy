@@ -169,6 +169,7 @@ typedef struct {
 
 fat12_err_t fat12_init(fat12_t *fat, fat12_io_t io);
 fat12_err_t fat12_format(fat12_io_t io, const char *volume_label, bool write_all_tracks);
+void fat12_abort_write(fat12_t *fat);
 
 fat12_err_t fat12_get_entry(fat12_t *fat, uint16_t cluster, uint16_t *next);
 bool fat12_is_eof(uint16_t cluster);
@@ -180,11 +181,11 @@ fat12_err_t fat12_find(fat12_t *fat, const char *filename, fat12_dirent_t *entry
 
 fat12_err_t fat12_open(fat12_t *fat, fat12_dirent_t *entry, fat12_file_t *file);
 fat12_err_t fat12_seek(fat12_file_t *file, uint32_t offset);
-int fat12_read(fat12_file_t *file, uint8_t *buf, uint16_t len);
+int fat12_read(fat12_file_t *file, uint8_t *buf, size_t len);
 fat12_err_t fat12_read_cluster(fat12_t *fat, uint16_t cluster, uint8_t *buf);
 
 fat12_err_t fat12_open_write(fat12_t *fat, const char *filename, fat12_writer_t *writer);
-int fat12_write(fat12_writer_t *writer, const uint8_t *buf, uint16_t len);
+int fat12_write(fat12_writer_t *writer, const uint8_t *buf, size_t len);
 fat12_err_t fat12_close_write(fat12_writer_t *writer);
 fat12_err_t fat12_create(fat12_t *fat, const char *filename, fat12_dirent_t *entry);
 fat12_err_t fat12_delete(fat12_t *fat, const char *filename);

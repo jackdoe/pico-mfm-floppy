@@ -16,10 +16,11 @@ static f12_err_t f12_check_disk(f12_t *fs) {
       lru_clear(fs->cache);
     }
 
+    fat12_abort_write(&fs->fat);
+
     for (int i = 0; i < F12_MAX_OPEN_FILES; i++) {
       fs->files[i].mode = F12_MODE_CLOSED;
     }
-    fs->fat.batch_in_use = false;
 
     fs->mounted = false;
     return f12_set_error(fs, F12_ERR_DISK_CHANGED);
@@ -168,6 +169,7 @@ f12_err_t f12_mount(f12_t *fs, f12_io_t io) {
   if (fs->cache) {
     lru_free(fs->cache);
   }
+  fat12_abort_write(&fs->fat);
 
   memset(fs, 0, sizeof(*fs));
   fs->io = io;
@@ -210,6 +212,7 @@ void f12_unmount(f12_t *fs) {
     lru_free(fs->cache);
     fs->cache = NULL;
   }
+  fat12_abort_write(&fs->fat);
 
   fs->mounted = false;
 }
@@ -343,7 +346,7 @@ int f12_read(f12_file_t *file, void *buf, size_t len) {
 
   int n = fat12_read(&file->reader, buf, len);
   if (n < 0) {
-    f12_set_error(file->fs, F12_ERR_IO);
+    f12_set_error(file->fs, fat12_to_f12_err((fat12_err_t)(-n)));
     return -1;
   }
 
@@ -365,7 +368,7 @@ int f12_write(f12_file_t *file, const void *buf, size_t len) {
 
   int n = fat12_write(&file->writer, buf, len);
   if (n < 0) {
-    f12_set_error(file->fs, F12_ERR_IO);
+    f12_set_error(file->fs, fat12_to_f12_err((fat12_err_t)(-n)));
     return -1;
   }
 
@@ -407,7 +410,9 @@ int f12_read_at(f12_file_t *file, uint32_t offset, void *buf, size_t len) {
 
   int n = f12_read(file, buf, len);
 
-  f12_seek(file, saved_pos);
+  if (f12_seek(file, saved_pos) != F12_OK) {
+    return -1;
+  }
 
   return n;
 }

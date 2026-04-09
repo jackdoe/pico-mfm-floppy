@@ -2,6 +2,28 @@
 #include "vdisk.h"
 #include "../src/fat12.h"
 
+typedef struct {
+  vdisk_t disk;
+  int fail_after_reads;
+} fault_vdisk_t;
+
+static bool fault_vdisk_read(void *ctx, sector_t *sector) {
+  fault_vdisk_t *disk = (fault_vdisk_t *)ctx;
+  if (disk->fail_after_reads == 0) {
+    sector->valid = false;
+    return false;
+  }
+  if (disk->fail_after_reads > 0) {
+    disk->fail_after_reads--;
+  }
+  return vdisk_read(&disk->disk, sector);
+}
+
+static bool fault_vdisk_write(void *ctx, track_t *track) {
+  fault_vdisk_t *disk = (fault_vdisk_t *)ctx;
+  return vdisk_write(&disk->disk, track);
+}
+
 TEST(test_init) {
   vdisk_t disk;
   vdisk_format_valid(&disk);
@@ -50,6 +72,53 @@ TEST(test_create_file) {
   ASSERT_MEM_EQ(found.name, "TEST    ", 8);
   ASSERT_MEM_EQ(found.ext, "TXT", 3);
   ASSERT_EQ(found.size, 0);
+}
+
+TEST(test_create_propagates_find_error) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_dirent_t entry;
+  disk.fail_after_reads = 0;
+
+  fat12_err_t err = fat12_create(&fat, "FAIL.TXT", &entry);
+  ASSERT_EQ(err, FAT12_ERR_READ);
+  ASSERT_EQ(disk.disk.track_writes, 0);
+  ASSERT_EQ(disk.disk.write_count, 0);
+  ASSERT_EQ((uint8_t)disk.disk.data[19][0], FAT12_DIRENT_END);
+}
+
+TEST(test_open_write_failure_cleans_up_batch) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t writer;
+  disk.fail_after_reads = 0;
+
+  fat12_err_t err = fat12_open_write(&fat, "BROKEN.TXT", &writer);
+  ASSERT_EQ(err, FAT12_ERR_READ);
+  ASSERT(!fat.batch_in_use);
+  ASSERT_NULL(fat.batch.data);
+  ASSERT_NULL(writer.fat);
+  ASSERT_NULL(writer.batch);
+
+  disk.fail_after_reads = -1;
+  err = fat12_open_write(&fat, "GOOD.TXT", &writer);
+  ASSERT_EQ(err, FAT12_OK);
+  ASSERT_EQ(fat12_write(&writer, (const uint8_t *)"ok", 2), 2);
+  ASSERT_EQ(fat12_close_write(&writer), FAT12_OK);
 }
 
 TEST(test_write_small_file) {
@@ -128,6 +197,42 @@ TEST(test_write_large_file) {
       exit(1);
     }
   }
+}
+
+TEST(test_write_read_large_single_call) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  size_t size = 70000;
+  uint8_t *pattern = malloc(size);
+  uint8_t *buf = malloc(size);
+  ASSERT_NOT_NULL(pattern);
+  ASSERT_NOT_NULL(buf);
+
+  for (size_t i = 0; i < size; i++) {
+    pattern[i] = (uint8_t)((i * 13u + 7u) & 0xFF);
+  }
+
+  fat12_writer_t writer;
+  ASSERT_EQ(fat12_open_write(&fat, "BIGCALL.BIN", &writer), FAT12_OK);
+  ASSERT_EQ(fat12_write(&writer, pattern, size), (int)size);
+  ASSERT_EQ(fat12_close_write(&writer), FAT12_OK);
+
+  fat12_dirent_t entry;
+  ASSERT_EQ(fat12_find(&fat, "BIGCALL.BIN", &entry), FAT12_OK);
+  ASSERT_EQ(entry.size, size);
+
+  fat12_file_t file;
+  ASSERT_EQ(fat12_open(&fat, &entry, &file), FAT12_OK);
+  ASSERT_EQ(fat12_read(&file, buf, size), (int)size);
+  ASSERT_MEM_EQ(buf, pattern, size);
+
+  free(buf);
+  free(pattern);
 }
 
 TEST(test_overwrite_file) {
@@ -768,8 +873,11 @@ int main(void) {
   RUN_TEST(test_init);
   RUN_TEST(test_empty_directory);
   RUN_TEST(test_create_file);
+  RUN_TEST(test_create_propagates_find_error);
+  RUN_TEST(test_open_write_failure_cleans_up_batch);
   RUN_TEST(test_write_small_file);
   RUN_TEST(test_write_large_file);
+  RUN_TEST(test_write_read_large_single_call);
   RUN_TEST(test_overwrite_file);
   RUN_TEST(test_delete_file);
   RUN_TEST(test_multiple_files);
