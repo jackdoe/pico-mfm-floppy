@@ -66,6 +66,7 @@ static void cmd_dump(int argc, char **argv);
 static void cmd_mfm(int argc, char **argv);
 static void cmd_selftest(int argc, char **argv);
 static void cmd_selftest2(int argc, char **argv);
+static void cmd_selftest3(int argc, char **argv);
 static void cmd_starwars(int argc, char **argv);
 static void cmd_diskdump(int argc, char **argv);
 static void cmd_mfmscan(int argc, char **argv);
@@ -98,6 +99,7 @@ static const cmd_entry_t commands[] = {
   {"mfm",     NULL,    cmd_mfm,    false, "mfm <track> <side>",  "MFM signal analysis"},
   {"selftest",NULL,    cmd_selftest,false, "selftest",            "Format + write/read/verify cycle"},
   {"selftest2",NULL,   cmd_selftest2,false,"selftest2 <n> <size>","Stress: n rounds of write/delete/verify"},
+  {"selftest3",NULL,   cmd_selftest3,false,"selftest3 [rounds]",  "Patch-specific full-disk overwrite test"},
   {"starwars", NULL,   cmd_starwars, false,"starwars",            "Imperial March on the stepper motor"},
   {"diskdump",NULL,    cmd_diskdump,false, "diskdump",            "Full disk sector scan + checksum"},
   {"mfmscan", NULL,    cmd_mfmscan, false, "mfmscan",             "MFM signal quality across all tracks"},
@@ -406,6 +408,140 @@ static uint32_t pattern_checksum(int file_id, uint32_t size) {
     sum = (sum << 5) + sum + gen_pattern_byte(file_id, i);
   }
   return sum;
+}
+
+static void fill_pattern_range(uint8_t *buf, int file_id, uint32_t offset, uint32_t size) {
+  for (uint32_t i = 0; i < size; i++) {
+    buf[i] = gen_pattern_byte(file_id, offset + i);
+  }
+}
+
+static uint32_t fs_cluster_size(void) {
+  return (uint32_t)fs.fat.bpb.sectors_per_cluster * fs.fat.bpb.bytes_per_sector;
+}
+
+static uint32_t clusters_for_size(uint32_t size) {
+  uint32_t cluster_size = fs_cluster_size();
+  if (size == 0) return 0;
+  return (size + cluster_size - 1) / cluster_size;
+}
+
+static bool write_pattern_file_chunked(const char *name, int file_id, uint32_t size,
+                                       uint32_t chunk_size, uint32_t *written_out,
+                                       f12_err_t *close_err_out) {
+  if (chunk_size == 0 || chunk_size > SELF_BUF_SIZE) {
+    chunk_size = SELF_BUF_SIZE;
+  }
+
+  f12_file_t *f = f12_open(&fs, name, "w");
+  if (!f) {
+    if (written_out) *written_out = 0;
+    if (close_err_out) *close_err_out = f12_errno(&fs);
+    return false;
+  }
+
+  uint32_t written = 0;
+  while (written < size) {
+    uint32_t chunk = size - written;
+    if (chunk > chunk_size) chunk = chunk_size;
+    fill_pattern_range(self_buf, file_id, written, chunk);
+
+    int n = f12_write(f, self_buf, chunk);
+    if (n <= 0) break;
+    written += (uint32_t)n;
+  }
+
+  if (written_out) *written_out = written;
+  if (close_err_out) *close_err_out = f12_close(f);
+  else f12_close(f);
+  return true;
+}
+
+static bool verify_pattern_file_chunked(const char *name, int file_id, uint32_t size,
+                                        uint32_t chunk_size, uint32_t *read_out) {
+  if (chunk_size == 0 || chunk_size > SELF_BUF_SIZE) {
+    chunk_size = SELF_BUF_SIZE;
+  }
+
+  f12_file_t *f = f12_open(&fs, name, "r");
+  if (!f) {
+    if (read_out) *read_out = 0;
+    return false;
+  }
+
+  bool ok = true;
+  uint32_t total = 0;
+  while (total < size) {
+    uint32_t chunk = size - total;
+    if (chunk > chunk_size) chunk = chunk_size;
+
+    int n = f12_read(f, self_buf, chunk);
+    if (n <= 0) {
+      ok = false;
+      break;
+    }
+
+    for (int i = 0; i < n; i++) {
+      if (self_buf[i] != gen_pattern_byte(file_id, total + (uint32_t)i)) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) break;
+
+    total += (uint32_t)n;
+  }
+
+  if (read_out) *read_out = total;
+  if (f12_close(f) != F12_OK) ok = false;
+  return ok && total == size;
+}
+
+static bool verify_pattern_at(f12_file_t *f, int file_id, uint32_t offset, uint32_t len) {
+  if (len > SELF_BUF_SIZE) return false;
+
+  int n = f12_read_at(f, offset, self_buf, len);
+  if (n != (int)len) return false;
+
+  for (uint32_t i = 0; i < len; i++) {
+    if (self_buf[i] != gen_pattern_byte(file_id, offset + i)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool verify_pattern_windows(const char *name, int file_id, uint32_t file_size) {
+  if (file_size == 0) return false;
+
+  uint32_t window = fs_cluster_size();
+  if (window == 0 || window > SELF_BUF_SIZE) window = SELF_BUF_SIZE;
+  if (window > file_size) window = file_size;
+
+  uint32_t offsets[3] = {
+    0,
+    file_size / 2,
+    file_size - window,
+  };
+
+  f12_file_t *f = f12_open(&fs, name, "r");
+  if (!f) return false;
+
+  bool ok = true;
+  for (int i = 0; i < 3; i++) {
+    uint32_t offset = offsets[i];
+    if (offset + window > file_size) {
+      offset = file_size - window;
+    }
+    if (!verify_pattern_at(f, file_id, offset, window)) {
+      ok = false;
+      break;
+    }
+  }
+
+  if (f12_close(f) != F12_OK) ok = false;
+  return ok;
 }
 
 // ============== Command Handlers ==============
@@ -1573,6 +1709,237 @@ static void cmd_selftest2(int argc, char **argv) {
 
   f12_unmount(&fs);
   mounted = false;
+}
+
+static void cmd_selftest3(int argc, char **argv) {
+  int rounds = 6;
+  if (argc > 2) {
+    printf("Usage: selftest3 [rounds]\n");
+    printf("  selftest3      default 6 full-disk overwrite rounds\n");
+    printf("  selftest3 12   run 12 overwrite/remount rounds\n");
+    return;
+  }
+  if (argc == 2) {
+    rounds = atoi(argv[1]);
+    if (rounds < 1 || rounds > 50) {
+      printf("Rounds must be 1-50\n");
+      return;
+    }
+  }
+
+  printf("This will FORMAT the disk and run patch-specific overwrite/buffer tests.\n");
+  printf("It fills the disk, overwrites a file with 0 clusters free, then grows/shrinks it.\n");
+  printf("Continue? [y/N] ");
+
+  char line[CMD_BUF_SIZE];
+  cli_readline(line, sizeof(line));
+  if (line[0] != 'y' && line[0] != 'Y') {
+    printf("Cancelled.\n");
+    return;
+  }
+
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+
+  setup_io();
+  f12_err_t err = f12_format(&fs, "PATCH3", false);
+  if (err != F12_OK) {
+    printf("Format failed: %s\n", f12_strerror(err));
+    return;
+  }
+
+  err = do_mount();
+  if (err != F12_OK) {
+    printf("Mount failed: %s\n", f12_strerror(err));
+    return;
+  }
+  mounted = true;
+
+  const char *byte_name = "BYTEIO.BIN";
+  const char *target_name = "TARGET.BIN";
+  const char *filler_name = "FILLER.BIN";
+  const int byte_id = 3000;
+  const int target_initial_id = 3100;
+  const int filler_id = 3200;
+  const int target_grow_id = 3300;
+  const int target_shrink_id = 3301;
+
+  uint32_t cluster_size = fs_cluster_size();
+  uint32_t byte_size = cluster_size * 8;
+  uint32_t target_size = cluster_size * 8;
+  uint32_t grow_size = cluster_size * 48;
+  uint32_t shrink_size = cluster_size * 3;
+
+  if (byte_size < 2048) byte_size = 2048;
+  if (byte_size > 8192) byte_size = 8192;
+  if (byte_size > SELF_BUF_SIZE) byte_size = SELF_BUF_SIZE;
+
+  if (target_size < 1024) target_size = 1024;
+  if (grow_size <= target_size) grow_size = target_size + cluster_size * 4;
+  if (shrink_size == 0 || shrink_size >= grow_size) shrink_size = cluster_size;
+
+  printf("  Cluster size: %lu bytes\n", cluster_size);
+  printf("  Byte-I/O file: %lu bytes\n", byte_size);
+  printf("  Target file: %lu -> %lu -> %lu bytes\n", target_size, grow_size, shrink_size);
+
+  int pass = 0;
+  int fail = 0;
+  uint32_t written = 0;
+  uint32_t read_back = 0;
+  f12_err_t close_err = F12_OK;
+  uint32_t t0, elapsed_ms;
+  char tag[96];
+
+  printf("\n--- Phase 1: Buffered Byte-at-a-Time I/O ---\n");
+  t0 = to_ms_since_boot(get_absolute_time());
+  bool ok = write_pattern_file_chunked(byte_name, byte_id, byte_size, 1, &written, &close_err);
+  elapsed_ms = to_ms_since_boot(get_absolute_time()) - t0;
+  snprintf(tag, sizeof(tag), "%s write 1-byte chunks", byte_name);
+  check(ok && written == byte_size && close_err == F12_OK, tag, &pass, &fail);
+  printf("  write: %lu bytes in %lu ms = %lu B/s\n",
+         written, elapsed_ms, elapsed_ms ? (written * 1000) / elapsed_ms : 0);
+
+  f12_stat_t st;
+  err = f12_stat(&fs, byte_name, &st);
+  snprintf(tag, sizeof(tag), "%s size %lu", byte_name, byte_size);
+  check(err == F12_OK && st.size == byte_size, tag, &pass, &fail);
+
+  t0 = to_ms_since_boot(get_absolute_time());
+  ok = verify_pattern_file_chunked(byte_name, byte_id, byte_size, 1, &read_back);
+  elapsed_ms = to_ms_since_boot(get_absolute_time()) - t0;
+  snprintf(tag, sizeof(tag), "%s read 1-byte chunks", byte_name);
+  check(ok && read_back == byte_size, tag, &pass, &fail);
+  printf("  read:  %lu bytes in %lu ms = %lu B/s\n",
+         read_back, elapsed_ms, elapsed_ms ? (read_back * 1000) / elapsed_ms : 0);
+
+  f12_unmount(&fs);
+  mounted = false;
+  err = do_mount();
+  check(err == F12_OK, "remount after byte I/O phase", &pass, &fail);
+  if (err != F12_OK) goto done;
+  mounted = true;
+
+  printf("\n--- Phase 2: Full-Disk Same-Size Overwrites ---\n");
+  ok = write_pattern_file_chunked(target_name, target_initial_id, target_size, 37, &written, &close_err);
+  check(ok && written == target_size && close_err == F12_OK,
+        "TARGET.BIN initial write", &pass, &fail);
+
+  uint16_t free_before_fill = count_free_clusters();
+  printf("  Free before filler: %u clusters (%lu bytes)\n",
+         free_before_fill, (uint32_t)free_before_fill * cluster_size);
+  check(free_before_fill > 0, "space remains for filler", &pass, &fail);
+
+  uint32_t filler_size = (uint32_t)free_before_fill * cluster_size;
+  ok = write_pattern_file_chunked(filler_name, filler_id, filler_size, 4096, &written, &close_err);
+  check(ok && written == filler_size && close_err == F12_OK,
+        "FILLER.BIN consumes remaining space", &pass, &fail);
+  check(count_free_clusters() == 0, "disk reports 0 free clusters", &pass, &fail);
+  check(verify_pattern_windows(filler_name, filler_id, filler_size),
+        "FILLER.BIN spot-check before overwrite rounds", &pass, &fail);
+
+  for (int round = 0; round < rounds; round++) {
+    int round_id = target_initial_id + 1 + round;
+
+    ok = write_pattern_file_chunked(target_name, round_id, target_size, 37, &written, &close_err);
+    snprintf(tag, sizeof(tag), "round %d same-size overwrite", round + 1);
+    check(ok && written == target_size && close_err == F12_OK, tag, &pass, &fail);
+
+    f12_unmount(&fs);
+    mounted = false;
+    err = do_mount();
+    snprintf(tag, sizeof(tag), "round %d remount", round + 1);
+    check(err == F12_OK, tag, &pass, &fail);
+    if (err != F12_OK) goto done;
+    mounted = true;
+
+    snprintf(tag, sizeof(tag), "round %d target verify", round + 1);
+    check(verify_pattern_file_chunked(target_name, round_id, target_size, 113, NULL),
+          tag, &pass, &fail);
+
+    snprintf(tag, sizeof(tag), "round %d filler spot-check", round + 1);
+    check(verify_pattern_windows(filler_name, filler_id, filler_size),
+          tag, &pass, &fail);
+
+    snprintf(tag, sizeof(tag), "round %d disk still full", round + 1);
+    check(count_free_clusters() == 0, tag, &pass, &fail);
+  }
+
+  check(verify_pattern_file_chunked(filler_name, filler_id, filler_size, 4096, NULL),
+        "FILLER.BIN full verify after overwrite rounds", &pass, &fail);
+
+  printf("\n--- Phase 3: Grow/Shrink Overwrites With Free Space ---\n");
+  err = f12_delete(&fs, filler_name);
+  check(err == F12_OK, "delete FILLER.BIN", &pass, &fail);
+  err = f12_stat(&fs, filler_name, &st);
+  check(err == F12_ERR_NOT_FOUND, "FILLER.BIN removed", &pass, &fail);
+
+  uint16_t free_before_grow = count_free_clusters();
+  printf("  Free after filler delete: %u clusters (%lu bytes)\n",
+         free_before_grow, (uint32_t)free_before_grow * cluster_size);
+  check(free_before_grow > 0, "space returned after filler delete", &pass, &fail);
+
+  ok = write_pattern_file_chunked(target_name, target_grow_id, grow_size, 73, &written, &close_err);
+  check(ok && written == grow_size && close_err == F12_OK,
+        "TARGET.BIN grow overwrite", &pass, &fail);
+
+  f12_unmount(&fs);
+  mounted = false;
+  err = do_mount();
+  check(err == F12_OK, "remount after grow overwrite", &pass, &fail);
+  if (err != F12_OK) goto done;
+  mounted = true;
+
+  err = f12_stat(&fs, target_name, &st);
+  check(err == F12_OK && st.size == grow_size,
+        "TARGET.BIN grow size after remount", &pass, &fail);
+  check(verify_pattern_file_chunked(target_name, target_grow_id, grow_size, 257, NULL),
+        "TARGET.BIN grow content verify", &pass, &fail);
+
+  uint16_t free_after_grow = count_free_clusters();
+  int32_t expected_free_after_grow =
+      (int32_t)free_before_grow + (int32_t)clusters_for_size(target_size) - (int32_t)clusters_for_size(grow_size);
+  snprintf(tag, sizeof(tag), "free clusters after grow = %ld", (long)expected_free_after_grow);
+  check(expected_free_after_grow >= 0 &&
+        free_after_grow == (uint16_t)expected_free_after_grow, tag, &pass, &fail);
+
+  ok = write_pattern_file_chunked(target_name, target_shrink_id, shrink_size, 19, &written, &close_err);
+  check(ok && written == shrink_size && close_err == F12_OK,
+        "TARGET.BIN shrink overwrite", &pass, &fail);
+
+  f12_unmount(&fs);
+  mounted = false;
+  err = do_mount();
+  check(err == F12_OK, "remount after shrink overwrite", &pass, &fail);
+  if (err != F12_OK) goto done;
+  mounted = true;
+
+  err = f12_stat(&fs, target_name, &st);
+  check(err == F12_OK && st.size == shrink_size,
+        "TARGET.BIN shrink size after remount", &pass, &fail);
+  check(verify_pattern_file_chunked(target_name, target_shrink_id, shrink_size, 97, NULL),
+        "TARGET.BIN shrink content verify", &pass, &fail);
+
+  uint16_t free_after_shrink = count_free_clusters();
+  int32_t expected_free_after_shrink =
+      (int32_t)free_after_grow + (int32_t)clusters_for_size(grow_size) - (int32_t)clusters_for_size(shrink_size);
+  snprintf(tag, sizeof(tag), "free clusters after shrink = %ld", (long)expected_free_after_shrink);
+  check(expected_free_after_shrink >= 0 &&
+        free_after_shrink == (uint16_t)expected_free_after_shrink, tag, &pass, &fail);
+
+  check(verify_pattern_file_chunked(byte_name, byte_id, byte_size, 1, NULL),
+        "BYTEIO.BIN still intact at end", &pass, &fail);
+
+done:
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+
+  printf("\n=== Selftest3 Complete ===\n");
+  printf("  Checks: %d passed, %d failed\n", pass, fail);
+  printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
 }
 
 static void floppy_play_note(uint16_t freq, uint16_t ms) {
