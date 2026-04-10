@@ -67,6 +67,8 @@ static void cmd_mfm(int argc, char **argv);
 static void cmd_selftest(int argc, char **argv);
 static void cmd_selftest2(int argc, char **argv);
 static void cmd_selftest3(int argc, char **argv);
+static void cmd_selftest3_a(int argc, char **argv);
+static void cmd_selftest3_b(int argc, char **argv);
 static void cmd_starwars(int argc, char **argv);
 static void cmd_diskdump(int argc, char **argv);
 static void cmd_mfmscan(int argc, char **argv);
@@ -100,6 +102,8 @@ static const cmd_entry_t commands[] = {
   {"selftest",NULL,    cmd_selftest,false, "selftest",            "Format + write/read/verify cycle"},
   {"selftest2",NULL,   cmd_selftest2,false,"selftest2 <n> <size>","Stress: n rounds of write/delete/verify"},
   {"selftest3",NULL,   cmd_selftest3,false,"selftest3 [rounds]",  "Patch-specific full-disk overwrite test"},
+  {"selftest3-a",NULL, cmd_selftest3_a,false,"selftest3-a [rounds]","Format + prepare reboot-resume overwrite test"},
+  {"selftest3-b",NULL, cmd_selftest3_b,false,"selftest3-b [rounds]","Resume selftest3 after power cycle without format"},
   {"starwars", NULL,   cmd_starwars, false,"starwars",            "Imperial March on the stepper motor"},
   {"diskdump",NULL,    cmd_diskdump,false, "diskdump",            "Full disk sector scan + checksum"},
   {"mfmscan", NULL,    cmd_mfmscan, false, "mfmscan",             "MFM signal quality across all tracks"},
@@ -542,6 +546,149 @@ static bool verify_pattern_windows(const char *name, int file_id, uint32_t file_
 
   if (f12_close(f) != F12_OK) ok = false;
   return ok;
+}
+
+#define SELFTEST3_STATE_FILE "SELF3.STA"
+#define SELFTEST3_STATE_MAGIC "S3STATE1"
+#define SELFTEST3_STATE_VERSION 1u
+#define SELFTEST3_STAGE_A_READY 1u
+#define SELFTEST3_STAGE_B_DONE  2u
+#define SELFTEST3_RANDOM_SEED   0x13579BDFu
+#define SELFTEST3_BYTE_FILE     "BYTEIO.BIN"
+#define SELFTEST3_TARGET_FILE   "TARGET.BIN"
+#define SELFTEST3_FILLER_FILE   "FILLER.BIN"
+
+typedef struct {
+  char magic[8];
+  uint32_t version;
+  uint32_t stage;
+  uint32_t seed;
+  uint32_t byte_id;
+  uint32_t byte_size;
+  uint32_t target_id;
+  uint32_t target_size;
+  uint32_t filler_id;
+  uint32_t filler_size;
+  uint32_t cluster_size;
+  uint32_t rounds_a;
+  uint8_t reserved[460];
+} selftest3_state_t;
+
+_Static_assert(sizeof(selftest3_state_t) == 512, "selftest3_state_t must be 512 bytes");
+
+static bool write_blob_file(const char *name, const void *buf, uint32_t size,
+                            uint32_t chunk_size, uint32_t *written_out,
+                            f12_err_t *close_err_out) {
+  if (chunk_size == 0 || chunk_size > SELF_BUF_SIZE) {
+    chunk_size = SELF_BUF_SIZE;
+  }
+
+  f12_file_t *f = f12_open(&fs, name, "w");
+  if (!f) {
+    if (written_out) *written_out = 0;
+    if (close_err_out) *close_err_out = f12_errno(&fs);
+    return false;
+  }
+
+  uint32_t written = 0;
+  while (written < size) {
+    uint32_t chunk = size - written;
+    if (chunk > chunk_size) chunk = chunk_size;
+
+    int n = f12_write(f, (const uint8_t *)buf + written, chunk);
+    if (n <= 0) break;
+    written += (uint32_t)n;
+  }
+
+  if (written_out) *written_out = written;
+  if (close_err_out) *close_err_out = f12_close(f);
+  else f12_close(f);
+  return true;
+}
+
+static bool read_blob_file(const char *name, void *buf, uint32_t size, uint32_t *read_out) {
+  f12_file_t *f = f12_open(&fs, name, "r");
+  if (!f) {
+    if (read_out) *read_out = 0;
+    return false;
+  }
+
+  uint32_t total = f12_read_full(f, buf, size);
+  bool ok = (f12_close(f) == F12_OK);
+
+  if (read_out) *read_out = total;
+  return ok && total == size;
+}
+
+static bool selftest3_store_state(const selftest3_state_t *state) {
+  uint32_t written = 0;
+  f12_err_t close_err = F12_OK;
+  return write_blob_file(SELFTEST3_STATE_FILE, state, sizeof(*state), 37,
+                         &written, &close_err) &&
+         written == sizeof(*state) &&
+         close_err == F12_OK;
+}
+
+static bool selftest3_load_state(selftest3_state_t *state) {
+  uint32_t got = 0;
+  if (!read_blob_file(SELFTEST3_STATE_FILE, state, sizeof(*state), &got)) {
+    return false;
+  }
+
+  return got == sizeof(*state) &&
+         memcmp(state->magic, SELFTEST3_STATE_MAGIC, sizeof(state->magic)) == 0 &&
+         state->version == SELFTEST3_STATE_VERSION;
+}
+
+static uint32_t selftest3_rand(uint32_t *state) {
+  uint32_t x = *state ? *state : 1u;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  *state = x;
+  return x;
+}
+
+static uint32_t selftest3_random_chunk(uint32_t *rng) {
+  static const uint16_t choices[] = {1, 2, 3, 5, 7, 19, 37, 73, 113, 257, 509};
+  return choices[selftest3_rand(rng) % (sizeof(choices) / sizeof(choices[0]))];
+}
+
+static uint32_t selftest3_random_pause_ms(uint32_t *rng) {
+  return 200 + (selftest3_rand(rng) % 500);
+}
+
+static f12_err_t selftest3_remount_after_pause(uint32_t pause_ms) {
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+
+  floppy_motor_off(&floppy);
+  floppy_select(&floppy, false);
+  if (pause_ms > 0) {
+    sleep_ms(pause_ms);
+  }
+
+  f12_err_t err = do_mount();
+  if (err == F12_OK) {
+    mounted = true;
+  }
+  return err;
+}
+
+static uint32_t selftest3_random_target_size(uint32_t *rng, uint32_t cluster_size,
+                                             uint32_t max_clusters, uint32_t current_clusters) {
+  uint32_t clusters = 1 + (selftest3_rand(rng) % max_clusters);
+  if (clusters == current_clusters) {
+    clusters = (clusters % max_clusters) + 1;
+  }
+
+  if (clusters == 1) {
+    return 1 + (selftest3_rand(rng) % cluster_size);
+  }
+
+  return (clusters - 1) * cluster_size + 1 + (selftest3_rand(rng) % cluster_size);
 }
 
 // ============== Command Handlers ==============
@@ -1940,6 +2087,380 @@ done:
   printf("\n=== Selftest3 Complete ===\n");
   printf("  Checks: %d passed, %d failed\n", pass, fail);
   printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
+}
+
+static void cmd_selftest3_a(int argc, char **argv) {
+  int rounds = 6;
+  if (argc > 2) {
+    printf("Usage: selftest3-a [rounds]\n");
+    printf("  selftest3-a      format + prepare state for reboot-resume test\n");
+    printf("  selftest3-a 10   do 10 full-disk overwrite rounds before reboot\n");
+    return;
+  }
+  if (argc == 2) {
+    rounds = atoi(argv[1]);
+    if (rounds < 1 || rounds > 50) {
+      printf("Rounds must be 1-50\n");
+      return;
+    }
+  }
+
+  printf("This will FORMAT the disk and prepare a reboot-resume patch test.\n");
+  printf("It leaves the disk full and writes a state marker for selftest3-b.\n");
+  printf("Continue? [y/N] ");
+
+  char line[CMD_BUF_SIZE];
+  cli_readline(line, sizeof(line));
+  if (line[0] != 'y' && line[0] != 'Y') {
+    printf("Cancelled.\n");
+    return;
+  }
+
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+
+  setup_io();
+  f12_err_t err = f12_format(&fs, "P3A", false);
+  if (err != F12_OK) {
+    printf("Format failed: %s\n", f12_strerror(err));
+    return;
+  }
+
+  err = do_mount();
+  if (err != F12_OK) {
+    printf("Mount failed: %s\n", f12_strerror(err));
+    return;
+  }
+  mounted = true;
+
+  const int byte_id = 4300;
+  const int target_initial_id = 4400;
+  const int filler_id = 4500;
+
+  uint32_t cluster_size = fs_cluster_size();
+  uint32_t byte_size = cluster_size * 8;
+  uint32_t target_size = cluster_size * 8;
+  if (byte_size < 2048) byte_size = 2048;
+  if (byte_size > 8192) byte_size = 8192;
+  if (byte_size > SELF_BUF_SIZE) byte_size = SELF_BUF_SIZE;
+  if (target_size < 1024) target_size = 1024;
+
+  int pass = 0;
+  int fail = 0;
+  uint32_t written = 0;
+  uint32_t read_back = 0;
+  f12_err_t close_err = F12_OK;
+  char tag[96];
+
+  selftest3_state_t state;
+  memset(&state, 0, sizeof(state));
+  memcpy(state.magic, SELFTEST3_STATE_MAGIC, sizeof(state.magic));
+  state.version = SELFTEST3_STATE_VERSION;
+  state.stage = SELFTEST3_STAGE_A_READY;
+  state.seed = SELFTEST3_RANDOM_SEED;
+  state.byte_id = byte_id;
+  state.byte_size = byte_size;
+  state.target_id = target_initial_id + rounds;
+  state.target_size = target_size;
+  state.filler_id = filler_id;
+  state.filler_size = 0;
+  state.cluster_size = cluster_size;
+  state.rounds_a = (uint32_t)rounds;
+
+  printf("  Cluster size: %lu bytes\n", cluster_size);
+  printf("  Byte-I/O file: %lu bytes\n", byte_size);
+  printf("  Target file: %lu bytes, %d rounds before reboot\n", target_size, rounds);
+
+  printf("\n--- Phase A1: Buffered Byte-at-a-Time I/O ---\n");
+  bool ok = write_pattern_file_chunked(SELFTEST3_BYTE_FILE, byte_id, byte_size, 1, &written, &close_err);
+  check(ok && written == byte_size && close_err == F12_OK,
+        "BYTEIO.BIN write 1-byte chunks", &pass, &fail);
+  check(verify_pattern_file_chunked(SELFTEST3_BYTE_FILE, byte_id, byte_size, 1, &read_back) &&
+        read_back == byte_size,
+        "BYTEIO.BIN read 1-byte chunks", &pass, &fail);
+
+  printf("\n--- Phase A2: Build Full-Disk Resume State ---\n");
+  ok = write_pattern_file_chunked(SELFTEST3_TARGET_FILE, target_initial_id, target_size, 37, &written, &close_err);
+  check(ok && written == target_size && close_err == F12_OK,
+        "TARGET.BIN initial write", &pass, &fail);
+
+  check(selftest3_store_state(&state), "SELF3.STA placeholder write", &pass, &fail);
+
+  uint16_t free_before_fill = count_free_clusters();
+  uint32_t filler_size = (uint32_t)free_before_fill * cluster_size;
+  state.filler_size = filler_size;
+  printf("  Free before filler: %u clusters (%lu bytes)\n",
+         free_before_fill, filler_size);
+  check(free_before_fill > 0, "space remains for filler", &pass, &fail);
+
+  ok = write_pattern_file_chunked(SELFTEST3_FILLER_FILE, filler_id, filler_size, 4096, &written, &close_err);
+  check(ok && written == filler_size && close_err == F12_OK,
+        "FILLER.BIN consumes remaining space", &pass, &fail);
+  check(count_free_clusters() == 0, "disk reports 0 free clusters", &pass, &fail);
+  check(verify_pattern_windows(SELFTEST3_FILLER_FILE, filler_id, filler_size),
+        "FILLER.BIN spot-check before reboot", &pass, &fail);
+
+  int current_target_id = target_initial_id;
+  for (int round = 0; round < rounds; round++) {
+    current_target_id++;
+
+    ok = write_pattern_file_chunked(SELFTEST3_TARGET_FILE, current_target_id, target_size, 37,
+                                    &written, &close_err);
+    snprintf(tag, sizeof(tag), "round %d same-size overwrite", round + 1);
+    check(ok && written == target_size && close_err == F12_OK, tag, &pass, &fail);
+
+    err = selftest3_remount_after_pause(0);
+    snprintf(tag, sizeof(tag), "round %d remount", round + 1);
+    check(err == F12_OK, tag, &pass, &fail);
+    if (err != F12_OK) goto done_a;
+
+    snprintf(tag, sizeof(tag), "round %d target verify", round + 1);
+    check(verify_pattern_file_chunked(SELFTEST3_TARGET_FILE, current_target_id, target_size, 113, NULL),
+          tag, &pass, &fail);
+
+    snprintf(tag, sizeof(tag), "round %d filler spot-check", round + 1);
+    check(verify_pattern_windows(SELFTEST3_FILLER_FILE, filler_id, filler_size),
+          tag, &pass, &fail);
+  }
+
+  state.target_id = (uint32_t)current_target_id;
+  check(selftest3_store_state(&state), "SELF3.STA final write on full disk", &pass, &fail);
+
+  selftest3_state_t verify_state;
+  bool state_ok = selftest3_load_state(&verify_state) &&
+                  verify_state.target_id == state.target_id &&
+                  verify_state.filler_size == state.filler_size &&
+                  verify_state.stage == SELFTEST3_STAGE_A_READY;
+  check(state_ok, "SELF3.STA verify after final write", &pass, &fail);
+
+done_a:
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+  floppy_motor_off(&floppy);
+  floppy_select(&floppy, false);
+
+  printf("\n--- Powercycle ---\n");
+  printf("  Now reboot or power-cycle the Pico.\n");
+  printf("  Then run: selftest3-b\n");
+  printf("  Optional longer soak: selftest3-b 12\n");
+  printf("  The disk should still contain %s, %s, %s, %s.\n",
+         SELFTEST3_BYTE_FILE, SELFTEST3_TARGET_FILE,
+         SELFTEST3_FILLER_FILE, SELFTEST3_STATE_FILE);
+
+  printf("\n=== Selftest3-A Complete ===\n");
+  printf("  Checks: %d passed, %d failed\n", pass, fail);
+  printf("  Result: %s\n", fail == 0 ? "READY FOR POWER CYCLE" : "FAILED");
+}
+
+static void cmd_selftest3_b(int argc, char **argv) {
+  int rounds = 12;
+  if (argc > 2) {
+    printf("Usage: selftest3-b [rounds]\n");
+    printf("  selftest3-b      resume after reboot with 12 randomized overwrite rounds\n");
+    printf("  selftest3-b 20   longer randomized overwrite/remount soak\n");
+    return;
+  }
+  if (argc == 2) {
+    rounds = atoi(argv[1]);
+    if (rounds < 1 || rounds > 100) {
+      printf("Rounds must be 1-100\n");
+      return;
+    }
+  }
+
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+
+  f12_err_t err = do_mount();
+  if (err != F12_OK) {
+    printf("Mount failed: %s\n", f12_strerror(err));
+    printf("Run selftest3-a first on a sacrificial disk.\n");
+    return;
+  }
+  mounted = true;
+
+  selftest3_state_t state;
+  if (!selftest3_load_state(&state)) {
+    printf("State file %s is missing or invalid.\n", SELFTEST3_STATE_FILE);
+    printf("Run selftest3-a first, then reboot, then run selftest3-b.\n");
+    goto done_b;
+  }
+
+  if (state.stage != SELFTEST3_STAGE_A_READY) {
+    printf("State file is not in the expected pre-reboot phase.\n");
+    printf("Current stage: %lu\n", state.stage);
+    goto done_b;
+  }
+
+  printf("Resuming patch test without format.\n");
+  printf("  Cluster size: %lu bytes\n", state.cluster_size);
+  printf("  Target from phase A: id=%lu size=%lu\n", state.target_id, state.target_size);
+  printf("  Filler size: %lu bytes\n", state.filler_size);
+  printf("  Randomized same-size rounds: %d\n", rounds);
+
+  int pass = 0;
+  int fail = 0;
+  char tag[96];
+
+  check(fs_cluster_size() == state.cluster_size, "cluster size matches saved state", &pass, &fail);
+
+  printf("\n--- Phase B1: Verify Post-Reboot State ---\n");
+  check(verify_pattern_file_chunked(SELFTEST3_BYTE_FILE, (int)state.byte_id, state.byte_size, 1, NULL),
+        "BYTEIO.BIN survived reboot", &pass, &fail);
+  check(verify_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)state.target_id, state.target_size, 113, NULL),
+        "TARGET.BIN survived reboot", &pass, &fail);
+  check(verify_pattern_windows(SELFTEST3_FILLER_FILE, (int)state.filler_id, state.filler_size),
+        "FILLER.BIN spot-check after reboot", &pass, &fail);
+  check(count_free_clusters() == 0, "disk still full after reboot", &pass, &fail);
+
+  printf("\n--- Phase B2: Randomized Full-Disk Overwrites ---\n");
+  uint32_t rng = state.seed ^ state.target_id ^ ((uint32_t)rounds * 0x9E3779B9u);
+  uint32_t current_target_id = state.target_id;
+  uint32_t current_target_size = state.target_size;
+  uint32_t current_target_clusters = clusters_for_size(current_target_size);
+
+  for (int round = 0; round < rounds; round++) {
+    uint32_t write_chunk = selftest3_random_chunk(&rng);
+    uint32_t verify_chunk = selftest3_random_chunk(&rng);
+    uint32_t pause_ms = selftest3_random_pause_ms(&rng);
+    uint32_t written = 0;
+    f12_err_t close_err = F12_OK;
+
+    current_target_id++;
+    bool ok = write_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)current_target_id,
+                                         current_target_size, write_chunk,
+                                         &written, &close_err);
+    snprintf(tag, sizeof(tag), "round %d overwrite chunk=%lu", round + 1, write_chunk);
+    check(ok && written == current_target_size && close_err == F12_OK, tag, &pass, &fail);
+
+    err = selftest3_remount_after_pause(pause_ms);
+    snprintf(tag, sizeof(tag), "round %d remount after %lums idle", round + 1, pause_ms);
+    check(err == F12_OK, tag, &pass, &fail);
+    if (err != F12_OK) goto done_b_counts;
+
+    snprintf(tag, sizeof(tag), "round %d target verify chunk=%lu", round + 1, verify_chunk);
+    check(verify_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)current_target_id,
+                                      current_target_size, verify_chunk, NULL),
+          tag, &pass, &fail);
+
+    if (((round + 1) % 4) == 0) {
+      snprintf(tag, sizeof(tag), "round %d filler full verify", round + 1);
+      check(verify_pattern_file_chunked(SELFTEST3_FILLER_FILE, (int)state.filler_id,
+                                        state.filler_size, 4096, NULL),
+            tag, &pass, &fail);
+    } else {
+      snprintf(tag, sizeof(tag), "round %d filler spot-check", round + 1);
+      check(verify_pattern_windows(SELFTEST3_FILLER_FILE, (int)state.filler_id, state.filler_size),
+            tag, &pass, &fail);
+    }
+
+    snprintf(tag, sizeof(tag), "round %d disk still full", round + 1);
+    check(count_free_clusters() == 0, tag, &pass, &fail);
+
+    if (round == 0 || round == rounds - 1) {
+      selftest3_state_t verify_state;
+      snprintf(tag, sizeof(tag), "round %d state file readable", round + 1);
+      check(selftest3_load_state(&verify_state) && verify_state.stage == SELFTEST3_STAGE_A_READY,
+            tag, &pass, &fail);
+    }
+  }
+
+  printf("\n--- Phase B3: Randomized Grow/Shrink Overwrites ---\n");
+  err = f12_delete(&fs, SELFTEST3_FILLER_FILE);
+  check(err == F12_OK, "delete FILLER.BIN", &pass, &fail);
+
+  f12_stat_t st;
+  err = f12_stat(&fs, SELFTEST3_FILLER_FILE, &st);
+  check(err == F12_ERR_NOT_FOUND, "FILLER.BIN removed", &pass, &fail);
+
+  uint32_t free_clusters = count_free_clusters();
+  printf("  Free after filler delete: %lu clusters (%lu bytes)\n",
+         free_clusters, free_clusters * state.cluster_size);
+  check(free_clusters > 0, "space returned after filler delete", &pass, &fail);
+
+  int size_rounds = rounds / 2 + 4;
+  for (int round = 0; round < size_rounds; round++) {
+    uint32_t max_target_clusters = free_clusters + current_target_clusters;
+    if (max_target_clusters > 96) max_target_clusters = 96;
+    if (max_target_clusters == 0) max_target_clusters = 1;
+
+    uint32_t new_size = selftest3_random_target_size(&rng, state.cluster_size,
+                                                     max_target_clusters,
+                                                     current_target_clusters);
+    uint32_t new_clusters = clusters_for_size(new_size);
+    uint32_t write_chunk = selftest3_random_chunk(&rng);
+    uint32_t pause_ms = selftest3_random_pause_ms(&rng);
+    uint32_t written = 0;
+    f12_err_t close_err = F12_OK;
+    int32_t expected_free;
+
+    current_target_id++;
+    bool ok = write_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)current_target_id, new_size,
+                                         write_chunk, &written, &close_err);
+    snprintf(tag, sizeof(tag), "size round %d write %lu bytes chunk=%lu",
+             round + 1, new_size, write_chunk);
+    check(ok && written == new_size && close_err == F12_OK, tag, &pass, &fail);
+
+    err = selftest3_remount_after_pause(pause_ms);
+    snprintf(tag, sizeof(tag), "size round %d remount after %lums idle", round + 1, pause_ms);
+    check(err == F12_OK, tag, &pass, &fail);
+    if (err != F12_OK) goto done_b_counts;
+
+    snprintf(tag, sizeof(tag), "size round %d content verify", round + 1);
+    check(verify_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)current_target_id,
+                                      new_size, selftest3_random_chunk(&rng), NULL),
+          tag, &pass, &fail);
+
+    expected_free = (int32_t)free_clusters + (int32_t)current_target_clusters - (int32_t)new_clusters;
+    free_clusters = count_free_clusters();
+    snprintf(tag, sizeof(tag), "size round %d free clusters = %ld", round + 1, (long)expected_free);
+    check(expected_free >= 0 && free_clusters == (uint32_t)expected_free, tag, &pass, &fail);
+
+    if (((round + 1) % 3) == 0) {
+      snprintf(tag, sizeof(tag), "size round %d BYTEIO.BIN verify", round + 1);
+      check(verify_pattern_file_chunked(SELFTEST3_BYTE_FILE, (int)state.byte_id, state.byte_size, 1, NULL),
+            tag, &pass, &fail);
+    }
+
+    current_target_size = new_size;
+    current_target_clusters = new_clusters;
+  }
+
+  state.stage = SELFTEST3_STAGE_B_DONE;
+  state.seed = rng;
+  state.target_id = current_target_id;
+  state.target_size = current_target_size;
+  state.filler_size = 0;
+  check(selftest3_store_state(&state), "SELF3.STA update after phase B", &pass, &fail);
+
+  selftest3_state_t final_state;
+  bool final_state_ok = selftest3_load_state(&final_state) &&
+                        final_state.stage == SELFTEST3_STAGE_B_DONE &&
+                        final_state.target_id == state.target_id &&
+                        final_state.target_size == state.target_size;
+  check(final_state_ok, "SELF3.STA verify after phase B", &pass, &fail);
+
+  check(verify_pattern_file_chunked(SELFTEST3_BYTE_FILE, (int)state.byte_id, state.byte_size, 1, NULL),
+        "BYTEIO.BIN final verify", &pass, &fail);
+
+done_b_counts:
+  printf("\n=== Selftest3-B Complete ===\n");
+  printf("  Checks: %d passed, %d failed\n", pass, fail);
+  printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
+
+done_b:
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+  floppy_motor_off(&floppy);
+  floppy_select(&floppy, false);
 }
 
 static void floppy_play_note(uint16_t freq, uint16_t ms) {
