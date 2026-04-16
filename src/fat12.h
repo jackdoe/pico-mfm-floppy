@@ -28,54 +28,12 @@ typedef struct {
   uint16_t sectors_per_track;
   uint16_t num_heads;
   uint32_t hidden_sectors;
-} fat12_bpb_t;
+} __attribute__((packed)) fat12_bpb_t;
+
+_Static_assert(sizeof(fat12_bpb_t) == 21, "fat12_bpb_t must match on-disk BPB layout");
 
 #define FAT12_BPB_OFFSET 11
 #define FAT12_BOOT_SIG_OFFSET 510
-
-typedef struct {
-  uint16_t bytes_per_sector;
-  uint8_t  sectors_per_cluster;
-  uint16_t reserved_sectors;
-  uint8_t  num_fats;
-  uint16_t root_entries;
-  uint16_t total_sectors;
-  uint8_t  media_descriptor;
-  uint16_t sectors_per_fat;
-  uint16_t sectors_per_track;
-  uint16_t num_heads;
-  uint32_t hidden_sectors;
-} __attribute__((packed)) fat12_bpb_raw_t;
-
-_Static_assert(sizeof(fat12_bpb_raw_t) == 21, "fat12_bpb_raw_t must match on-disk BPB layout");
-
-static inline void fat12_bpb_from_raw(fat12_bpb_t *bpb, const fat12_bpb_raw_t *raw) {
-  bpb->bytes_per_sector    = raw->bytes_per_sector;
-  bpb->sectors_per_cluster = raw->sectors_per_cluster;
-  bpb->reserved_sectors    = raw->reserved_sectors;
-  bpb->num_fats            = raw->num_fats;
-  bpb->root_entries        = raw->root_entries;
-  bpb->total_sectors       = raw->total_sectors;
-  bpb->media_descriptor    = raw->media_descriptor;
-  bpb->sectors_per_fat     = raw->sectors_per_fat;
-  bpb->sectors_per_track   = raw->sectors_per_track;
-  bpb->num_heads           = raw->num_heads;
-  bpb->hidden_sectors      = raw->hidden_sectors;
-}
-
-static inline void fat12_bpb_to_raw(fat12_bpb_raw_t *raw, const fat12_bpb_t *bpb) {
-  raw->bytes_per_sector    = bpb->bytes_per_sector;
-  raw->sectors_per_cluster = bpb->sectors_per_cluster;
-  raw->reserved_sectors    = bpb->reserved_sectors;
-  raw->num_fats            = bpb->num_fats;
-  raw->root_entries        = bpb->root_entries;
-  raw->total_sectors       = bpb->total_sectors;
-  raw->media_descriptor    = bpb->media_descriptor;
-  raw->sectors_per_fat     = bpb->sectors_per_fat;
-  raw->sectors_per_track   = bpb->sectors_per_track;
-  raw->num_heads           = bpb->num_heads;
-  raw->hidden_sectors      = bpb->hidden_sectors;
-}
 
 typedef struct {
   char     name[FAT12_FILENAME_LEN];
@@ -101,16 +59,13 @@ typedef struct {
 
 #define FAT12_WRITE_BATCH_MAX 36
 
-typedef struct fat12 fat12_t;
-
 typedef struct {
-  fat12_t *fat;
   uint16_t lbas[FAT12_WRITE_BATCH_MAX];
   uint8_t (*data)[SECTOR_SIZE];
   uint8_t count;
 } fat12_write_batch_t;
 
-struct fat12 {
+typedef struct fat12 {
   fat12_io_t io;
   fat12_bpb_t bpb;
 
@@ -120,22 +75,25 @@ struct fat12 {
   uint16_t data_start_sector;
   uint16_t total_clusters;
 
-  sector_t sector_buf;
-
   fat12_write_batch_t batch;
-  bool batch_in_use;
 
   uint16_t next_free_hint;
   bool fat_mismatch;
-};
+} fat12_t;
 
-typedef struct {
-  fat12_bpb_t bpb;
-  uint16_t fat_start_sector;
-  uint16_t root_dir_start_sector;
-  uint16_t root_dir_sectors;
-  uint16_t data_start_sector;
-} fat12_layout_t;
+static inline uint16_t fat12_chs_to_lba(const fat12_bpb_t *bpb,
+                                         uint8_t track, uint8_t side, uint8_t sector_n) {
+  return (track * bpb->num_heads + side) * bpb->sectors_per_track + (sector_n - 1);
+}
+
+static inline void fat12_lba_to_chs(const fat12_bpb_t *bpb, uint16_t lba,
+                                     uint8_t *track, uint8_t *side, uint8_t *sector_n) {
+  uint16_t per_cyl = bpb->num_heads * bpb->sectors_per_track;
+  *track = lba / per_cyl;
+  uint16_t rem = lba % per_cyl;
+  *side = rem / bpb->sectors_per_track;
+  *sector_n = (rem % bpb->sectors_per_track) + 1;
+}
 
 typedef enum {
   FAT12_OK = 0,
@@ -160,7 +118,6 @@ typedef struct {
 
 typedef struct {
   fat12_t *fat;
-  fat12_write_batch_t *batch;
   uint16_t dirent_index;
   fat12_dirent_t dirent;
   uint16_t first_cluster;

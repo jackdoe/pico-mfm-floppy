@@ -112,7 +112,7 @@ Tests (host-side, no hardware needed):
 
 ## Testing
 
-112 unit tests, 12,001 fuzz iterations, 100 SCP roundtrip fuzz iterations. Tested against real 1994 floppy disks. Tests run for both RP2040 and RP2350 configurations.
+145 unit tests, 12,001 fuzz iterations, 100 SCP roundtrip fuzz iterations. Tested against real 1994 floppy disks. Tests run for both RP2040 and RP2350 configurations.
 
 ```
 tests/
@@ -127,7 +127,7 @@ tests/
 ├── test_scp_roundtrip.c   8 tests: decode→modify→encode→decode→verify + fuzz
 ├── test_pio_sim.c         4 tests: real floppy.c code with PIO hardware simulation
 ├── test_pio_emu.c         3 tests: cycle-accurate PIO instruction emulation
-├── test_write_verify.c    4 tests: write-verify-retry through full firmware + PIO sim
+├── test_write_verify.c    7 tests: write-verify-retry through full firmware + PIO sim, cache-skip-flux-read
 ├── flux_sim.c/h          SCP file parser + synthetic flux with jitter/drift
 ├── pio_sim.c/h           GPIO/PIO hardware simulator with write-back and fault injection
 ├── pio_emu.c/h           RP2040 PIO instruction set emulator (9 opcodes)

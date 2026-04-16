@@ -218,6 +218,7 @@ static uint16_t pio_sim_next_sample(void) {
     if (g_drive->read_pos >= g_drive->read_count)
         g_drive->read_pos = 0;
 
+    g_drive->flux_sample_reads++;
     uint16_t delta = g_drive->read_buf[g_drive->read_pos++];
     g_drive->counter -= delta;
 

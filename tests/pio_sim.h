@@ -34,6 +34,7 @@ typedef struct {
     uint32_t write_capture_capacity;
 
     uint32_t index_poll_count;
+    uint32_t flux_sample_reads;
     int fault_writes_remaining;
     bool index_stuck;
     bool index_value;

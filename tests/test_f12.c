@@ -288,7 +288,6 @@ TEST(test_disk_changed_aborts_pending_write) {
   f12_file_t *f = f12_open(&fs, "PEND.TXT", "w");
   ASSERT(f != NULL);
   ASSERT_EQ(f12_write(f, "hello", 5), 5);
-  ASSERT(fs.fat.batch_in_use);
   ASSERT_NOT_NULL(fs.fat.batch.data);
 
   vdisk.disk_changed = true;
@@ -296,7 +295,6 @@ TEST(test_disk_changed_aborts_pending_write) {
   ASSERT_EQ(f12_write(f, "!", 1), -1);
   ASSERT_EQ(f12_errno(&fs), F12_ERR_DISK_CHANGED);
   ASSERT(!fs.mounted);
-  ASSERT(!fs.fat.batch_in_use);
   ASSERT_NULL(fs.fat.batch.data);
   ASSERT_EQ(f->mode, F12_MODE_CLOSED);
 

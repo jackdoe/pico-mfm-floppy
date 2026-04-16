@@ -63,13 +63,12 @@ static bool f12_cached_read(void *ctx, sector_t *sector) {
     track.side = sector->side;
     fs->io.read_track(fs->io.ctx, &track);
     uint16_t pin_limit = fs->fat.root_dir_start_sector + fs->fat.root_dir_sectors;
-    uint16_t track_lba_base = (track.track * fs->fat.bpb.num_heads + track.side)
-                              * fs->fat.bpb.sectors_per_track;
     for (int i = 0; i < SECTORS_PER_TRACK; i++) {
       if (track.sectors[i].valid) {
         uint32_t k = lru_key(track.track, track.side, i + 1);
         lru_set(fs->cache, k, track.sectors[i].data);
-        if (track_lba_base + i < pin_limit) {
+        uint16_t lba = fat12_chs_to_lba(&fs->fat.bpb, track.track, track.side, i + 1);
+        if (lba < pin_limit) {
           lru_pin(fs->cache, k);
         }
       }
@@ -88,8 +87,7 @@ static bool f12_cached_read(void *ctx, sector_t *sector) {
 
   if (sector->valid) {
     lru_set(fs->cache, key, sector->data);
-    uint16_t lba = (sector->track * fs->fat.bpb.num_heads + sector->side)
-                   * fs->fat.bpb.sectors_per_track + (sector->sector_n - 1);
+    uint16_t lba = fat12_chs_to_lba(&fs->fat.bpb, sector->track, sector->side, sector->sector_n);
     if (lba < fs->fat.root_dir_start_sector + fs->fat.root_dir_sectors) {
       lru_pin(fs->cache, key);
     }
@@ -104,6 +102,20 @@ static bool f12_cached_write(void *ctx, track_t *track) {
   if (fs->mounted) {
     if (f12_check_writable(fs) != F12_OK) {
       return false;
+    }
+  }
+
+  for (int i = 0; i < SECTORS_PER_TRACK; i++) {
+    if (track->sectors[i].valid) continue;
+    uint32_t key = lru_key(track->track, track->side, i + 1);
+    uint8_t *cached = lru_get(fs->cache, key);
+    if (cached) {
+      memcpy(track->sectors[i].data, cached, SECTOR_SIZE);
+      track->sectors[i].track = track->track;
+      track->sectors[i].side = track->side;
+      track->sectors[i].sector_n = i + 1;
+      track->sectors[i].size_code = 2;
+      track->sectors[i].valid = true;
     }
   }
 
@@ -297,7 +309,6 @@ f12_file_t *f12_open(f12_t *fs, const char *path, const char *mode) {
     }
 
     file->mode = F12_MODE_READ;
-    file->position = 0;
 
   } else {
     fat12_err_t ferr = fat12_open_write(&fs->fat, path, &file->io.writer);
@@ -307,7 +318,6 @@ f12_file_t *f12_open(f12_t *fs, const char *path, const char *mode) {
     }
 
     file->mode = F12_MODE_WRITE;
-    file->position = 0;
   }
 
   return file;
@@ -350,7 +360,6 @@ int f12_read(f12_file_t *file, void *buf, size_t len) {
     return -1;
   }
 
-  file->position += n;
   return n;
 }
 
@@ -372,7 +381,6 @@ int f12_write(f12_file_t *file, const void *buf, size_t len) {
     return -1;
   }
 
-  file->position += n;
   return n;
 }
 
@@ -391,19 +399,22 @@ f12_err_t f12_seek(f12_file_t *file, uint32_t offset) {
     return f12_set_error(file->fs, fat12_to_f12_err(ferr));
   }
 
-  file->position = file->io.reader.bytes_read;
   return F12_OK;
 }
 
 uint32_t f12_tell(f12_file_t *file) {
   if (!file) return 0;
-  return file->position;
+  switch (file->mode) {
+    case F12_MODE_READ:  return file->io.reader.bytes_read;
+    case F12_MODE_WRITE: return file->io.writer.bytes_written;
+    default:             return 0;
+  }
 }
 
 int f12_read_at(f12_file_t *file, uint32_t offset, void *buf, size_t len) {
   if (!file || !file->fs) return -1;
 
-  uint32_t saved_pos = file->position;
+  uint32_t saved_pos = f12_tell(file);
 
   f12_err_t err = f12_seek(file, offset);
   if (err != F12_OK) return -1;

@@ -132,10 +132,8 @@ TEST(test_open_write_failure_cleans_up_batch) {
 
   fat12_err_t err = fat12_open_write(&fat, "BROKEN.TXT", &writer);
   ASSERT_EQ(err, FAT12_ERR_READ);
-  ASSERT(!fat.batch_in_use);
   ASSERT_NULL(fat.batch.data);
   ASSERT_NULL(writer.fat);
-  ASSERT_NULL(writer.batch);
 
   disk.fail_after_reads = -1;
   err = fat12_open_write(&fat, "GOOD.TXT", &writer);
@@ -339,7 +337,6 @@ TEST(test_overwrite_failure_preserves_existing_file) {
   ASSERT_EQ(fat12_open_write(&fat, "SAFE.TXT", &writer), FAT12_OK);
   ASSERT_EQ(fat12_write(&writer, (const uint8_t *)"new data that should not stick", 30), 30);
   ASSERT_EQ(fat12_close_write(&writer), FAT12_ERR_WRITE);
-  ASSERT(!fat.batch_in_use);
   ASSERT_NULL(fat.batch.data);
 
   disk.fail_after_track_writes = -1;

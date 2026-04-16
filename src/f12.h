@@ -60,13 +60,11 @@ typedef enum {
 struct f12_file {
   f12_t *fs;
   fat12_dirent_t dirent;
-  uint16_t dirent_index;
   union {
     fat12_file_t reader;
     fat12_writer_t writer;
   } io;
   f12_file_mode_t mode;
-  uint32_t position;
 };
 
 struct f12 {

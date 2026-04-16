@@ -256,6 +256,34 @@ TEST(test_write_verify_overwrite_preserves_old_on_fail) {
     f12_unmount(&fs);
 }
 
+TEST(test_write_skips_flux_read_when_sectors_cached) {
+    setup_formatted_disk();
+
+    f12_t fs;
+    memset(&fs, 0, sizeof(fs));
+    ASSERT_EQ(f12_mount(&fs, make_floppy_io()), F12_OK);
+
+    f12_dir_t dir;
+    f12_stat_t stat;
+    f12_opendir(&fs, "/", &dir);
+    while (f12_readdir(&dir, &stat) == F12_OK) {}
+    f12_closedir(&dir);
+
+    uint32_t samples_before = sim_drive.flux_sample_reads;
+
+    f12_file_t *f = f12_open(&fs, "TINY.TXT", "w");
+    ASSERT(f != NULL);
+    ASSERT_EQ(f12_write(f, "hi", 2), 2);
+    ASSERT_EQ(f12_close(f), F12_OK);
+
+    uint32_t samples_during_write = sim_drive.flux_sample_reads - samples_before;
+    printf("\n  Flux samples during write+close: %u\n  ", samples_during_write);
+
+    ASSERT(samples_during_write < 400000);
+
+    f12_unmount(&fs);
+}
+
 int main(void) {
     printf("=== Write Verification Tests ===\n\n");
 
@@ -265,6 +293,7 @@ int main(void) {
     RUN_TEST(test_write_verify_permanent_fail);
     RUN_TEST(test_write_verify_overwrite_existing_file);
     RUN_TEST(test_write_verify_overwrite_preserves_old_on_fail);
+    RUN_TEST(test_write_skips_flux_read_when_sectors_cached);
 
     pio_sim_free(&sim_drive);
 
