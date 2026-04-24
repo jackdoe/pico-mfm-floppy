@@ -61,8 +61,9 @@ typedef struct {
 
 typedef struct {
   uint16_t lbas[FAT12_WRITE_BATCH_MAX];
-  uint8_t (*data)[SECTOR_SIZE];
+  uint8_t data[FAT12_WRITE_BATCH_MAX][SECTOR_SIZE];
   uint8_t count;
+  bool active;
 } fat12_write_batch_t;
 
 typedef struct fat12 {
@@ -79,6 +80,7 @@ typedef struct fat12 {
 
   uint16_t next_free_hint;
   bool fat_mismatch;
+  track_t write_track;
 } fat12_t;
 
 static inline uint16_t fat12_chs_to_lba(const fat12_bpb_t *bpb,

@@ -14,6 +14,31 @@ static f12_io_t vdisk_f12_io(void) {
   };
 }
 
+typedef struct {
+  vdisk_t *disk;
+  int track_reads;
+} failing_track_io_t;
+
+static bool failing_track_read(void *ctx, sector_t *sector) {
+  failing_track_io_t *io = (failing_track_io_t *)ctx;
+  return vdisk_read(io->disk, sector);
+}
+
+static bool failing_track_read_track(void *ctx, track_t *track) {
+  failing_track_io_t *io = (failing_track_io_t *)ctx;
+  io->track_reads++;
+  for (int i = 0; i < SECTORS_PER_TRACK; i++) {
+    track->sectors[i].valid = true;
+    memset(track->sectors[i].data, 0xEE, SECTOR_SIZE);
+  }
+  return false;
+}
+
+static bool failing_track_write(void *ctx, track_t *track) {
+  failing_track_io_t *io = (failing_track_io_t *)ctx;
+  return vdisk_write(io->disk, track);
+}
+
 TEST(test_mount_unmount) {
   vdisk_init(&vdisk);
 
@@ -30,6 +55,43 @@ TEST(test_mount_unmount) {
 
   f12_unmount(&fs);
   ASSERT(!fs.mounted);
+}
+
+TEST(test_mount_clears_uninitialized_state) {
+  vdisk_format_valid(&vdisk);
+
+  f12_t fs;
+  memset(&fs, 0xA5, sizeof(fs));
+
+  f12_err_t err = f12_mount(&fs, vdisk_f12_io());
+  ASSERT_EQ(err, F12_OK);
+  ASSERT(fs.mounted);
+  ASSERT_NOT_NULL(fs.cache);
+
+  f12_unmount(&fs);
+}
+
+TEST(test_failed_track_read_falls_back_to_sector_read) {
+  vdisk_format_valid(&vdisk);
+
+  failing_track_io_t fio = { .disk = &vdisk };
+  f12_io_t io = {
+    .read = failing_track_read,
+    .read_track = failing_track_read_track,
+    .write = failing_track_write,
+    .disk_changed = NULL,
+    .write_protected = NULL,
+    .ctx = &fio,
+  };
+
+  f12_t fs;
+  memset(&fs, 0, sizeof(fs));
+  f12_err_t err = f12_mount(&fs, io);
+  ASSERT_EQ(err, F12_OK);
+  ASSERT(fio.track_reads > 0);
+  ASSERT(vdisk.read_count > 0);
+
+  f12_unmount(&fs);
 }
 
 TEST(test_format_and_mount) {
@@ -288,14 +350,14 @@ TEST(test_disk_changed_aborts_pending_write) {
   f12_file_t *f = f12_open(&fs, "PEND.TXT", "w");
   ASSERT(f != NULL);
   ASSERT_EQ(f12_write(f, "hello", 5), 5);
-  ASSERT_NOT_NULL(fs.fat.batch.data);
+  ASSERT(fs.fat.batch.active);
 
   vdisk.disk_changed = true;
 
   ASSERT_EQ(f12_write(f, "!", 1), -1);
   ASSERT_EQ(f12_errno(&fs), F12_ERR_DISK_CHANGED);
   ASSERT(!fs.mounted);
-  ASSERT_NULL(fs.fat.batch.data);
+  ASSERT(!fs.fat.batch.active);
   ASSERT_EQ(f->mode, F12_MODE_CLOSED);
 
   f12_unmount(&fs);
@@ -642,6 +704,8 @@ int main(void) {
   printf("=== F12 High-Level API Tests ===\n\n");
 
   RUN_TEST(test_mount_unmount);
+  RUN_TEST(test_mount_clears_uninitialized_state);
+  RUN_TEST(test_failed_track_read_falls_back_to_sector_read);
   RUN_TEST(test_format_and_mount);
   RUN_TEST(test_create_write_read_file);
   RUN_TEST(test_file_stat);

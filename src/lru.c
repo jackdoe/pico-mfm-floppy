@@ -84,14 +84,41 @@ lru_t *lru_init(uint32_t max_entries, uint32_t elem_size) {
   lru->elem_size = elem_size;
   lru->entry_stride = entry_stride;
   lru->count = 0;
+  lru->owns_storage = true;
+  lru->owns_self = true;
 
   return lru;
 }
 
+bool lru_init_fixed(lru_t *lru, void *storage, uint32_t storage_size,
+                    uint32_t max_entries, uint32_t elem_size) {
+  if (!lru || !storage || max_entries == 0 || elem_size == 0) return false;
+
+  uint32_t entry_stride = sizeof(lru_entry_t) + elem_size;
+  entry_stride = (entry_stride + 7) & ~7u;
+  if (storage_size < max_entries * entry_stride) return false;
+
+  memset(storage, 0, storage_size);
+  lru->storage = (uint8_t *)storage;
+  lru->head = NULL;
+  lru->tail = NULL;
+  lru->max_entries = max_entries;
+  lru->elem_size = elem_size;
+  lru->entry_stride = entry_stride;
+  lru->count = 0;
+  lru->owns_storage = false;
+  lru->owns_self = false;
+  return true;
+}
+
 void lru_free(lru_t *lru) {
   if (!lru) return;
-  free(lru->storage);
-  free(lru);
+  if (lru->owns_storage) {
+    free(lru->storage);
+  }
+  if (lru->owns_self) {
+    free(lru);
+  }
 }
 
 void *lru_get(lru_t *lru, uint32_t key) {

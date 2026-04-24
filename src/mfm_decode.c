@@ -51,9 +51,24 @@ void mfm_reset(mfm_t *m) {
   m->sync_stage = 0;
 }
 
+static void mfm_drop_record(mfm_t *m) {
+  mfm_reset(m);
+  m->have_pending_addr = false;
+  m->buf_pos = 0;
+  m->bytes_expected = 0;
+  m->bit_count = 0;
+  m->byte_acc = 0;
+  m->overflow = false;
+}
+
 bool mfm_feed(mfm_t *m, uint16_t delta, sector_t *out) {
   int p = mfm_classify(m, delta);
-  if (p < 0) return false;
+  if (p < 0) {
+    if (m->state != MFM_HUNT || m->have_pending_addr) {
+      mfm_drop_record(m);
+    }
+    return false;
+  }
 
   switch (m->state) {
     case MFM_HUNT:
@@ -161,9 +176,14 @@ check_record:
         m->pending_track = m->buf[1];
         m->pending_side = m->buf[2];
         m->pending_sector = m->buf[3];
-        uint8_t size_code = m->buf[4] & 0x03;
-        m->pending_size_code = (size_code > 2) ? 2 : size_code;
-        m->have_pending_addr = true;
+        uint8_t size_code = m->buf[4];
+        if (size_code <= 2) {
+          m->pending_size_code = size_code;
+          m->have_pending_addr = true;
+        } else {
+          m->crc_errors++;
+          m->have_pending_addr = false;
+        }
       } else {
         m->crc_errors++;
         m->have_pending_addr = false;

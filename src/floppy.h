@@ -11,6 +11,14 @@
 #define FLOPPY_TRACKS 80
 #define SECTORS_PER_TRACK 18
 
+#ifndef FLOPPY_FLUX_BUF_SIZE
+#if PICO_RP2040
+#define FLOPPY_FLUX_BUF_SIZE 110000
+#else
+#define FLOPPY_FLUX_BUF_SIZE 200000
+#endif
+#endif
+
 typedef struct {
   uint8_t track;
   uint8_t side;
@@ -82,6 +90,7 @@ struct floppy {
   bool auto_motor;
   volatile uint32_t last_io_time_ms;
   struct repeating_timer idle_timer;
+  uint8_t flux_buf[FLOPPY_FLUX_BUF_SIZE];
 };
 
 void floppy_init(floppy_t *f);

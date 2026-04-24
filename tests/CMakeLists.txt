@@ -4,6 +4,12 @@ project(floppy_tests C)
 set(CMAKE_C_STANDARD 11)
 add_compile_options(-Wall -Wextra -g -O2)
 
+option(ENABLE_SANITIZERS "Enable host sanitizers" OFF)
+if(ENABLE_SANITIZERS)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
 set(SRCDIR ${CMAKE_CURRENT_LIST_DIR}/../src)
 set(STUBS ${CMAKE_CURRENT_LIST_DIR}/stubs)
 

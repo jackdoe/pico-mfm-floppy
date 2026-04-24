@@ -75,6 +75,18 @@ TEST(test_fat12_cluster_underflow) {
   ASSERT_EQ(err, FAT12_ERR_INVALID);
 }
 
+TEST(test_fat12_rejects_impossible_layout) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+  disk.data[0][19] = 20;
+  disk.data[0][20] = 0;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_err_t err = fat12_init(&fat, io);
+  ASSERT_EQ(err, FAT12_ERR_INVALID);
+}
+
 static uint16_t pulse_to_delta(uint8_t pulse) {
   return pulse + MFM_PIO_OVERHEAD;
 }
@@ -134,9 +146,8 @@ TEST(test_mfm_decode_large_size_code) {
     }
   }
 
-  ASSERT(got_sector);
-  ASSERT_EQ(out.size_code, 2);
-  ASSERT(out.valid);
+  ASSERT(!got_sector);
+  ASSERT(!m.have_pending_addr);
 }
 
 TEST(test_mfm_decode_invalid_pulses) {
@@ -153,6 +164,34 @@ TEST(test_mfm_decode_invalid_pulses) {
   }
 
   ASSERT(m.state == MFM_HUNT);
+}
+
+TEST(test_mfm_decode_invalid_pulse_drops_pending_record) {
+  mfm_t m;
+  mfm_init(&m);
+
+  uint8_t pulse_buf[8192];
+  mfm_encode_t enc;
+  mfm_encode_init(&enc, pulse_buf, sizeof(pulse_buf));
+
+  sector_t s = {
+    .track = 0, .side = 0, .sector_n = 1,
+    .size_code = 2, .valid = true
+  };
+  memset(s.data, 0x66, sizeof(s.data));
+  mfm_encode_sector(&enc, &s);
+
+  sector_t out;
+  memset(&out, 0, sizeof(out));
+
+  for (size_t i = 0; i < enc.pos && !m.have_pending_addr; i++) {
+    ASSERT(!mfm_feed(&m, pulse_to_delta(pulse_buf[i]), &out));
+  }
+
+  ASSERT(m.have_pending_addr);
+  ASSERT(!mfm_feed(&m, 0, &out));
+  ASSERT(!m.have_pending_addr);
+  ASSERT_EQ(m.state, MFM_HUNT);
 }
 
 TEST(test_mfm_decode_truncated_sector) {
@@ -271,6 +310,11 @@ TEST(test_fat12_fat_mismatch_detection) {
 
   fat12_init(&fat, io);
   ASSERT(fat.fat_mismatch);
+
+  vdisk_format_valid(&disk);
+  disk.data[VDISK_FAT2_START + 1][3] ^= 0xFF;
+  fat12_init(&fat, io);
+  ASSERT(fat.fat_mismatch);
 }
 
 TEST(test_fat12_delete_loop_detection) {
@@ -311,12 +355,14 @@ int main(void) {
   RUN_TEST(test_fat12_zero_sectors_per_cluster);
   RUN_TEST(test_fat12_null_read_callback);
   RUN_TEST(test_fat12_cluster_underflow);
+  RUN_TEST(test_fat12_rejects_impossible_layout);
   RUN_TEST(test_fat12_delete_loop_detection);
   RUN_TEST(test_fat12_fat_mismatch_detection);
 
   printf("\n--- MFM Decoder Edge Cases ---\n");
   RUN_TEST(test_mfm_decode_large_size_code);
   RUN_TEST(test_mfm_decode_invalid_pulses);
+  RUN_TEST(test_mfm_decode_invalid_pulse_drops_pending_record);
   RUN_TEST(test_mfm_decode_truncated_sector);
   RUN_TEST(test_mfm_decode_corrupted_crc);
   RUN_TEST(test_mfm_encode_buffer_overflow);

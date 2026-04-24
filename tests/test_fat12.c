@@ -132,7 +132,7 @@ TEST(test_open_write_failure_cleans_up_batch) {
 
   fat12_err_t err = fat12_open_write(&fat, "BROKEN.TXT", &writer);
   ASSERT_EQ(err, FAT12_ERR_READ);
-  ASSERT_NULL(fat.batch.data);
+  ASSERT(!fat.batch.active);
   ASSERT_NULL(writer.fat);
 
   disk.fail_after_reads = -1;
@@ -337,7 +337,7 @@ TEST(test_overwrite_failure_preserves_existing_file) {
   ASSERT_EQ(fat12_open_write(&fat, "SAFE.TXT", &writer), FAT12_OK);
   ASSERT_EQ(fat12_write(&writer, (const uint8_t *)"new data that should not stick", 30), 30);
   ASSERT_EQ(fat12_close_write(&writer), FAT12_ERR_WRITE);
-  ASSERT_NULL(fat.batch.data);
+  ASSERT(!fat.batch.active);
 
   disk.fail_after_track_writes = -1;
 
@@ -350,6 +350,64 @@ TEST(test_overwrite_failure_preserves_existing_file) {
   char buf[32] = {0};
   ASSERT_EQ(fat12_read(&file, (uint8_t *)buf, sizeof(buf)), 8);
   ASSERT_MEM_EQ(buf, "old data", 8);
+}
+
+TEST(test_invalid_83_names_rejected) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  ASSERT_EQ(fat12_init(&fat, io), FAT12_OK);
+
+  fat12_writer_t writer;
+  ASSERT_EQ(fat12_open_write(&fat, "", &writer), FAT12_ERR_INVALID);
+  ASSERT_EQ(fat12_open_write(&fat, "TOOLONGNAME.TXT", &writer), FAT12_ERR_INVALID);
+  ASSERT_EQ(fat12_open_write(&fat, "BAD.LONG", &writer), FAT12_ERR_INVALID);
+  ASSERT_EQ(fat12_open_write(&fat, "A.B.C", &writer), FAT12_ERR_INVALID);
+  ASSERT_EQ(fat12_open_write(&fat, "BAD NAME.TXT", &writer), FAT12_ERR_INVALID);
+
+  fat12_dirent_t entry;
+  ASSERT_EQ(fat12_find(&fat, "BAD NAME.TXT", &entry), FAT12_ERR_INVALID);
+  ASSERT_EQ(fat12_create(&fat, "TOOLONGNAME.TXT", &entry), FAT12_ERR_INVALID);
+  ASSERT_EQ(fat12_delete(&fat, "BAD NAME.TXT"), FAT12_ERR_INVALID);
+  ASSERT(!fat.batch.active);
+}
+
+TEST(test_delete_marks_dirent_before_freeing_chain) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  ASSERT_EQ(fat12_init(&fat, io), FAT12_OK);
+
+  fat12_writer_t writer;
+  ASSERT_EQ(fat12_open_write(&fat, "DROP.TXT", &writer), FAT12_OK);
+  uint8_t data[700];
+  memset(data, 0x31, sizeof(data));
+  ASSERT_EQ(fat12_write(&writer, data, sizeof(data)), (int)sizeof(data));
+  ASSERT_EQ(fat12_close_write(&writer), FAT12_OK);
+
+  fat12_dirent_t entry;
+  ASSERT_EQ(fat12_find(&fat, "DROP.TXT", &entry), FAT12_OK);
+  uint16_t start = entry.start_cluster;
+  ASSERT(start >= 2);
+
+  disk.fail_after_track_writes = 1;
+  ASSERT_EQ(fat12_delete(&fat, "DROP.TXT"), FAT12_ERR_WRITE);
+  ASSERT(!fat.batch.active);
+
+  disk.fail_after_track_writes = -1;
+  ASSERT_EQ(fat12_init(&fat, io), FAT12_OK);
+  ASSERT_EQ(fat12_find(&fat, "DROP.TXT", &entry), FAT12_ERR_NOT_FOUND);
+
+  uint16_t next = 0;
+  ASSERT_EQ(fat12_get_entry(&fat, start, &next), FAT12_OK);
+  ASSERT(next != 0);
 }
 
 TEST(test_overwrite_succeeds_without_spare_clusters) {
@@ -1020,8 +1078,10 @@ int main(void) {
   RUN_TEST(test_overwrite_failure_preserves_existing_file);
   RUN_TEST(test_overwrite_succeeds_without_spare_clusters);
   RUN_TEST(test_delete_file);
+  RUN_TEST(test_delete_marks_dirent_before_freeing_chain);
   RUN_TEST(test_multiple_files);
   RUN_TEST(test_case_insensitive);
+  RUN_TEST(test_invalid_83_names_rejected);
   RUN_TEST(test_batching_efficiency);
   RUN_TEST(test_write_read_cycle);
   RUN_TEST(test_cluster_chain);

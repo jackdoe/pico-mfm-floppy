@@ -58,16 +58,19 @@ static bool f12_cached_read(void *ctx, sector_t *sector) {
   }
 
   if (fs->io.read_track) {
-    static track_t track;
-    track.track = sector->track;
-    track.side = sector->side;
-    fs->io.read_track(fs->io.ctx, &track);
+    track_t *track = &fs->track;
+    memset(track, 0, sizeof(*track));
+    track->track = sector->track;
+    track->side = sector->side;
+    if (!fs->io.read_track(fs->io.ctx, track)) {
+      goto read_sector;
+    }
     uint16_t pin_limit = fs->fat.root_dir_start_sector + fs->fat.root_dir_sectors;
     for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-      if (track.sectors[i].valid) {
-        uint32_t k = lru_key(track.track, track.side, i + 1);
-        lru_set(fs->cache, k, track.sectors[i].data);
-        uint16_t lba = fat12_chs_to_lba(&fs->fat.bpb, track.track, track.side, i + 1);
+      if (track->sectors[i].valid) {
+        uint32_t k = lru_key(track->track, track->side, i + 1);
+        lru_set(fs->cache, k, track->sectors[i].data);
+        uint16_t lba = fat12_chs_to_lba(&fs->fat.bpb, track->track, track->side, i + 1);
         if (lba < pin_limit) {
           lru_pin(fs->cache, k);
         }
@@ -81,6 +84,7 @@ static bool f12_cached_read(void *ctx, sector_t *sector) {
     }
   }
 
+read_sector:
   if (!fs->io.read(fs->io.ctx, sector)) {
     return false;
   }
@@ -178,18 +182,14 @@ static void format_name_83(const fat12_dirent_t *entry, char *out) {
 f12_err_t f12_mount(f12_t *fs, f12_io_t io) {
   if (!fs) return F12_ERR_INVALID;
 
-  if (fs->cache) {
-    lru_free(fs->cache);
-  }
-  fat12_abort_write(&fs->fat);
-
   memset(fs, 0, sizeof(*fs));
   fs->io = io;
 
-  fs->cache = lru_init(F12_CACHE_SIZE, SECTOR_SIZE);
-  if (!fs->cache) {
+  if (!lru_init_fixed(&fs->cache_obj, fs->cache_storage, sizeof(fs->cache_storage),
+                      F12_CACHE_SIZE, SECTOR_SIZE)) {
     return f12_set_error(fs, F12_ERR_IO);
   }
+  fs->cache = &fs->cache_obj;
 
   fat12_io_t fat_io = {
     .read = f12_cached_read,
@@ -199,7 +199,7 @@ f12_err_t f12_mount(f12_t *fs, f12_io_t io) {
 
   fat12_err_t err = fat12_init(&fs->fat, fat_io);
   if (err != FAT12_OK) {
-    lru_free(fs->cache);
+    lru_clear(fs->cache);
     fs->cache = NULL;
     return f12_set_error(fs, fat12_to_f12_err(err));
   }
@@ -221,7 +221,7 @@ void f12_unmount(f12_t *fs) {
   }
 
   if (fs->cache) {
-    lru_free(fs->cache);
+    lru_clear(fs->cache);
     fs->cache = NULL;
   }
   fat12_abort_write(&fs->fat);

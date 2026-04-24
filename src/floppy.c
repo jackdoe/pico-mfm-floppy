@@ -38,14 +38,6 @@
 #define DIR_OUTWARD 2
 #define IDLE_CHECK_INTERVAL_MS 1000
 
-#ifndef FLOPPY_FLUX_BUF_SIZE
-#if PICO_RP2040
-#define FLOPPY_FLUX_BUF_SIZE 110000
-#else
-#define FLOPPY_FLUX_BUF_SIZE 200000
-#endif
-#endif
-
 #ifndef FLOPPY_FLUX_WAIT_TIMEOUT_MS
 #define FLOPPY_FLUX_WAIT_TIMEOUT_MS 250
 #endif
@@ -154,6 +146,8 @@ static bool floppy_flux_write_stop(floppy_t *f) {
   uint32_t start_ms = to_ms_since_boot(get_absolute_time());
   while (!pio_sm_is_tx_fifo_empty(f->write.pio, f->write.sm)) {
     if ((uint32_t)(to_ms_since_boot(get_absolute_time()) - start_ms) >= FLOPPY_TX_DRAIN_TIMEOUT_MS) {
+      gpio_put_oc(f->pins.write_gate, 1);
+      pio_sm_set_enabled(f->write.pio, f->write.sm, false);
       return false;
     }
     tight_loop_contents();
@@ -261,7 +255,7 @@ static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
     return FLOPPY_ERR_TIMEOUT;
   }
   uint16_t prev = initial >> 1;
-  bool ix_prev = false;
+  bool ix_prev = initial & 1;
   floppy_status_t res = FLOPPY_ERR_TIMEOUT;
 
   for (int ix_edges = 0; ix_edges < FLOPPY_READ_TRACK_ATTEMPTS * 2;) {
@@ -481,19 +475,7 @@ bool floppy_at_track0(floppy_t *f) {
 }
 
 bool floppy_disk_changed(floppy_t *f) {
-  bool changed = !gpio_get(f->pins.disk_change);
-
-  if (changed) {
-    if (f->track > 0) {
-      floppy_step(f, DIR_OUTWARD);
-      floppy_step(f, DIR_INWARD);
-    } else {
-      floppy_step(f, DIR_INWARD);
-      floppy_step(f, DIR_OUTWARD);
-    }
-  }
-
-  return changed;
+  return !gpio_get(f->pins.disk_change);
 }
 
 bool floppy_write_protected(floppy_t *f) {
@@ -555,9 +537,8 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
     return status;
   }
 
-  static uint8_t flux_buf[FLOPPY_FLUX_BUF_SIZE];
   mfm_encode_t enc;
-  mfm_encode_init(&enc, flux_buf, sizeof(flux_buf));
+  mfm_encode_init(&enc, f->flux_buf, sizeof(f->flux_buf));
   mfm_encode_track(&enc, t);
   if (enc.overflow) {
     FLOPPY_ERR("[floppy] encode overflow track %d side %d\n", t->track, t->side);
@@ -582,7 +563,7 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
     }
     floppy_flux_write_start(f);
     for (size_t i = 0; i < enc.pos; i++) {
-      pio_sm_put_blocking(f->write.pio, f->write.sm, flux_buf[i]);
+      pio_sm_put_blocking(f->write.pio, f->write.sm, f->flux_buf[i]);
     }
     if (!floppy_flux_write_stop(f)) {
       return FLOPPY_ERR_TIMEOUT;

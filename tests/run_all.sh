@@ -3,8 +3,8 @@ set -e
 
 cd "$(dirname "$0")"
 
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
-cmake --build build --parallel > /dev/null 2>&1
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
 
 cd build
 

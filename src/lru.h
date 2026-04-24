@@ -21,9 +21,14 @@ typedef struct {
   uint32_t elem_size;
   uint32_t entry_stride;
   uint32_t count;
+  bool owns_storage;
+  bool owns_self;
 } lru_t;
 
 lru_t *lru_init(uint32_t max_entries, uint32_t elem_size);
+
+bool lru_init_fixed(lru_t *lru, void *storage, uint32_t storage_size,
+                    uint32_t max_entries, uint32_t elem_size);
 
 void lru_free(lru_t *lru);
 

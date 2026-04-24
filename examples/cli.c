@@ -69,6 +69,7 @@ static void cmd_selftest2(int argc, char **argv);
 static void cmd_selftest3(int argc, char **argv);
 static void cmd_selftest3_a(int argc, char **argv);
 static void cmd_selftest3_b(int argc, char **argv);
+static void cmd_test_full(int argc, char **argv);
 static void cmd_starwars(int argc, char **argv);
 static void cmd_diskdump(int argc, char **argv);
 static void cmd_mfmscan(int argc, char **argv);
@@ -104,6 +105,7 @@ static const cmd_entry_t commands[] = {
   {"selftest3",NULL,   cmd_selftest3,false,"selftest3 [rounds]",  "Patch-specific full-disk overwrite test"},
   {"selftest3-a",NULL, cmd_selftest3_a,false,"selftest3-a [rounds]","Format + prepare reboot-resume overwrite test"},
   {"selftest3-b",NULL, cmd_selftest3_b,false,"selftest3-b [rounds]","Resume selftest3 after power cycle without format"},
+  {"test-full",NULL,   cmd_test_full,false,"test-full [rounds]", "Full hardware test sequence, no selftest3"},
   {"starwars", NULL,   cmd_starwars, false,"starwars",            "Imperial March on the stepper motor"},
   {"diskdump",NULL,    cmd_diskdump,false, "diskdump",            "Full disk sector scan + checksum"},
   {"mfmscan", NULL,    cmd_mfmscan, false, "mfmscan",             "MFM signal quality across all tracks"},
@@ -1420,6 +1422,182 @@ static void check(bool cond, const char *tag, int *pass, int *fail) {
     printf("  FAIL: %s\n", tag);
     (*fail)++;
   }
+}
+
+static bool read_file_exact(const char *name, uint8_t *buf, uint32_t expected) {
+  f12_file_t *f = f12_open(&fs, name, "r");
+  if (!f) return false;
+  uint32_t got = f12_read_full(f, buf, expected + 1);
+  bool close_ok = f12_close(f) == F12_OK;
+  return close_ok && got == expected;
+}
+
+static void cmd_test_full(int argc, char **argv) {
+  int rounds = 6;
+  if (argc > 2) {
+    printf("Usage: test-full [rounds]\n");
+    return;
+  }
+  if (argc == 2) {
+    rounds = atoi(argv[1]);
+    if (rounds < 1 || rounds > 100) {
+      printf("Rounds must be 1-100\n");
+      return;
+    }
+  }
+
+  printf("This will FORMAT the disk, run diagnostics, file I/O, and a full sector scan.\n");
+  printf("It does not run selftest3. Continue? [y/N] ");
+
+  char line[CMD_BUF_SIZE];
+  cli_readline(line, sizeof(line));
+  if (line[0] != 'y' && line[0] != 'Y') {
+    printf("Cancelled.\n");
+    return;
+  }
+
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+
+  int pass = 0;
+  int fail = 0;
+
+  printf("\n--- Phase 1: GPIO and Flux Sanity ---\n");
+  cmd_pins(0, NULL);
+  cmd_status(0, NULL);
+  cmd_poll(0, NULL);
+  char *flux_args[] = {"flux", "50"};
+  cmd_flux(2, flux_args);
+
+  printf("\n--- Phase 2: Full Format and Mount ---\n");
+  setup_io();
+  f12_err_t err = f12_format(&fs, "TESTFULL", true);
+  check(err == F12_OK, "full format", &pass, &fail);
+  if (err != F12_OK) goto done;
+
+  err = do_mount();
+  check(err == F12_OK, "mount after full format", &pass, &fail);
+  if (err != F12_OK) goto done;
+  mounted = true;
+  cmd_status(0, NULL);
+
+  printf("\n--- Phase 3: MFM Signal Checks ---\n");
+  char *mfm_outer[] = {"mfm", "0", "0"};
+  char *mfm_inner[] = {"mfm", "79", "0"};
+  cmd_mfm(3, mfm_outer);
+  cmd_mfm(3, mfm_inner);
+
+  printf("\n--- Phase 4: Shell File Operations ---\n");
+  const char text[] = "test-full hardware sequence\nformat mount write copy move delete verify\n";
+  uint32_t text_len = sizeof(text) - 1;
+  f12_file_t *f = f12_open(&fs, "TEST.TXT", "w");
+  check(f != NULL, "open TEST.TXT for write", &pass, &fail);
+  if (f) {
+    uint32_t wrote = f12_write_full(f, text, text_len);
+    f12_err_t close_err = f12_close(f);
+    check(wrote == text_len && close_err == F12_OK, "write TEST.TXT", &pass, &fail);
+  }
+
+  bool exact = read_file_exact("TEST.TXT", self_buf, text_len);
+  check(exact && memcmp(self_buf, text, text_len) == 0, "read TEST.TXT", &pass, &fail);
+
+  char *cp_args[] = {"cp", "TEST.TXT", "COPY.TXT"};
+  cmd_cp(3, cp_args);
+  exact = read_file_exact("COPY.TXT", self_buf, text_len);
+  check(exact && memcmp(self_buf, text, text_len) == 0, "copy TEST.TXT to COPY.TXT", &pass, &fail);
+
+  char *mv_args[] = {"mv", "COPY.TXT", "MOVED.TXT"};
+  cmd_mv(3, mv_args);
+  f12_stat_t st;
+  check(f12_stat(&fs, "COPY.TXT", &st) == F12_ERR_NOT_FOUND, "COPY.TXT removed by mv", &pass, &fail);
+  exact = read_file_exact("MOVED.TXT", self_buf, text_len);
+  check(exact && memcmp(self_buf, text, text_len) == 0, "MOVED.TXT verified", &pass, &fail);
+
+  char *rm_args[] = {"rm", "MOVED.TXT"};
+  cmd_rm(2, rm_args);
+  check(f12_stat(&fs, "MOVED.TXT", &st) == F12_ERR_NOT_FOUND, "rm MOVED.TXT", &pass, &fail);
+
+  printf("\n--- Phase 5: Pattern Stress ---\n");
+  struct { const char *name; uint32_t size; int id; uint32_t chunk; } files[] = {
+    {"BYTEIO.BIN", 4096, 1000, 1},
+    {"SMALL.BIN", 512, 1001, 17},
+    {"MEDIUM.BIN", 8192, 1002, 257},
+    {"LARGE.BIN", 32768, 1003, 4096},
+  };
+
+  for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+    uint32_t written = 0;
+    f12_err_t close_err = F12_OK;
+    bool ok = write_pattern_file_chunked(files[i].name, files[i].id, files[i].size,
+                                         files[i].chunk, &written, &close_err);
+    char tag[80];
+    snprintf(tag, sizeof(tag), "write %s", files[i].name);
+    check(ok && written == files[i].size && close_err == F12_OK, tag, &pass, &fail);
+  }
+
+  for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+    char tag[80];
+    snprintf(tag, sizeof(tag), "verify %s", files[i].name);
+    check(verify_pattern_file_chunked(files[i].name, files[i].id, files[i].size,
+                                      files[i].chunk, NULL),
+          tag, &pass, &fail);
+  }
+
+  for (int round = 0; round < rounds; round++) {
+    uint32_t size = 2048 + (uint32_t)(round % 9) * 1536;
+    uint32_t chunk = 1 + (uint32_t)(round % 7) * 73;
+    int id = 2000 + round;
+    uint32_t written = 0;
+    f12_err_t close_err = F12_OK;
+    bool ok = write_pattern_file_chunked("ROUND.BIN", id, size, chunk, &written, &close_err);
+    char tag[96];
+    snprintf(tag, sizeof(tag), "round %d overwrite write", round + 1);
+    check(ok && written == size && close_err == F12_OK, tag, &pass, &fail);
+
+    snprintf(tag, sizeof(tag), "round %d overwrite verify", round + 1);
+    check(verify_pattern_file_chunked("ROUND.BIN", id, size, chunk + 31, NULL), tag, &pass, &fail);
+  }
+
+  err = f12_delete(&fs, "SMALL.BIN");
+  check(err == F12_OK, "delete SMALL.BIN", &pass, &fail);
+  err = f12_delete(&fs, "MEDIUM.BIN");
+  check(err == F12_OK, "delete MEDIUM.BIN", &pass, &fail);
+  check(f12_stat(&fs, "SMALL.BIN", &st) == F12_ERR_NOT_FOUND, "SMALL.BIN gone", &pass, &fail);
+  check(f12_stat(&fs, "MEDIUM.BIN", &st) == F12_ERR_NOT_FOUND, "MEDIUM.BIN gone", &pass, &fail);
+
+  uint32_t written = 0;
+  f12_err_t close_err = F12_OK;
+  bool ok = write_pattern_file_chunked("REFILL.BIN", 3000, 12000, 333, &written, &close_err);
+  check(ok && written == 12000 && close_err == F12_OK, "write REFILL.BIN", &pass, &fail);
+  check(verify_pattern_file_chunked("REFILL.BIN", 3000, 12000, 777, NULL), "verify REFILL.BIN", &pass, &fail);
+
+  printf("\n--- Phase 6: Remount Verify ---\n");
+  f12_unmount(&fs);
+  mounted = false;
+  err = do_mount();
+  check(err == F12_OK, "remount after stress", &pass, &fail);
+  if (err != F12_OK) goto done;
+  mounted = true;
+  check(verify_pattern_file_chunked("BYTEIO.BIN", 1000, 4096, 1, NULL), "BYTEIO.BIN survives remount", &pass, &fail);
+  check(verify_pattern_file_chunked("LARGE.BIN", 1003, 32768, 4096, NULL), "LARGE.BIN survives remount", &pass, &fail);
+  check(verify_pattern_file_chunked("REFILL.BIN", 3000, 12000, 777, NULL), "REFILL.BIN survives remount", &pass, &fail);
+
+  printf("\n--- Phase 7: Full Disk Scan ---\n");
+  cmd_diskdump(0, NULL);
+
+done:
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+  floppy_motor_off(&floppy);
+  floppy_select(&floppy, false);
+
+  printf("\n=== Test-Full Complete ===\n");
+  printf("  Checks: %d passed, %d failed\n", pass, fail);
+  printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
 }
 
 static void cmd_selftest(int argc, char **argv) {

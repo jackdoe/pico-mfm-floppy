@@ -404,6 +404,25 @@ TEST(test_pin_cleared_on_clear) {
   lru_free(lru);
 }
 
+TEST(test_fixed_storage_cache) {
+  lru_t lru;
+  uint8_t storage[4 * ((sizeof(lru_entry_t) + sizeof(int) + 7u) & ~7u)];
+
+  ASSERT(lru_init_fixed(&lru, storage, sizeof(storage), 4, sizeof(int)));
+  ASSERT_EQ(lru_count(&lru), 0);
+
+  int v1 = 11;
+  int v2 = 22;
+  lru_set(&lru, 1, &v1);
+  lru_set(&lru, 2, &v2);
+
+  ASSERT_EQ(*(int *)lru_get(&lru, 1), 11);
+  ASSERT_EQ(*(int *)lru_get(&lru, 2), 22);
+
+  lru_free(&lru);
+  ASSERT_EQ(lru_count(&lru), 2);
+}
+
 int main(void) {
   printf("=== LRU Cache Tests ===\n\n");
 
@@ -430,6 +449,7 @@ int main(void) {
   RUN_TEST(test_direct_write_to_slot);
   RUN_TEST(test_pin_survives_eviction);
   RUN_TEST(test_pin_cleared_on_clear);
+  RUN_TEST(test_fixed_storage_cache);
 
   TEST_RESULTS();
 }

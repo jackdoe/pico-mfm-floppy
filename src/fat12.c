@@ -15,6 +15,21 @@ static void fat12_compute_layout(fat12_t *fat) {
                          fat->bpb.sectors_per_cluster;
 }
 
+static bool fat12_layout_valid(fat12_t *fat) {
+  uint32_t fat_end = (uint32_t)fat->fat_start_sector +
+                     (uint32_t)fat->bpb.num_fats * fat->bpb.sectors_per_fat;
+  uint32_t root_end = (uint32_t)fat->root_dir_start_sector + fat->root_dir_sectors;
+  uint32_t per_cyl = (uint32_t)fat->bpb.num_heads * fat->bpb.sectors_per_track;
+
+  if (fat->root_dir_start_sector != fat_end) return false;
+  if (fat->data_start_sector != root_end) return false;
+  if (root_end >= fat->bpb.total_sectors) return false;
+  if (per_cyl == 0) return false;
+  if (fat->bpb.total_sectors % per_cyl != 0) return false;
+  if (fat->bpb.total_sectors > FLOPPY_TRACKS * fat->bpb.num_heads * fat->bpb.sectors_per_track) return false;
+  return fat->total_clusters > 0;
+}
+
 static bool fat12_read_sector(fat12_t *fat, uint16_t lba, sector_t *sector) {
   fat12_lba_to_chs(&fat->bpb, lba, &sector->track, &sector->side, &sector->sector_n);
   sector->valid = false;
@@ -45,18 +60,28 @@ fat12_err_t fat12_init(fat12_t *fat, fat12_io_t io) {
       fat->bpb.sectors_per_cluster == 0 ||
       fat->bpb.sectors_per_cluster > FAT12_MAX_CLUSTER_SECTORS ||
       fat->bpb.num_fats == 0 ||
+      fat->bpb.sectors_per_fat == 0 ||
+      fat->bpb.root_entries == 0 ||
+      fat->bpb.total_sectors == 0 ||
       fat->bpb.sectors_per_track == 0 ||
       fat->bpb.num_heads == 0) {
     return FAT12_ERR_INVALID;
   }
 
   fat12_compute_layout(fat);
+  if (!fat12_layout_valid(fat)) {
+    return FAT12_ERR_INVALID;
+  }
 
   if (fat->bpb.num_fats >= 2) {
-    sector_t fat1, fat2;
-    if (fat12_read_sector(fat, fat->fat_start_sector, &fat1) &&
-        fat12_read_sector(fat, fat->fat_start_sector + fat->bpb.sectors_per_fat, &fat2)) {
-      fat->fat_mismatch = memcmp(fat1.data, fat2.data, SECTOR_SIZE) != 0;
+    for (uint16_t s = 0; s < fat->bpb.sectors_per_fat; s++) {
+      sector_t fat1, fat2;
+      if (fat12_read_sector(fat, fat->fat_start_sector + s, &fat1) &&
+          fat12_read_sector(fat, fat->fat_start_sector + fat->bpb.sectors_per_fat + s, &fat2) &&
+          memcmp(fat1.data, fat2.data, SECTOR_SIZE) != 0) {
+        fat->fat_mismatch = true;
+        break;
+      }
     }
   }
 
@@ -167,28 +192,52 @@ static char fat12_toupper(char c) {
   return (c >= 'a' && c <= 'z') ? (c - 32) : c;
 }
 
-static void fat12_format_name(const char *input, char *name8, char *ext3) {
+static bool fat12_name_char_valid(char c) {
+  if (c >= 'A' && c <= 'Z') return true;
+  if (c >= 'a' && c <= 'z') return true;
+  if (c >= '0' && c <= '9') return true;
+  switch (c) {
+    case '$': case '%': case '\'': case '-': case '_': case '@': case '~':
+    case '`': case '!': case '(': case ')': case '{': case '}': case '^':
+    case '#': case '&':
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool fat12_format_name(const char *input, char *name8, char *ext3) {
   memset(name8, ' ', 8);
   memset(ext3, ' ', 3);
 
+  if (!input || *input == '\0' || *input == '.') return false;
+
   int i = 0;
   while (*input && *input != '.' && i < 8) {
+    if (!fat12_name_char_valid(*input)) return false;
     name8[i++] = fat12_toupper(*input);
     input++;
   }
+
+  if (i == 0) return false;
+  if (*input && *input != '.') return false;
 
   if (*input == '.') input++;
 
   i = 0;
   while (*input && i < 3) {
+    if (*input == '.' || !fat12_name_char_valid(*input)) return false;
     ext3[i++] = fat12_toupper(*input);
     input++;
   }
+
+  if (*input) return false;
+  return true;
 }
 
 fat12_err_t fat12_find(fat12_t *fat, const char *filename, fat12_dirent_t *entry) {
   char name8[8], ext3[3];
-  fat12_format_name(filename, name8, ext3);
+  if (!fat12_format_name(filename, name8, ext3)) return FAT12_ERR_INVALID;
 
   for (uint16_t i = 0; i < fat->bpb.root_entries; i++) {
     fat12_err_t err = fat12_read_root_entry(fat, i, entry);
@@ -331,19 +380,16 @@ int fat12_read(fat12_file_t *file, uint8_t *buf, size_t len) {
 }
 
 static bool fat12_batch_begin(fat12_t *fat) {
+  if (fat->batch.active) return false;
   fat->batch.count = 0;
-  if (!fat->batch.data) {
-    fat->batch.data = (uint8_t (*)[SECTOR_SIZE])malloc(FAT12_WRITE_BATCH_MAX * SECTOR_SIZE);
-    if (!fat->batch.data) return false;
-  }
+  fat->batch.active = true;
   return true;
 }
 
 void fat12_abort_write(fat12_t *fat) {
   if (!fat) return;
-  free(fat->batch.data);
-  fat->batch.data = NULL;
   fat->batch.count = 0;
+  fat->batch.active = false;
 }
 
 static fat12_err_t fat12_write_batch_add(fat12_write_batch_t *batch, uint16_t lba, const uint8_t *data) {
@@ -384,16 +430,16 @@ static fat12_err_t fat12_write_batch_flush(fat12_t *fat) {
     uint8_t c, h, s;
     fat12_lba_to_chs(&fat->bpb, batch->lbas[0], &c, &h, &s);
 
-    static track_t track;
-    memset(&track, 0, sizeof(track));
-    track.track = c;
-    track.side = h;
+    track_t *track = &fat->write_track;
+    memset(track, 0, sizeof(*track));
+    track->track = c;
+    track->side = h;
 
     for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-      track.sectors[i].track = c;
-      track.sectors[i].side = h;
-      track.sectors[i].sector_n = i + 1;
-      track.sectors[i].valid = false;
+      track->sectors[i].track = c;
+      track->sectors[i].side = h;
+      track->sectors[i].sector_n = i + 1;
+      track->sectors[i].valid = false;
     }
 
     uint8_t new_count = 0;
@@ -403,9 +449,9 @@ static fat12_err_t fat12_write_batch_flush(fat12_t *fat) {
 
       if (bc == c && bh == h && bs >= 1 && bs <= SECTORS_PER_TRACK) {
         int idx = bs - 1;
-        memcpy(track.sectors[idx].data, batch->data[i], SECTOR_SIZE);
-        track.sectors[idx].valid = true;
-        track.sectors[idx].size_code = 2;
+        memcpy(track->sectors[idx].data, batch->data[i], SECTOR_SIZE);
+        track->sectors[idx].valid = true;
+        track->sectors[idx].size_code = 2;
       } else if (bc != c || bh != h) {
         if (new_count != i) {
           batch->lbas[new_count] = batch->lbas[i];
@@ -416,7 +462,7 @@ static fat12_err_t fat12_write_batch_flush(fat12_t *fat) {
     }
     batch->count = new_count;
 
-    if (!fat->io.write(fat->io.ctx, &track)) {
+    if (!fat->io.write(fat->io.ctx, track)) {
       return FAT12_ERR_WRITE;
     }
   }
@@ -686,7 +732,7 @@ fat12_err_t fat12_create(fat12_t *fat, const char *filename, fat12_dirent_t *ent
   entry->start_cluster = 0;
   entry->size = 0;
 
-  if (fat->batch.data) return FAT12_ERR_INVALID;
+  if (fat->batch.active) return FAT12_ERR_INVALID;
   if (!fat12_batch_begin(fat)) return FAT12_ERR_READ;
 
   err = fat12_write_root_entry(fat, dirent_idx, entry);
@@ -705,7 +751,7 @@ static void fat12_init_dirent(fat12_dirent_t *d, const char *name8, const char *
 }
 
 fat12_err_t fat12_open_write(fat12_t *fat, const char *filename, fat12_writer_t *writer) {
-  if (fat->batch.data) return FAT12_ERR_INVALID;
+  if (fat->batch.active) return FAT12_ERR_INVALID;
 
   fat12_err_t result = FAT12_ERR_FULL;
 
@@ -717,7 +763,10 @@ fat12_err_t fat12_open_write(fat12_t *fat, const char *filename, fat12_writer_t 
   }
 
   char name8[8], ext3[3];
-  fat12_format_name(filename, name8, ext3);
+  if (!fat12_format_name(filename, name8, ext3)) {
+    result = FAT12_ERR_INVALID;
+    goto fail;
+  }
 
   for (uint16_t i = 0; i < fat->bpb.root_entries; i++) {
     fat12_err_t err = fat12_read_root_entry(fat, i, &writer->dirent);
@@ -998,11 +1047,11 @@ fat12_err_t fat12_close_write(fat12_writer_t *writer) {
 }
 
 fat12_err_t fat12_delete(fat12_t *fat, const char *filename) {
-  if (fat->batch.data) return FAT12_ERR_INVALID;
+  if (fat->batch.active) return FAT12_ERR_INVALID;
 
   fat12_dirent_t entry;
   char name8[8], ext3[3];
-  fat12_format_name(filename, name8, ext3);
+  if (!fat12_format_name(filename, name8, ext3)) return FAT12_ERR_INVALID;
 
   if (!fat12_batch_begin(fat)) return FAT12_ERR_READ;
 
@@ -1017,15 +1066,19 @@ fat12_err_t fat12_delete(fat12_t *fat, const char *filename) {
 
     if (memcmp(entry.name, name8, 8) == 0 &&
         memcmp(entry.ext, ext3, 3) == 0) {
-      err = fat12_free_chain(fat, entry.start_cluster);
-      if (err != FAT12_OK) { result = err; goto done; }
-
+      uint16_t start_cluster = entry.start_cluster;
       if (entry.start_cluster >= 2 && entry.start_cluster < fat->next_free_hint) {
         fat->next_free_hint = entry.start_cluster;
       }
 
       entry.name[0] = FAT12_DIRENT_FREE;
       err = fat12_write_root_entry(fat, i, &entry);
+      if (err != FAT12_OK) { result = err; goto done; }
+
+      err = fat12_write_batch_flush(fat);
+      if (err != FAT12_OK) { result = err; goto done; }
+
+      err = fat12_free_chain(fat, start_cluster);
       if (err != FAT12_OK) { result = err; goto done; }
 
       result = fat12_write_batch_flush(fat);
@@ -1161,30 +1214,30 @@ fat12_err_t fat12_format(fat12_io_t io, const char *volume_label, bool write_all
 
   for (uint8_t cyl = 0; cyl < 80; cyl++) {
     for (uint8_t side = 0; side < fat.bpb.num_heads; side++) {
-      static track_t t;
-      memset(&t, 0, sizeof(t));
-      t.track = cyl;
-      t.side = side;
+      track_t *t = &fat.write_track;
+      memset(t, 0, sizeof(*t));
+      t->track = cyl;
+      t->side = side;
 
       bool has_valid = false;
       for (uint8_t s = 0; s < fat.bpb.sectors_per_track; s++) {
         uint16_t lba = fat12_chs_to_lba(&fat.bpb, cyl, side, s + 1);
 
-        t.sectors[s].track = t.track;
-        t.sectors[s].side = side;
-        t.sectors[s].sector_n = s + 1;
-        t.sectors[s].size_code = 2;
-        t.sectors[s].valid = true;
+        t->sectors[s].track = t->track;
+        t->sectors[s].side = side;
+        t->sectors[s].sector_n = s + 1;
+        t->sectors[s].size_code = 2;
+        t->sectors[s].valid = true;
 
-        fat12_fill_format_sector(&t.sectors[s], lba, &fat, boot,
+        fat12_fill_format_sector(&t->sectors[s], lba, &fat, boot,
                                  fat_sector, root_first, volume_label,
                                  write_all_tracks);
 
-        if (t.sectors[s].valid) has_valid = true;
+        if (t->sectors[s].valid) has_valid = true;
       }
 
       if (has_valid) {
-        if (!io.write(io.ctx, &t))
+        if (!io.write(io.ctx, t))
           return FAT12_ERR_WRITE;
       }
 
