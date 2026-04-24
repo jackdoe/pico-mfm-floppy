@@ -505,11 +505,11 @@ floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector) {
   f->stats.reads++;
 
   floppy_status_t st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
+  if (st == FLOPPY_OK) return st;
   if (!floppy_status_retryable(st)) {
     floppy_stats_record_failure(f, st);
     return st;
   }
-  if (st == FLOPPY_OK) return st;
 
   f->stats.retries++;
   st = floppy_jog(f, target, 10);
@@ -518,12 +518,12 @@ floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector) {
     return st;
   }
   st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
-  if (!floppy_status_retryable(st)) {
-    floppy_stats_record_failure(f, st);
-    return st;
-  }
   if (st == FLOPPY_OK) {
     f->stats.recovered++;
+    return st;
+  }
+  if (!floppy_status_retryable(st)) {
+    floppy_stats_record_failure(f, st);
     return st;
   }
 
