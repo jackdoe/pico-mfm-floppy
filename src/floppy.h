@@ -76,6 +76,16 @@ typedef struct {
 
 typedef struct floppy floppy_t;
 
+typedef struct {
+  uint32_t reads;
+  uint32_t retries;
+  uint32_t recovered;
+  uint32_t failed;
+  uint32_t timeout;
+  uint32_t wrong_track;
+  uint32_t wrong_side;
+} floppy_stats_t;
+
 struct floppy {
   floppy_pins_t pins;
   floppy_pio_t read;
@@ -91,6 +101,7 @@ struct floppy {
   volatile uint32_t last_io_time_ms;
   struct repeating_timer idle_timer;
   uint8_t flux_buf[FLOPPY_FLUX_BUF_SIZE];
+  floppy_stats_t stats;
 };
 
 void floppy_init(floppy_t *f);
@@ -111,6 +122,10 @@ bool floppy_at_track0(floppy_t *f);
 bool floppy_disk_changed(floppy_t *f);
 
 bool floppy_write_protected(floppy_t *f);
+
+void floppy_stats_reset(floppy_t *f);
+
+floppy_stats_t floppy_stats(floppy_t *f);
 
 floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector);
 floppy_status_t floppy_read_track(floppy_t *f, track_t *t);

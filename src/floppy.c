@@ -221,6 +221,14 @@ static bool floppy_status_retryable(floppy_status_t status) {
          status == FLOPPY_ERR_WRONG_SIDE;
 }
 
+static void floppy_stats_record_failure(floppy_t *f, floppy_status_t status) {
+  if (status == FLOPPY_OK) return;
+  f->stats.failed++;
+  if (status == FLOPPY_ERR_TIMEOUT) f->stats.timeout++;
+  else if (status == FLOPPY_ERR_WRONG_TRACK) f->stats.wrong_track++;
+  else if (status == FLOPPY_ERR_WRONG_SIDE) f->stats.wrong_side++;
+}
+
 static floppy_status_t floppy_jog(floppy_t *f, uint8_t track, uint8_t distance) {
   uint8_t away = (track <= distance) ? track + distance : track - distance;
   floppy_status_t status = floppy_seek(f, away);
@@ -482,24 +490,53 @@ bool floppy_write_protected(floppy_t *f) {
   return !gpio_get(f->pins.write_protect);
 }
 
+void floppy_stats_reset(floppy_t *f) {
+  memset(&f->stats, 0, sizeof(f->stats));
+}
+
+floppy_stats_t floppy_stats(floppy_t *f) {
+  return f->stats;
+}
+
 floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector) {
   sector->valid = false;
   floppy_prepare(f);
   uint8_t target = sector->track;
+  f->stats.reads++;
 
   floppy_status_t st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
-  if (!floppy_status_retryable(st)) return st;
+  if (!floppy_status_retryable(st)) {
+    floppy_stats_record_failure(f, st);
+    return st;
+  }
   if (st == FLOPPY_OK) return st;
 
+  f->stats.retries++;
   st = floppy_jog(f, target, 10);
-  if (st != FLOPPY_OK) return st;
+  if (st != FLOPPY_OK) {
+    floppy_stats_record_failure(f, st);
+    return st;
+  }
   st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
-  if (!floppy_status_retryable(st)) return st;
-  if (st == FLOPPY_OK) return st;
+  if (!floppy_status_retryable(st)) {
+    floppy_stats_record_failure(f, st);
+    return st;
+  }
+  if (st == FLOPPY_OK) {
+    f->stats.recovered++;
+    return st;
+  }
 
+  f->stats.retries++;
   st = floppy_jog(f, target, 20);
-  if (st != FLOPPY_OK) return st;
-  return floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
+  if (st != FLOPPY_OK) {
+    floppy_stats_record_failure(f, st);
+    return st;
+  }
+  st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
+  if (st == FLOPPY_OK) f->stats.recovered++;
+  else floppy_stats_record_failure(f, st);
+  return st;
 }
 
 struct verify_ctx {

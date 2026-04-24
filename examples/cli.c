@@ -107,7 +107,7 @@ static const cmd_entry_t commands[] = {
   {"selftest3-b",NULL, cmd_selftest3_b,false,"selftest3-b [rounds]","Resume selftest3 after power cycle without format"},
   {"test-full",NULL,   cmd_test_full,false,"test-full [rounds]", "Full hardware test sequence, no selftest3"},
   {"starwars", NULL,   cmd_starwars, false,"starwars",            "Imperial March on the stepper motor"},
-  {"diskdump",NULL,    cmd_diskdump,false, "diskdump",            "Full disk sector scan + checksum"},
+  {"diskdump",NULL,    cmd_diskdump,false, "diskdump [quiet]",    "Full disk sector scan + retry summary"},
   {"mfmscan", NULL,    cmd_mfmscan, false, "mfmscan",             "MFM signal quality across all tracks"},
   {"reboot",  NULL,    cmd_reboot,  false, "reboot",              "Reboot the Pico"},
 };
@@ -278,9 +278,20 @@ typedef struct {
   uint16_t T2_max;
   uint16_t T3_max;
   uint32_t syncs;
-  uint32_t sectors;
+  uint32_t sector_records;
+  uint32_t unique_sectors;
   uint32_t crc_errors;
+  bool seen[SECTORS_PER_TRACK];
 } track_stats_t;
+
+typedef struct {
+  int total_valid;
+  int total_invalid;
+  uint32_t checksum;
+  floppy_stats_t retries;
+} diskdump_stats_t;
+
+static diskdump_stats_t run_diskdump(bool verbose);
 
 static inline bool flux_data_available(void) {
   return floppy.read.half || !pio_sm_is_rx_fifo_empty(floppy.read.pio, floppy.read.sm);
@@ -359,7 +370,14 @@ static void read_track_stats(int track, int side, track_stats_t *stats) {
       stats->long_count++;
     }
 
-    mfm_feed(&mfm, delta, &sector);
+    if (mfm_feed(&mfm, delta, &sector) && sector.valid &&
+        sector.sector_n >= 1 && sector.sector_n <= SECTORS_PER_TRACK) {
+      uint8_t idx = sector.sector_n - 1;
+      if (!stats->seen[idx]) {
+        stats->seen[idx] = true;
+        stats->unique_sectors++;
+      }
+    }
     prev = cnt;
   }
 
@@ -368,7 +386,7 @@ static void read_track_stats(int track, int side, track_stats_t *stats) {
   stats->T2_max = mfm.T2_max;
   stats->T3_max = mfm.T3_max;
   stats->syncs = mfm.syncs_found;
-  stats->sectors = mfm.sectors_read;
+  stats->sector_records = mfm.sectors_read;
   stats->crc_errors = mfm.crc_errors;
 }
 
@@ -1402,7 +1420,8 @@ static void cmd_mfm(int argc, char **argv) {
   printf("  Invalid:  %lu (%.1f%%)\n", stats.invalid_count,
          stats.total_pulses ? stats.invalid_count * 100.0 / stats.total_pulses : 0);
   printf("  Syncs:    %lu\n", stats.syncs);
-  printf("  Sectors:  %lu / %d\n", stats.sectors, SECTORS_PER_TRACK);
+  printf("  Records:  %lu\n", stats.sector_records);
+  printf("  Unique:   %lu / %d\n", stats.unique_sectors, SECTORS_PER_TRACK);
   printf("  CRC err:  %lu\n", stats.crc_errors);
   printf("  Adaptive: T2_max=%d  T3_max=%d\n", stats.T2_max, stats.T3_max);
 
@@ -1430,6 +1449,31 @@ static bool read_file_exact(const char *name, uint8_t *buf, uint32_t expected) {
   uint32_t got = f12_read_full(f, buf, expected + 1);
   bool close_ok = f12_close(f) == F12_OK;
   return close_ok && got == expected;
+}
+
+static bool mfm_health_check(int track, int side, const char *label, int *pass, int *fail) {
+  track_stats_t stats;
+  read_track_stats(track, side, &stats);
+
+  printf("  %s T%d/S%d: unique=%lu/%d records=%lu crc=%lu invalid=%lu/%lu\n",
+         label, track, side, stats.unique_sectors, SECTORS_PER_TRACK,
+         stats.sector_records, stats.crc_errors,
+         stats.invalid_count, stats.total_pulses);
+
+  uint32_t invalid_limit = stats.total_pulses / 200;
+  if (invalid_limit < 1) invalid_limit = 1;
+
+  char tag[96];
+  snprintf(tag, sizeof(tag), "%s unique sectors", label);
+  check(stats.unique_sectors == SECTORS_PER_TRACK, tag, pass, fail);
+  snprintf(tag, sizeof(tag), "%s CRC clean", label);
+  check(stats.crc_errors == 0, tag, pass, fail);
+  snprintf(tag, sizeof(tag), "%s invalid pulse threshold", label);
+  check(stats.invalid_count <= invalid_limit, tag, pass, fail);
+
+  return stats.unique_sectors == SECTORS_PER_TRACK &&
+         stats.crc_errors == 0 &&
+         stats.invalid_count <= invalid_limit;
 }
 
 static void cmd_test_full(int argc, char **argv) {
@@ -1467,9 +1511,12 @@ static void cmd_test_full(int argc, char **argv) {
   printf("\n--- Phase 1: GPIO and Flux Sanity ---\n");
   cmd_pins(0, NULL);
   cmd_status(0, NULL);
+  check(!floppy_write_protected(&floppy), "disk is writable", &pass, &fail);
   cmd_poll(0, NULL);
   char *flux_args[] = {"flux", "50"};
   cmd_flux(2, flux_args);
+
+  if (floppy_write_protected(&floppy)) goto done;
 
   printf("\n--- Phase 2: Full Format and Mount ---\n");
   setup_io();
@@ -1484,10 +1531,8 @@ static void cmd_test_full(int argc, char **argv) {
   cmd_status(0, NULL);
 
   printf("\n--- Phase 3: MFM Signal Checks ---\n");
-  char *mfm_outer[] = {"mfm", "0", "0"};
-  char *mfm_inner[] = {"mfm", "79", "0"};
-  cmd_mfm(3, mfm_outer);
-  cmd_mfm(3, mfm_inner);
+  mfm_health_check(0, 0, "outer", &pass, &fail);
+  mfm_health_check(79, 0, "inner", &pass, &fail);
 
   printf("\n--- Phase 4: Shell File Operations ---\n");
   const char text[] = "test-full hardware sequence\nformat mount write copy move delete verify\n";
@@ -1585,7 +1630,11 @@ static void cmd_test_full(int argc, char **argv) {
   check(verify_pattern_file_chunked("REFILL.BIN", 3000, 12000, 777, NULL), "REFILL.BIN survives remount", &pass, &fail);
 
   printf("\n--- Phase 7: Full Disk Scan ---\n");
-  cmd_diskdump(0, NULL);
+  diskdump_stats_t dump = run_diskdump(true);
+  check(dump.total_valid == FLOPPY_TRACKS * 2 * SECTORS_PER_TRACK, "all sectors readable", &pass, &fail);
+  check(dump.total_invalid == 0, "no unreadable sectors", &pass, &fail);
+  check(dump.retries.failed == 0, "no final read failures", &pass, &fail);
+  check(dump.retries.recovered <= 8, "recovered read retry threshold", &pass, &fail);
 
 done:
   if (mounted) {
@@ -2713,16 +2762,21 @@ static void cmd_starwars(int argc, char **argv) {
   printf("  Done.\n");
 }
 
-static void cmd_diskdump(int argc, char **argv) {
-  (void)argc; (void)argv;
+static diskdump_stats_t run_diskdump(bool verbose) {
+  diskdump_stats_t stats;
+  memset(&stats, 0, sizeof(stats));
 
   int total_valid = 0;
   int total_invalid = 0;
   uint32_t disk_checksum = 0;
   sector_t sector;
 
-  printf("  %-8s %-6s %-10s %-10s\n", "TRACK", "SIDE", "DECODED", "ERRORS");
-  printf("  %-8s %-6s %-10s %-10s\n", "-----", "----", "-------", "------");
+  floppy_stats_reset(&floppy);
+
+  if (verbose) {
+    printf("  %-8s %-6s %-10s %-10s\n", "TRACK", "SIDE", "DECODED", "ERRORS");
+    printf("  %-8s %-6s %-10s %-10s\n", "-----", "----", "-------", "------");
+  }
 
   for (int track = 0; track < FLOPPY_TRACKS; track++) {
     for (int side = 0; side < 2; side++) {
@@ -2747,14 +2801,37 @@ static void cmd_diskdump(int argc, char **argv) {
       total_valid += decoded;
       total_invalid += errors;
 
-      printf("  T%02d      %d      %2d/%-2d      %d\n",
-             track, side, decoded, SECTORS_PER_TRACK, errors);
+      if (verbose || decoded != SECTORS_PER_TRACK || errors != 0) {
+        printf("  T%02d      %d      %2d/%-2d      %d\n",
+               track, side, decoded, SECTORS_PER_TRACK, errors);
+      }
     }
   }
+
+  stats.total_valid = total_valid;
+  stats.total_invalid = total_invalid;
+  stats.checksum = disk_checksum;
+  stats.retries = floppy_stats(&floppy);
 
   printf("\n  Total decoded: %d / 2880\n", total_valid);
   printf("  Errors:        %d\n", total_invalid);
   printf("  Disk checksum: 0x%08lX\n", disk_checksum);
+  printf("  Read retries:  %lu attempts, %lu recovered, %lu failed\n",
+         stats.retries.retries, stats.retries.recovered, stats.retries.failed);
+  if (stats.retries.timeout || stats.retries.wrong_track || stats.retries.wrong_side) {
+    printf("  Retry causes:  timeout=%lu wrong_track=%lu wrong_side=%lu\n",
+           stats.retries.timeout, stats.retries.wrong_track, stats.retries.wrong_side);
+  }
+
+  return stats;
+}
+
+static void cmd_diskdump(int argc, char **argv) {
+  bool verbose = true;
+  if (argc >= 2 && strcasecmp(argv[1], "quiet") == 0) {
+    verbose = false;
+  }
+  run_diskdump(verbose);
 }
 
 static void cmd_mfmscan(int argc, char **argv) {
@@ -2782,32 +2859,33 @@ static void cmd_mfmscan(int argc, char **argv) {
     printf("    Invalid:  %lu (%.1f%%)\n", stats.invalid_count,
            stats.total_pulses ? stats.invalid_count * 100.0 / stats.total_pulses : 0);
     printf("    Syncs:    %lu\n", stats.syncs);
-    printf("    Sectors:  %lu / %d\n", stats.sectors, SECTORS_PER_TRACK);
+    printf("    Records:  %lu\n", stats.sector_records);
+    printf("    Unique:   %lu / %d\n", stats.unique_sectors, SECTORS_PER_TRACK);
     printf("    CRC err:  %lu\n", stats.crc_errors);
     printf("    Adaptive: T2_max=%d  T3_max=%d\n", stats.T2_max, stats.T3_max);
     print_histogram(&stats);
   }
 
   printf("\n  === Per-Track Summary (side 0) ===\n");
-  printf("  %-6s %-8s %-8s %-8s %-8s %-5s %-5s\n",
-         "TRACK", "SHORT", "MEDIUM", "LONG", "INVALID", "SECT", "CRC");
-  printf("  %-6s %-8s %-8s %-8s %-8s %-5s %-5s\n",
-         "-----", "------", "------", "------", "-------", "----", "---");
+  printf("  %-6s %-8s %-8s %-8s %-8s %-5s %-5s %-5s\n",
+         "TRACK", "SHORT", "MEDIUM", "LONG", "INVALID", "UNIQ", "REC", "CRC");
+  printf("  %-6s %-8s %-8s %-8s %-8s %-5s %-5s %-5s\n",
+         "-----", "------", "------", "------", "-------", "----", "---", "---");
 
   int total_sectors = 0;
   int total_crc = 0;
 
   for (int track = 0; track < FLOPPY_TRACKS; track++) {
     read_track_stats(track, 0, &stats);
-    printf("  T%02d    %-8lu %-8lu %-8lu %-8lu %-5lu %-5lu\n",
+    printf("  T%02d    %-8lu %-8lu %-8lu %-8lu %-5lu %-5lu %-5lu\n",
            track, stats.short_count, stats.medium_count,
            stats.long_count, stats.invalid_count,
-           stats.sectors, stats.crc_errors);
-    total_sectors += stats.sectors;
+           stats.unique_sectors, stats.sector_records, stats.crc_errors);
+    total_sectors += stats.unique_sectors;
     total_crc += stats.crc_errors;
   }
 
-  printf("\n  Side 0 total: %d sectors decoded, %d CRC errors\n", total_sectors, total_crc);
+  printf("\n  Side 0 total: %d unique sectors decoded, %d CRC errors\n", total_sectors, total_crc);
 }
 
 static void cmd_reboot(int argc, char **argv) {
