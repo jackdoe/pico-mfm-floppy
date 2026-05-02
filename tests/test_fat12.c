@@ -167,8 +167,7 @@ TEST(test_write_small_file) {
   ASSERT_EQ(entry.size, strlen(msg));
 
   fat12_file_t file;
-  err = fat12_open(&fat, &entry, &file);
-  ASSERT_EQ(err, FAT12_OK);
+  fat12_open(&fat, &entry, &file);
 
   char buf[64] = {0};
   int n = fat12_read(&file, (uint8_t *)buf, sizeof(buf));
@@ -195,7 +194,7 @@ TEST(test_small_reads_use_cluster_buffer) {
   ASSERT_EQ(fat12_find(&fat, "READBUF.TXT", &entry), FAT12_OK);
 
   fat12_file_t file;
-  ASSERT_EQ(fat12_open(&fat, &entry, &file), FAT12_OK);
+  fat12_open(&fat, &entry, &file);
   disk.read_count = 0;
 
   for (size_t i = 0; i < strlen(msg); i++) {
@@ -279,7 +278,7 @@ TEST(test_write_read_large_single_call) {
   ASSERT_EQ(entry.size, size);
 
   fat12_file_t file;
-  ASSERT_EQ(fat12_open(&fat, &entry, &file), FAT12_OK);
+  fat12_open(&fat, &entry, &file);
   ASSERT_EQ(fat12_read(&file, buf, size), (int)size);
   ASSERT_MEM_EQ(buf, pattern, size);
 
@@ -346,7 +345,7 @@ TEST(test_overwrite_failure_preserves_existing_file) {
   ASSERT_EQ(entry.size, 8);
 
   fat12_file_t file;
-  ASSERT_EQ(fat12_open(&fat, &entry, &file), FAT12_OK);
+  fat12_open(&fat, &entry, &file);
   char buf[32] = {0};
   ASSERT_EQ(fat12_read(&file, (uint8_t *)buf, sizeof(buf)), 8);
   ASSERT_MEM_EQ(buf, "old data", 8);
@@ -453,7 +452,7 @@ TEST(test_overwrite_succeeds_without_spare_clusters) {
   ASSERT_EQ(entry.size, sizeof(updated));
 
   fat12_file_t file;
-  ASSERT_EQ(fat12_open(&fat, &entry, &file), FAT12_OK);
+  fat12_open(&fat, &entry, &file);
   uint8_t buf[sizeof(updated)];
   ASSERT_EQ(fat12_read(&file, buf, sizeof(buf)), (int)sizeof(buf));
   ASSERT_MEM_EQ(buf, updated, sizeof(updated));
@@ -831,8 +830,7 @@ TEST(test_format_write_read_file) {
   ASSERT_EQ(entry.size, strlen(content));
 
   fat12_file_t file;
-  err = fat12_open(&fat, &entry, &file);
-  ASSERT_EQ(err, FAT12_OK);
+  fat12_open(&fat, &entry, &file);
 
   char buf[64];
   int n = fat12_read(&file, (uint8_t *)buf, sizeof(buf));
@@ -1055,6 +1053,634 @@ TEST(test_multiple_small_writes_cross_cluster) {
   }
 }
 
+TEST(test_init_fails_when_boot_read_fails) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = 0;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  ASSERT_EQ(fat12_init(&fat, io), FAT12_ERR_READ);
+}
+
+TEST(test_init_fat_mismatch_read_fails) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = 2;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  ASSERT_EQ(fat12_init(&fat, io), FAT12_OK);
+}
+
+TEST(test_seek_propagates_read_error) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  fat12_open_write(&fat, "S.TXT", &w);
+  uint8_t buf[2000];
+  memset(buf, 0x44, sizeof(buf));
+  fat12_write(&w, buf, sizeof(buf));
+  fat12_close_write(&w);
+
+  fat12_dirent_t e;
+  fat12_find(&fat, "S.TXT", &e);
+
+  fat12_file_t file;
+  fat12_open(&fat, &e, &file);
+
+  disk.fail_after_reads = 0;
+  fat12_err_t err = fat12_seek(&file, 1500);
+  ASSERT_EQ(err, FAT12_ERR_READ);
+}
+
+TEST(test_read_propagates_read_error) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  fat12_open_write(&fat, "R.TXT", &w);
+  uint8_t buf[2000];
+  memset(buf, 0x55, sizeof(buf));
+  fat12_write(&w, buf, sizeof(buf));
+  fat12_close_write(&w);
+
+  fat12_dirent_t e;
+  fat12_find(&fat, "R.TXT", &e);
+
+  fat12_file_t file;
+  fat12_open(&fat, &e, &file);
+
+  disk.fail_after_reads = 0;
+  uint8_t out[2000];
+  int n = fat12_read(&file, out, sizeof(out));
+  ASSERT(n < 0);
+  ASSERT_EQ(-n, FAT12_ERR_READ);
+}
+
+TEST(test_close_write_propagates_write_error) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  fat12_open_write(&fat, "W.TXT", &w);
+  uint8_t buf[3000];
+  memset(buf, 0x66, sizeof(buf));
+  fat12_write(&w, buf, sizeof(buf));
+
+  disk.fail_after_track_writes = 0;
+  fat12_err_t err = fat12_close_write(&w);
+  ASSERT(err != FAT12_OK);
+  ASSERT(!fat.batch.active);
+}
+
+TEST(test_delete_propagates_write_error) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  fat12_open_write(&fat, "D.TXT", &w);
+  uint8_t buf[100];
+  memset(buf, 0x77, sizeof(buf));
+  fat12_write(&w, buf, sizeof(buf));
+  fat12_close_write(&w);
+
+  disk.fail_after_track_writes = 0;
+  fat12_err_t err = fat12_delete(&fat, "D.TXT");
+  ASSERT_EQ(err, FAT12_ERR_WRITE);
+  ASSERT(!fat.batch.active);
+}
+
+TEST(test_create_propagates_write_error) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  disk.fail_after_track_writes = 0;
+  fat12_dirent_t e;
+  fat12_err_t err = fat12_create(&fat, "C.TXT", &e);
+  ASSERT_EQ(err, FAT12_ERR_WRITE);
+  ASSERT(!fat.batch.active);
+}
+
+TEST(test_format_partial_write_failure) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_track_writes = 2;
+
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_err_t err = fat12_format(io, "X", true);
+  ASSERT_EQ(err, FAT12_ERR_WRITE);
+}
+
+TEST(test_close_write_root_entry_flush_fails) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  fat12_open_write(&fat, "F.TXT", &w);
+  uint8_t buf[200];
+  memset(buf, 0x99, sizeof(buf));
+  fat12_write(&w, buf, sizeof(buf));
+
+  disk.fail_after_track_writes = 1;
+  fat12_err_t err = fat12_close_write(&w);
+  ASSERT(err != FAT12_OK);
+  ASSERT(!fat.batch.active);
+}
+
+TEST(test_close_write_replacing_existing_chain_free_fails) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  fat12_open_write(&fat, "REP.TXT", &w);
+  uint8_t orig[200];
+  memset(orig, 0xAA, sizeof(orig));
+  fat12_write(&w, orig, sizeof(orig));
+  fat12_close_write(&w);
+
+  fat12_open_write(&fat, "REP.TXT", &w);
+  ASSERT(w.replacing_existing);
+  uint8_t neu[200];
+  memset(neu, 0xBB, sizeof(neu));
+  fat12_write(&w, neu, sizeof(neu));
+
+  disk.fail_after_track_writes = 2;
+  fat12_err_t err = fat12_close_write(&w);
+  ASSERT(err != FAT12_OK);
+  ASSERT(!fat.batch.active);
+}
+
+TEST(test_write_after_error_returns_error) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  fat12_open_write(&fat, "E.TXT", &w);
+  w.error = FAT12_ERR_WRITE;
+
+  uint8_t buf[10];
+  int n = fat12_write(&w, buf, sizeof(buf));
+  ASSERT(n < 0);
+  ASSERT_EQ(-n, FAT12_ERR_WRITE);
+
+  fat12_abort_write(&fat);
+}
+
+TEST(test_open_write_count_chain_fails) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  fat12_open_write(&fat, "C.TXT", &w);
+  uint8_t buf[2500];
+  memset(buf, 0x44, sizeof(buf));
+  fat12_write(&w, buf, sizeof(buf));
+  fat12_close_write(&w);
+
+  disk.fail_after_reads = 1;
+  fat12_err_t err = fat12_open_write(&fat, "C.TXT", &w);
+  ASSERT(err != FAT12_OK);
+  ASSERT(!fat.batch.active);
+  ASSERT_NULL(w.fat);
+}
+
+TEST(test_open_write_already_active_batch) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w1, w2;
+  ASSERT_EQ(fat12_open_write(&fat, "A.TXT", &w1), FAT12_OK);
+  ASSERT(fat.batch.active);
+
+  fat12_err_t err = fat12_open_write(&fat, "B.TXT", &w2);
+  ASSERT_EQ(err, FAT12_ERR_INVALID);
+
+  fat12_abort_write(&fat);
+}
+
+TEST(test_split_sector_fat_entry) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  for (uint16_t c = 2; c < 343; c++) {
+    vdisk_set_fat_entry(&disk, c, c == 342 ? 0xFFF : c + 1);
+  }
+  fat12_init(&fat, io);
+
+  uint16_t next = 0;
+  ASSERT_EQ(fat12_get_entry(&fat, 341, &next), FAT12_OK);
+  ASSERT_EQ(next, 342);
+}
+
+TEST(test_split_sector_fat_entry_read_fail) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  disk.fail_after_reads = -1;
+  fat12_init(&fat, io);
+
+  for (uint16_t c = 2; c < 343; c++) {
+    vdisk_set_fat_entry(&disk.disk, c, c == 342 ? 0xFFF : c + 1);
+  }
+  fat12_init(&fat, io);
+
+  disk.fail_after_reads = 1;
+  uint16_t next = 0;
+  fat12_err_t err = fat12_get_entry(&fat, 341, &next);
+  ASSERT_EQ(err, FAT12_ERR_READ);
+}
+
+TEST(test_seek_propagates_split_read_fail) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  fat12_open_write(&fat, "L.BIN", &w);
+  uint8_t big[2048];
+  memset(big, 0xAA, sizeof(big));
+  fat12_write(&w, big, sizeof(big));
+  fat12_close_write(&w);
+
+  fat12_dirent_t e;
+  fat12_find(&fat, "L.BIN", &e);
+  fat12_file_t file;
+  fat12_open(&fat, &e, &file);
+
+  disk.fail_after_reads = 0;
+  fat12_err_t err = fat12_seek(&file, 1024);
+  ASSERT_EQ(err, FAT12_ERR_READ);
+}
+
+TEST(test_delete_propagates_free_chain_read_error) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  fat12_open_write(&fat, "CHAIN.BIN", &w);
+  uint8_t buf[3000];
+  memset(buf, 0x77, sizeof(buf));
+  fat12_write(&w, buf, sizeof(buf));
+  fat12_close_write(&w);
+
+  disk.fail_after_reads = 2;
+  fat12_err_t err = fat12_delete(&fat, "CHAIN.BIN");
+  ASSERT_EQ(err, FAT12_ERR_READ);
+  ASSERT(!fat.batch.active);
+}
+
+TEST(test_set_entry_split_write_fail) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  for (uint16_t c = 2; c < 343; c++) {
+    vdisk_set_fat_entry(&disk.disk, c, c == 342 ? 0xFFF : c + 1);
+  }
+  fat12_init(&fat, io);
+
+  fat12_dirent_t e;
+  memset(&e, 0, sizeof(e));
+  memcpy(e.name, "TAILFILE", 8);
+  memcpy(e.ext, "BIN", 3);
+  e.attr = FAT12_ATTR_ARCHIVE;
+  e.start_cluster = 341;
+  e.size = 512;
+  uint16_t lba = fat.root_dir_start_sector;
+  memcpy(&disk.disk.data[lba][0], &e, sizeof(e));
+
+  disk.fail_after_reads = 1;
+  fat12_err_t err = fat12_delete(&fat, "TAILFILE.BIN");
+  ASSERT(err != FAT12_OK);
+}
+
+TEST(test_format_long_volume_label) {
+  vdisk_t disk;
+  vdisk_init(&disk);
+
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  ASSERT_EQ(fat12_format(io, "LONGLABELSXY", false), FAT12_OK);
+
+  fat12_t fat;
+  ASSERT_EQ(fat12_init(&fat, io), FAT12_OK);
+
+  fat12_dirent_t e;
+  ASSERT_EQ(fat12_read_root_entry(&fat, 0, &e), FAT12_OK);
+  ASSERT(e.attr & FAT12_ATTR_VOLUME_ID);
+  ASSERT_MEM_EQ(e.name, "LONGLABE", 8);
+  ASSERT_MEM_EQ(e.ext, "LSX", 3);
+}
+
+TEST(test_overwrite_in_place_with_data_writes) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  fat12_open_write(&fat, "P.BIN", &w);
+  uint8_t orig[2000];
+  memset(orig, 0xAA, sizeof(orig));
+  fat12_write(&w, orig, sizeof(orig));
+  fat12_close_write(&w);
+
+  for (uint16_t cluster = 2; cluster < fat.total_clusters + 2; cluster++) {
+    uint16_t next;
+    fat12_get_entry(&fat, cluster, &next);
+    if (next == 0) {
+      vdisk_set_fat_entry(&disk, cluster, 0xFF7);
+    }
+  }
+  fat12_init(&fat, io);
+
+  fat12_open_write(&fat, "P.BIN", &w);
+  ASSERT(w.overwrite_in_place);
+
+  uint8_t shorter[600];
+  memset(shorter, 0xBB, sizeof(shorter));
+  fat12_write(&w, shorter, sizeof(shorter));
+  ASSERT_EQ(fat12_close_write(&w), FAT12_OK);
+
+  fat12_dirent_t e;
+  fat12_find(&fat, "P.BIN", &e);
+  ASSERT_EQ(e.size, sizeof(shorter));
+  ASSERT(e.start_cluster >= 2);
+}
+
+TEST(test_seek_walks_multiple_clusters) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  fat12_open_write(&fat, "MULTI.BIN", &w);
+  uint8_t buf[3000];
+  for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (uint8_t)(i & 0xFF);
+  fat12_write(&w, buf, sizeof(buf));
+  fat12_close_write(&w);
+
+  fat12_dirent_t e;
+  fat12_find(&fat, "MULTI.BIN", &e);
+  fat12_file_t file;
+  fat12_open(&fat, &e, &file);
+
+  ASSERT_EQ(fat12_seek(&file, 1800), FAT12_OK);
+  ASSERT_EQ(file.bytes_read, 1800);
+
+  uint8_t out[10];
+  int n = fat12_read(&file, out, sizeof(out));
+  ASSERT_EQ(n, 10);
+  for (int i = 0; i < 10; i++) {
+    ASSERT_EQ(out[i], (uint8_t)((1800 + i) & 0xFF));
+  }
+}
+
+TEST(test_seek_clamps_past_eof_in_fat12) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  ASSERT_EQ(fat12_open_write(&fat, "S.TXT", &w), FAT12_OK);
+  uint8_t data[100];
+  memset(data, 0xCC, sizeof(data));
+  fat12_write(&w, data, sizeof(data));
+  fat12_close_write(&w);
+
+  fat12_dirent_t e;
+  ASSERT_EQ(fat12_find(&fat, "S.TXT", &e), FAT12_OK);
+
+  fat12_file_t file;
+  fat12_open(&fat, &e, &file);
+  ASSERT_EQ(fat12_seek(&file, 99999), FAT12_OK);
+  ASSERT_EQ(file.bytes_read, sizeof(data));
+
+  uint8_t buf[16];
+  ASSERT_EQ(fat12_read(&file, buf, sizeof(buf)), 0);
+}
+
+TEST(test_create_existing_returns_invalid) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_dirent_t e;
+  ASSERT_EQ(fat12_create(&fat, "DUP.TXT", &e), FAT12_OK);
+  ASSERT_EQ(fat12_create(&fat, "DUP.TXT", &e), FAT12_ERR_INVALID);
+}
+
+TEST(test_overwrite_existing_to_empty_in_place) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  ASSERT_EQ(fat12_open_write(&fat, "Z.TXT", &w), FAT12_OK);
+  uint8_t big[1500];
+  memset(big, 0xAB, sizeof(big));
+  fat12_write(&w, big, sizeof(big));
+  fat12_close_write(&w);
+
+  fat12_dirent_t e0;
+  ASSERT_EQ(fat12_find(&fat, "Z.TXT", &e0), FAT12_OK);
+  uint16_t old_start = e0.start_cluster;
+  ASSERT(old_start >= 2);
+
+  for (uint16_t cluster = 2; cluster < fat.total_clusters + 2; cluster++) {
+    uint16_t next;
+    fat12_get_entry(&fat, cluster, &next);
+    if (next == 0) {
+      vdisk_set_fat_entry(&disk, cluster, 0xFF7);
+    }
+  }
+
+  fat12_init(&fat, io);
+
+  ASSERT_EQ(fat12_open_write(&fat, "Z.TXT", &w), FAT12_OK);
+  ASSERT(w.overwrite_in_place);
+  ASSERT_EQ(fat12_close_write(&w), FAT12_OK);
+
+  fat12_dirent_t e;
+  ASSERT_EQ(fat12_find(&fat, "Z.TXT", &e), FAT12_OK);
+  ASSERT_EQ(e.size, 0);
+  ASSERT_EQ(e.start_cluster, 0);
+
+  uint16_t entry;
+  fat12_get_entry(&fat, old_start, &entry);
+  ASSERT_EQ(entry, 0);
+}
+
+TEST(test_writer_unknown_filename_full_dir) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  for (uint16_t i = 0; i < fat.bpb.root_entries; i++) {
+    fat12_dirent_t e;
+    memset(&e, 0, sizeof(e));
+    char name[9];
+    snprintf(name, sizeof(name), "F%07u", i + 1);
+    memcpy(e.name, name, 8);
+    memcpy(e.ext, "TXT", 3);
+    e.attr = FAT12_ATTR_ARCHIVE;
+    e.start_cluster = 0;
+    e.size = 0;
+    uint16_t lba = fat.root_dir_start_sector + (i * FAT12_DIR_ENTRY_SIZE) / SECTOR_SIZE;
+    uint16_t off = (i * FAT12_DIR_ENTRY_SIZE) % SECTOR_SIZE;
+    memcpy(&disk.data[lba][off], &e, sizeof(e));
+  }
+
+  fat12_writer_t w;
+  fat12_err_t r = fat12_open_write(&fat, "NEWFILE.TXT", &w);
+  ASSERT_EQ(r, FAT12_ERR_FULL);
+  ASSERT(!fat.batch.active);
+}
+
+TEST(test_invalid_filename_in_open_write) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  fat12_writer_t w;
+  fat12_err_t r = fat12_open_write(&fat, ".STARTDOT", &w);
+  ASSERT_EQ(r, FAT12_ERR_INVALID);
+  ASSERT(!fat.batch.active);
+
+  r = fat12_open_write(&fat, "TOOLONGNAME.TXT", &w);
+  ASSERT_EQ(r, FAT12_ERR_INVALID);
+
+  r = fat12_open_write(&fat, "BAD/CHAR.TXT", &w);
+  ASSERT_EQ(r, FAT12_ERR_INVALID);
+}
+
+TEST(test_delete_invalid_filename) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  ASSERT_EQ(fat12_delete(&fat, "BAD/NAME.TXT"), FAT12_ERR_INVALID);
+  ASSERT_EQ(fat12_delete(&fat, ""), FAT12_ERR_INVALID);
+  ASSERT(!fat.batch.active);
+}
+
 TEST(test_format_null_write_callback) {
   fat12_io_t io = { .read = vdisk_read, .write = NULL, .ctx = NULL };
 
@@ -1102,6 +1728,35 @@ int main(void) {
   RUN_TEST(test_format_then_init);
   RUN_TEST(test_format_write_read_file);
   RUN_TEST(test_format_null_write_callback);
+
+  printf("\n--- Edge Cases ---\n");
+  RUN_TEST(test_init_fails_when_boot_read_fails);
+  RUN_TEST(test_init_fat_mismatch_read_fails);
+  RUN_TEST(test_seek_propagates_read_error);
+  RUN_TEST(test_read_propagates_read_error);
+  RUN_TEST(test_close_write_propagates_write_error);
+  RUN_TEST(test_delete_propagates_write_error);
+  RUN_TEST(test_create_propagates_write_error);
+  RUN_TEST(test_format_partial_write_failure);
+  RUN_TEST(test_close_write_root_entry_flush_fails);
+  RUN_TEST(test_close_write_replacing_existing_chain_free_fails);
+  RUN_TEST(test_write_after_error_returns_error);
+  RUN_TEST(test_open_write_count_chain_fails);
+  RUN_TEST(test_open_write_already_active_batch);
+  RUN_TEST(test_split_sector_fat_entry);
+  RUN_TEST(test_split_sector_fat_entry_read_fail);
+  RUN_TEST(test_seek_propagates_split_read_fail);
+  RUN_TEST(test_delete_propagates_free_chain_read_error);
+  RUN_TEST(test_set_entry_split_write_fail);
+  RUN_TEST(test_format_long_volume_label);
+  RUN_TEST(test_overwrite_in_place_with_data_writes);
+  RUN_TEST(test_seek_walks_multiple_clusters);
+  RUN_TEST(test_seek_clamps_past_eof_in_fat12);
+  RUN_TEST(test_create_existing_returns_invalid);
+  RUN_TEST(test_overwrite_existing_to_empty_in_place);
+  RUN_TEST(test_writer_unknown_filename_full_dir);
+  RUN_TEST(test_invalid_filename_in_open_write);
+  RUN_TEST(test_delete_invalid_filename);
 
   TEST_RESULTS();
 }

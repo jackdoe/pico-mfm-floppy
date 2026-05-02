@@ -422,10 +422,9 @@ void fuzz_fat12_file_operations(int iterations) {
 
       if (fat12_find(&fat, "FUZZ.TXT", &entry) == FAT12_OK) {
         fat12_file_t file;
-        if (fat12_open(&fat, &entry, &file) == FAT12_OK) {
-          uint8_t read_buf[512];
-          fat12_read(&file, read_buf, sizeof(read_buf));
-        }
+        fat12_open(&fat, &entry, &file);
+        uint8_t read_buf[512];
+        fat12_read(&file, read_buf, sizeof(read_buf));
       }
 
       fat12_delete(&fat, "FUZZ.TXT");

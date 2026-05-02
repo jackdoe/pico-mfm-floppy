@@ -84,3 +84,15 @@ target_compile_definitions(test_floppy_timeouts PRIVATE
     FLOPPY_INDEX_TIMEOUT_MS=5
     FLOPPY_TX_DRAIN_TIMEOUT_MS=5)
 add_test(NAME test_floppy_timeouts COMMAND test_floppy_timeouts)
+
+add_executable(test_e2e_corruption test_e2e_corruption.c pio_sim.c flux_sim.c ${SRCS} ${SRCDIR}/floppy.c)
+target_include_directories(test_e2e_corruption PRIVATE ${STUBS} ${SRCDIR})
+target_compile_definitions(test_e2e_corruption PRIVATE FLOPPY_DEBUG=0)
+add_test(NAME test_e2e_corruption COMMAND test_e2e_corruption)
+
+add_custom_target(coverage
+    COMMAND ${CMAKE_COMMAND} -E echo "Running coverage suite..."
+    COMMAND ${CMAKE_CURRENT_LIST_DIR}/run_coverage.sh
+    WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+    USES_TERMINAL
+    COMMENT "Build with --coverage, run all tests, emit gcovr report")

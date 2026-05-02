@@ -55,19 +55,19 @@ src/
 ```
 Floppy Pin   Signal           Pico GPIO
 ────────────────────────────────────────
+ 2           /DENSITY         GP15  ← 4.7kΩ pull-up to 3.3V
  8           /INDEX           GP14
-26           /TRACK_0         GP5
-28           /WRITE_PROTECT   GP4
-30           /READ_DATA       GP3   ← 4.7kΩ pull-up to 3.3V required
-34           /DISK_CHANGE     GP1
 12           /DRIVE_SELECT_B  GP12
 16           /MOTOR_ENABLE_B  GP10
 18           /DIRECTION       GP9
 20           /STEP            GP8
 22           /WRITE_DATA      GP7
 24           /WRITE_GATE      GP6
+26           /TRACK_0         GP5
+28           /WRITE_PROTECT   GP4
+30           /READ_DATA       GP3   ← 4.7kΩ pull-up to 3.3V required
 32           /SIDE_SELECT     GP2
- 2           /DENSITY         GP15  ← 4.7kΩ pull-up to 3.3V
+34           /DISK_CHANGE     GP1
 
 Odd pins (1-33): ground
 Power: separate 5V supply (up to 1A), grounds connected

@@ -423,6 +423,112 @@ TEST(test_fixed_storage_cache) {
   ASSERT_EQ(lru_count(&lru), 2);
 }
 
+TEST(test_init_fixed_storage_too_small) {
+  lru_t lru;
+  uint8_t storage[16];
+  ASSERT(!lru_init_fixed(&lru, storage, sizeof(storage), 4, 512));
+}
+
+TEST(test_init_fixed_null_args) {
+  lru_t lru;
+  uint8_t storage[64];
+  ASSERT(!lru_init_fixed(NULL, storage, sizeof(storage), 1, sizeof(int)));
+  ASSERT(!lru_init_fixed(&lru, NULL, 64, 1, sizeof(int)));
+  ASSERT(!lru_init_fixed(&lru, storage, sizeof(storage), 0, sizeof(int)));
+  ASSERT(!lru_init_fixed(&lru, storage, sizeof(storage), 1, 0));
+}
+
+TEST(test_pin_nonexistent) {
+  lru_t *lru = lru_init(4, sizeof(int));
+  ASSERT(!lru_pin(lru, 999));
+  ASSERT(!lru_pin(NULL, 0));
+  lru_free(lru);
+}
+
+TEST(test_get_or_create_promotes_existing) {
+  lru_t *lru = lru_init(3, sizeof(int));
+  bool is_new;
+  int v1 = 1, v2 = 2, v3 = 3, v4 = 4;
+
+  lru_set(lru, 1, &v1);
+  lru_set(lru, 2, &v2);
+  lru_set(lru, 3, &v3);
+
+  int *slot = (int *)lru_get_or_create(lru, 1, &is_new);
+  ASSERT_NOT_NULL(slot);
+  ASSERT(!is_new);
+  ASSERT_EQ(*slot, 1);
+
+  lru_set(lru, 4, &v4);
+  ASSERT_EQ(lru_count(lru), 3);
+  ASSERT_NOT_NULL(lru_get(lru, 1));
+  ASSERT_NULL(lru_get(lru, 2));
+  ASSERT_NOT_NULL(lru_get(lru, 3));
+  ASSERT_NOT_NULL(lru_get(lru, 4));
+
+  lru_free(lru);
+}
+
+TEST(test_get_or_create_null_lru_and_args) {
+  ASSERT_NULL(lru_get_or_create(NULL, 0, NULL));
+
+  lru_t *lru = lru_init(2, sizeof(int));
+  void *slot = lru_get_or_create(lru, 5, NULL);
+  ASSERT_NOT_NULL(slot);
+  lru_free(lru);
+}
+
+TEST(test_pin_all_blocks_eviction) {
+  lru_t *lru = lru_init(2, sizeof(int));
+
+  int v1 = 1, v2 = 2, v3 = 3;
+  lru_set(lru, 1, &v1);
+  lru_set(lru, 2, &v2);
+  lru_pin(lru, 1);
+  lru_pin(lru, 2);
+
+  void *r = lru_set(lru, 3, &v3);
+  ASSERT_NULL(r);
+
+  ASSERT_NOT_NULL(lru_get(lru, 1));
+  ASSERT_NOT_NULL(lru_get(lru, 2));
+  ASSERT_NULL(lru_get(lru, 3));
+
+  lru_free(lru);
+}
+
+TEST(test_remove_clears_slot_for_reuse) {
+  lru_t *lru = lru_init(2, sizeof(int));
+
+  int v1 = 1, v2 = 2, v3 = 3;
+  lru_set(lru, 1, &v1);
+  lru_set(lru, 2, &v2);
+  ASSERT(lru_remove(lru, 1));
+  ASSERT_EQ(lru_count(lru), 1);
+
+  lru_set(lru, 3, &v3);
+  ASSERT_EQ(lru_count(lru), 2);
+  ASSERT_NOT_NULL(lru_get(lru, 2));
+  ASSERT_NOT_NULL(lru_get(lru, 3));
+
+  lru_free(lru);
+}
+
+TEST(test_remove_head_and_tail) {
+  lru_t *lru = lru_init(3, sizeof(int));
+  int v1 = 1, v2 = 2, v3 = 3;
+  lru_set(lru, 1, &v1);
+  lru_set(lru, 2, &v2);
+  lru_set(lru, 3, &v3);
+
+  ASSERT(lru_remove(lru, 3));
+  ASSERT(lru_remove(lru, 1));
+  ASSERT_EQ(lru_count(lru), 1);
+  ASSERT_NOT_NULL(lru_get(lru, 2));
+
+  lru_free(lru);
+}
+
 int main(void) {
   printf("=== LRU Cache Tests ===\n\n");
 
@@ -450,6 +556,14 @@ int main(void) {
   RUN_TEST(test_pin_survives_eviction);
   RUN_TEST(test_pin_cleared_on_clear);
   RUN_TEST(test_fixed_storage_cache);
+  RUN_TEST(test_init_fixed_storage_too_small);
+  RUN_TEST(test_init_fixed_null_args);
+  RUN_TEST(test_pin_nonexistent);
+  RUN_TEST(test_get_or_create_promotes_existing);
+  RUN_TEST(test_get_or_create_null_lru_and_args);
+  RUN_TEST(test_pin_all_blocks_eviction);
+  RUN_TEST(test_remove_clears_slot_for_reuse);
+  RUN_TEST(test_remove_head_and_tail);
 
   TEST_RESULTS();
 }

@@ -148,7 +148,7 @@ bool fat12_entry_valid(fat12_dirent_t *entry);
 bool fat12_entry_is_end(fat12_dirent_t *entry);
 fat12_err_t fat12_find(fat12_t *fat, const char *filename, fat12_dirent_t *entry);
 
-fat12_err_t fat12_open(fat12_t *fat, fat12_dirent_t *entry, fat12_file_t *file);
+void fat12_open(fat12_t *fat, fat12_dirent_t *entry, fat12_file_t *file);
 fat12_err_t fat12_seek(fat12_file_t *file, uint32_t offset);
 int fat12_read(fat12_file_t *file, uint8_t *buf, size_t len);
 fat12_err_t fat12_read_cluster(fat12_t *fat, uint16_t cluster, uint8_t *buf);

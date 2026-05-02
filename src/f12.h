@@ -11,6 +11,7 @@
 #define F12_MAX_OPEN_FILES 10
 #define F12_CACHE_SIZE 54
 #define F12_CACHE_ENTRY_STRIDE ((sizeof(lru_entry_t) + SECTOR_SIZE + 7u) & ~7u)
+#define F12_CACHE_STORAGE_SIZE (F12_CACHE_SIZE * F12_CACHE_ENTRY_STRIDE)
 
 typedef enum {
   F12_OK = 0,
@@ -73,7 +74,7 @@ struct f12 {
   fat12_t fat;
   lru_t *cache;
   lru_t cache_obj;
-  uint8_t cache_storage[F12_CACHE_SIZE * F12_CACHE_ENTRY_STRIDE];
+  uint8_t cache_storage[F12_CACHE_STORAGE_SIZE];
   track_t track;
 
   f12_file_t files[F12_MAX_OPEN_FILES];

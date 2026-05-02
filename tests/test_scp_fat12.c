@@ -160,7 +160,7 @@ TEST(test_fat12_reads_match_raw) {
         if (entry.size == 0) continue;
 
         fat12_file_t file;
-        if (fat12_open(&fat, &entry, &file) != FAT12_OK) continue;
+        fat12_open(&fat, &entry, &file);
 
         uint8_t *buf = malloc(entry.size);
         uint32_t total = 0;

@@ -21,7 +21,6 @@ typedef struct {
   uint16_t buf_pos;
   uint16_t bytes_expected;
   uint16_t crc;
-  bool overflow;
   uint8_t sync_stage;
 
   uint16_t t_cell;
@@ -46,7 +45,5 @@ void mfm_init(mfm_t *m);
 void mfm_reset(mfm_t *m);
 
 bool mfm_feed(mfm_t *m, uint16_t delta, sector_t *out);
-
-void mfm_print_stats(mfm_t *m);
 
 #endif

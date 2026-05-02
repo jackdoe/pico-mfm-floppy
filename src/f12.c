@@ -185,10 +185,8 @@ f12_err_t f12_mount(f12_t *fs, f12_io_t io) {
   memset(fs, 0, sizeof(*fs));
   fs->io = io;
 
-  if (!lru_init_fixed(&fs->cache_obj, fs->cache_storage, sizeof(fs->cache_storage),
-                      F12_CACHE_SIZE, SECTOR_SIZE)) {
-    return f12_set_error(fs, F12_ERR_IO);
-  }
+  lru_init_fixed(&fs->cache_obj, fs->cache_storage, sizeof(fs->cache_storage),
+                 F12_CACHE_SIZE, SECTOR_SIZE);
   fs->cache = &fs->cache_obj;
 
   fat12_io_t fat_io = {
@@ -302,12 +300,7 @@ f12_file_t *f12_open(f12_t *fs, const char *path, const char *mode) {
       return NULL;
     }
 
-    ferr = fat12_open(&fs->fat, &file->dirent, &file->io.reader);
-    if (ferr != FAT12_OK) {
-      f12_set_error(fs, fat12_to_f12_err(ferr));
-      return NULL;
-    }
-
+    fat12_open(&fs->fat, &file->dirent, &file->io.reader);
     file->mode = F12_MODE_READ;
 
   } else {

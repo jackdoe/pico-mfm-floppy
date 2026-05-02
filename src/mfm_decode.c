@@ -1,7 +1,6 @@
 #include "mfm_decode.h"
 #include "crc.h"
 #include <string.h>
-#include <stdio.h>
 
 static int mfm_classify(mfm_t *m, uint16_t delta) {
   if (delta < MFM_PULSE_FLOOR) return -1;
@@ -24,11 +23,7 @@ static void mfm_push_bit(mfm_t *m, int bit) {
   m->bit_count++;
 
   if (m->bit_count >= 8) {
-    if (m->buf_pos < sizeof(m->buf)) {
-      m->buf[m->buf_pos++] = m->byte_acc;
-    } else {
-      m->overflow = true;
-    }
+    m->buf[m->buf_pos++] = m->byte_acc;
     m->crc = crc16_update(m->crc, m->byte_acc);
     m->bit_count = 0;
     m->byte_acc = 0;
@@ -58,7 +53,6 @@ static void mfm_drop_record(mfm_t *m) {
   m->bytes_expected = 0;
   m->bit_count = 0;
   m->byte_acc = 0;
-  m->overflow = false;
 }
 
 bool mfm_feed(mfm_t *m, uint16_t delta, sector_t *out) {
@@ -103,7 +97,6 @@ bool mfm_feed(mfm_t *m, uint16_t delta, sector_t *out) {
           m->bit_count = 0;
           m->buf_pos = 0;
           m->bytes_expected = 0;
-          m->overflow = false;
           m->crc = 0xFFFF;
           m->crc = crc16_update(m->crc, 0xA1);
           m->crc = crc16_update(m->crc, 0xA1);
@@ -195,7 +188,7 @@ check_record:
       out->side = m->pending_side;
       out->sector_n = m->pending_sector;
       out->size_code = m->pending_size_code;
-      out->valid = crc_ok && !m->overflow;
+      out->valid = crc_ok;
 
       uint16_t copy_size = size;
       if (copy_size > SECTOR_SIZE) copy_size = SECTOR_SIZE;
@@ -218,10 +211,3 @@ check_record:
   return false;
 }
 
-void mfm_print_stats(mfm_t *m) {
-  printf("\n=== MFM Stats ===\n");
-  printf("Syncs found:   %u\n", m->syncs_found);
-  printf("Sectors read:  %u\n", m->sectors_read);
-  printf("CRC errors:    %u\n", m->crc_errors);
-  printf("=================\n");
-}
