@@ -70,6 +70,7 @@ typedef struct {
   uint sm;
   uint offset;
   uint16_t half;
+  bool half_valid;
 } floppy_pio_t;
 
 #define FLOPPY_IDLE_TIMEOUT_MS 20000

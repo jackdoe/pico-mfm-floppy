@@ -1215,6 +1215,48 @@ TEST(test_stat_null_args) {
   f12_unmount(&fs);
 }
 
+TEST(test_fat2_sectors_not_pinned) {
+  vdisk_init(&vdisk);
+  f12_t fs;
+  memset(&fs, 0, sizeof(fs));
+  fs.io = vdisk_f12_io();
+  f12_format(&fs, "PINTEST", true);
+  ASSERT_EQ(f12_mount(&fs, vdisk_f12_io()), F12_OK);
+
+  uint8_t buf[4096];
+  for (int i = 0; i < (int)sizeof(buf); i++) buf[i] = (uint8_t)(i * 31 + 7);
+  f12_file_t *f = f12_open(&fs, "DATA.BIN", "w");
+  ASSERT_NOT_NULL(f);
+  f12_write(f, buf, sizeof(buf));
+  ASSERT_EQ(f12_close(f), F12_OK);
+  f = f12_open(&fs, "DATA.BIN", "r");
+  ASSERT_NOT_NULL(f);
+  f12_read(f, buf, sizeof(buf));
+  f12_close(f);
+
+  uint16_t fat2_lo = fs.fat.fat_start_sector + fs.fat.bpb.sectors_per_fat;
+  uint16_t fat2_hi = fat2_lo + fs.fat.bpb.sectors_per_fat;
+  uint16_t fat1_lo = fs.fat.fat_start_sector;
+
+  lru_t *c = fs.cache;
+  int pinned_fat2 = 0, pinned_fat1 = 0;
+  for (uint32_t i = 0; i < c->max_entries; i++) {
+    lru_entry_t *e = (lru_entry_t *)(c->storage + i * c->entry_stride);
+    if (!e->occupied || !e->pinned) continue;
+    uint8_t track = (e->key >> 16) & 0xFF;
+    uint8_t side = (e->key >> 8) & 0xFF;
+    uint8_t sec = e->key & 0xFF;
+    uint16_t lba = (track * 2 + side) * SECTORS_PER_TRACK + (sec - 1);
+    if (lba >= fat2_lo && lba < fat2_hi) pinned_fat2++;
+    if (lba >= fat1_lo && lba < fat2_lo) pinned_fat1++;
+  }
+
+  ASSERT_EQ(pinned_fat2, 0);
+  ASSERT(pinned_fat1 > 0);
+
+  f12_unmount(&fs);
+}
+
 int main(void) {
   printf("=== F12 High-Level API Tests ===\n\n");
 
@@ -1267,6 +1309,7 @@ int main(void) {
   RUN_TEST(test_open_directory_returns_is_dir);
   RUN_TEST(test_read_propagates_fat_error);
   RUN_TEST(test_stat_null_args);
+  RUN_TEST(test_fat2_sectors_not_pinned);
 
   TEST_RESULTS();
 }

@@ -220,12 +220,13 @@ TEST(test_pio_wrong_side_detection) {
     ASSERT(floppy.stats.wrong_side > 0);
 }
 
-TEST(test_pio_seek_clamps_above_max) {
+TEST(test_pio_seek_rejects_above_max) {
     setup_floppy();
 
+    floppy_seek(&floppy, 10);
     floppy_status_t s = floppy_seek(&floppy, 200);
-    ASSERT_EQ(s, FLOPPY_OK);
-    ASSERT_EQ(floppy_current_track(&floppy), FLOPPY_TRACKS - 1);
+    ASSERT_EQ(s, FLOPPY_ERR_WRONG_TRACK);
+    ASSERT_EQ(floppy_current_track(&floppy), 10);
 }
 
 TEST(test_pio_motor_off_is_idempotent) {
@@ -285,7 +286,7 @@ int main(void) {
     RUN_TEST(test_pio_read_all_track0);
     RUN_TEST(test_pio_f12_mount_and_list);
     RUN_TEST(test_pio_f12_read_file);
-    RUN_TEST(test_pio_seek_clamps_above_max);
+    RUN_TEST(test_pio_seek_rejects_above_max);
     RUN_TEST(test_pio_motor_off_is_idempotent);
     RUN_TEST(test_pio_select_idempotent_no_op);
     RUN_TEST(test_pio_at_track0_and_state);

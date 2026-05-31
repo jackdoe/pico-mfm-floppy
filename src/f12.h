@@ -50,6 +50,7 @@ typedef struct {
   bool (*write)(void *ctx, track_t *track);
   bool (*disk_changed)(void *ctx);
   bool (*write_protected)(void *ctx);
+  fat12_progress_t progress;
   void *ctx;
 } f12_io_t;
 

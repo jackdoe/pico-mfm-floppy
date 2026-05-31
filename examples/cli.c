@@ -13,6 +13,8 @@
 
 // ============== Configuration ==============
 
+#define FW_VERSION "0.2.0"
+
 static floppy_t floppy;
 static f12_t fs;
 static bool mounted;
@@ -74,6 +76,7 @@ static void cmd_starwars(int argc, char **argv);
 static void cmd_diskdump(int argc, char **argv);
 static void cmd_mfmscan(int argc, char **argv);
 static void cmd_reboot(int argc, char **argv);
+static void cmd_version(int argc, char **argv);
 
 // ============== Command Table ==============
 
@@ -110,6 +113,7 @@ static const cmd_entry_t commands[] = {
   {"diskdump",NULL,    cmd_diskdump,false, "diskdump [quiet]",    "Full disk sector scan + retry summary"},
   {"mfmscan", NULL,    cmd_mfmscan, false, "mfmscan",             "MFM signal quality across all tracks"},
   {"reboot",  NULL,    cmd_reboot,  false, "reboot",              "Reboot the Pico"},
+  {"version", "ver",   cmd_version, false, "version",             "Show firmware version and build"},
 };
 
 #define NUM_COMMANDS (sizeof(commands) / sizeof(commands[0]))
@@ -294,17 +298,17 @@ typedef struct {
 static diskdump_stats_t run_diskdump(bool verbose);
 
 static inline bool flux_data_available(void) {
-  return floppy.read.half || !pio_sm_is_rx_fifo_empty(floppy.read.pio, floppy.read.sm);
+  return floppy.read.half_valid || !pio_sm_is_rx_fifo_empty(floppy.read.pio, floppy.read.sm);
 }
 
 static inline uint16_t flux_read_raw(void) {
-  if (floppy.read.half) {
-    uint16_t v = floppy.read.half;
-    floppy.read.half = 0;
-    return v;
+  if (floppy.read.half_valid) {
+    floppy.read.half_valid = false;
+    return floppy.read.half;
   }
   uint32_t pv = pio_sm_get_blocking(floppy.read.pio, floppy.read.sm);
   floppy.read.half = pv >> 16;
+  floppy.read.half_valid = true;
   return pv & 0xffff;
 }
 
@@ -333,7 +337,7 @@ static void read_track_stats(int track, int side, track_stats_t *stats) {
   pio_sm_exec(floppy.read.pio, floppy.read.sm, pio_encode_jmp(floppy.read.offset));
   pio_sm_restart(floppy.read.pio, floppy.read.sm);
   pio_sm_clear_fifos(floppy.read.pio, floppy.read.sm);
-  floppy.read.half = 0;
+  floppy.read.half_valid = false;
   pio_sm_set_enabled(floppy.read.pio, floppy.read.sm, true);
 
   mfm_t mfm;
@@ -1027,6 +1031,16 @@ static void cmd_stat(int argc, char **argv) {
   }
 }
 
+static void format_progress(void *ctx, uint8_t cyl, uint8_t side,
+                            uint16_t done, uint16_t total) {
+  (void)ctx;
+  if (done == 1 || done == total || (done % 4) == 0) {
+    uint32_t pct = total ? (uint32_t)done * 100 / total : 100;
+    printf("  formatting: %u/%u tracks (%lu%%), track %u side %u\n",
+           done, total, (unsigned long)pct, cyl, side);
+  }
+}
+
 static void cmd_format(int argc, char **argv) {
   const char *label = "PICODISK";
   bool full = false;
@@ -1055,6 +1069,7 @@ static void cmd_format(int argc, char **argv) {
   }
 
   setup_io();
+  fs.io.progress = format_progress;
 
   // Need to upcase the label for FAT
   char ulabel[12];
@@ -1282,7 +1297,7 @@ static void cmd_flux(int argc, char **argv) {
   pio_sm_exec(floppy.read.pio, floppy.read.sm, pio_encode_jmp(floppy.read.offset));
   pio_sm_restart(floppy.read.pio, floppy.read.sm);
   pio_sm_clear_fifos(floppy.read.pio, floppy.read.sm);
-  floppy.read.half = 0;
+  floppy.read.half_valid = false;
   pio_sm_set_enabled(floppy.read.pio, floppy.read.sm, true);
 
   // Wait for first transition with timeout
@@ -1520,6 +1535,7 @@ static void cmd_test_full(int argc, char **argv) {
 
   printf("\n--- Phase 2: Full Format and Mount ---\n");
   setup_io();
+  fs.io.progress = format_progress;
   f12_err_t err = f12_format(&fs, "TESTFULL", true);
   check(err == F12_OK, "full format", &pass, &fail);
   if (err != F12_OK) goto done;
@@ -2888,6 +2904,19 @@ static void cmd_mfmscan(int argc, char **argv) {
   printf("\n  Side 0 total: %d unique sectors decoded, %d CRC errors\n", total_sectors, total_crc);
 }
 
+static void cmd_version(int argc, char **argv) {
+  (void)argc; (void)argv;
+#if PICO_RP2040
+  const char *board = "RP2040 (Pico)";
+#else
+  const char *board = "RP2350 (Pico 2)";
+#endif
+  printf("Pico Floppy %s\n", FW_VERSION);
+  printf("  build:     %s %s\n", __DATE__, __TIME__);
+  printf("  board:     %s\n", board);
+  printf("  sys clock: %lu MHz\n", (unsigned long)(clock_get_hz(clk_sys) / 1000000));
+}
+
 static void cmd_reboot(int argc, char **argv) {
   (void)argc; (void)argv;
   printf("Rebooting...\n");
@@ -2909,6 +2938,7 @@ int main(void) {
   sleep_ms(2000);
 
   printf("\r\n\r\n=== Pico Floppy Shell ===\r\n");
+  cmd_version(0, NULL);
 
   floppy = (floppy_t){
     .pins = {

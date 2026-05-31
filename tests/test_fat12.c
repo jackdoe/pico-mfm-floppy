@@ -756,6 +756,43 @@ TEST(test_format_full) {
   ASSERT_EQ(disk.data[2879][0], 0);
 }
 
+static int g_prog_calls;
+static uint16_t g_prog_last_done;
+static uint16_t g_prog_last_total;
+static uint16_t g_prog_prev_done;
+static bool g_prog_monotonic;
+
+static void record_progress(void *ctx, uint8_t cyl, uint8_t side,
+                            uint16_t done, uint16_t total) {
+  (void)ctx; (void)cyl; (void)side;
+  if (done != g_prog_prev_done + 1) g_prog_monotonic = false;
+  g_prog_prev_done = done;
+  g_prog_calls++;
+  g_prog_last_done = done;
+  g_prog_last_total = total;
+}
+
+TEST(test_format_progress_callback) {
+  vdisk_t disk;
+  vdisk_init(&disk);
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write,
+                    .progress = record_progress, .ctx = &disk };
+
+  g_prog_calls = 0; g_prog_prev_done = 0; g_prog_monotonic = true;
+  ASSERT_EQ(fat12_format(io, "PROG", true), FAT12_OK);
+  ASSERT_EQ(g_prog_calls, 160);
+  ASSERT_EQ(g_prog_last_total, 160);
+  ASSERT_EQ(g_prog_last_done, 160);
+  ASSERT(g_prog_monotonic);
+
+  vdisk_init(&disk);
+  g_prog_calls = 0; g_prog_prev_done = 0; g_prog_monotonic = true;
+  ASSERT_EQ(fat12_format(io, "PROG", false), FAT12_OK);
+  ASSERT(g_prog_calls > 0);
+  ASSERT_EQ(g_prog_last_done, g_prog_last_total);
+  ASSERT(g_prog_monotonic);
+}
+
 TEST(test_format_no_label) {
   vdisk_t disk;
   vdisk_init(&disk);
@@ -1724,6 +1761,7 @@ int main(void) {
   printf("\n--- Format Tests ---\n");
   RUN_TEST(test_format_quick);
   RUN_TEST(test_format_full);
+  RUN_TEST(test_format_progress_callback);
   RUN_TEST(test_format_no_label);
   RUN_TEST(test_format_then_init);
   RUN_TEST(test_format_write_read_file);

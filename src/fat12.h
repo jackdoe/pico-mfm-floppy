@@ -10,9 +10,13 @@
 #define FAT12_EXTENSION_LEN 3
 #define FAT12_MAX_CLUSTER_SECTORS 1
 
+typedef void (*fat12_progress_t)(void *ctx, uint8_t cyl, uint8_t side,
+                                 uint16_t done, uint16_t total);
+
 typedef struct {
   bool (*read)(void *ctx, sector_t *sector);
   bool (*write)(void *ctx, track_t *track);
+  fat12_progress_t progress;
   void *ctx;
 } fat12_io_t;
 

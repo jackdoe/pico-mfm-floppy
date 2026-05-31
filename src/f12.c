@@ -40,6 +40,14 @@ static f12_err_t f12_check_writable(f12_t *fs) {
   return F12_OK;
 }
 
+static bool f12_should_pin(const fat12_t *fat, uint16_t lba) {
+  uint16_t first_fat_end = fat->fat_start_sector + fat->bpb.sectors_per_fat;
+  uint16_t root_end = fat->root_dir_start_sector + fat->root_dir_sectors;
+  if (lba < first_fat_end) return true;
+  if (lba >= fat->root_dir_start_sector && lba < root_end) return true;
+  return false;
+}
+
 static bool f12_cached_read(void *ctx, sector_t *sector) {
   f12_t *fs = (f12_t *)ctx;
 
@@ -65,13 +73,12 @@ static bool f12_cached_read(void *ctx, sector_t *sector) {
     if (!fs->io.read_track(fs->io.ctx, track)) {
       goto read_sector;
     }
-    uint16_t pin_limit = fs->fat.root_dir_start_sector + fs->fat.root_dir_sectors;
     for (int i = 0; i < SECTORS_PER_TRACK; i++) {
       if (track->sectors[i].valid) {
         uint32_t k = lru_key(track->track, track->side, i + 1);
         lru_set(fs->cache, k, track->sectors[i].data);
         uint16_t lba = fat12_chs_to_lba(&fs->fat.bpb, track->track, track->side, i + 1);
-        if (lba < pin_limit) {
+        if (f12_should_pin(&fs->fat, lba)) {
           lru_pin(fs->cache, k);
         }
       }
@@ -92,7 +99,7 @@ read_sector:
   if (sector->valid) {
     lru_set(fs->cache, key, sector->data);
     uint16_t lba = fat12_chs_to_lba(&fs->fat.bpb, sector->track, sector->side, sector->sector_n);
-    if (lba < fs->fat.root_dir_start_sector + fs->fat.root_dir_sectors) {
+    if (f12_should_pin(&fs->fat, lba)) {
       lru_pin(fs->cache, key);
     }
   }
@@ -237,6 +244,7 @@ f12_err_t f12_format(f12_t *fs, const char *label, bool full) {
   fat12_io_t fat_io = {
     .read = fs->io.read,
     .write = fs->io.write,
+    .progress = fs->io.progress,
     .ctx = fs->io.ctx,
   };
 

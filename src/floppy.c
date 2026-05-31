@@ -72,12 +72,17 @@ static bool floppy_idle_timer_callback(struct repeating_timer *t) {
   return true;
 }
 
-static void floppy_prepare(floppy_t *f) {
+static void floppy_touch(floppy_t *f) {
   if (!f->auto_motor) return;
-
   uint32_t saved = save_and_disable_interrupts();
   f->last_io_time_ms = to_ms_since_boot(get_absolute_time());
   restore_interrupts(saved);
+}
+
+static void floppy_prepare(floppy_t *f) {
+  if (!f->auto_motor) return;
+
+  floppy_touch(f);
   floppy_select(f, true);
   floppy_motor_on(f);
 }
@@ -92,17 +97,17 @@ static void gpio_put_oc(uint pin, bool value) {
 }
 
 static inline bool flux_data_available(floppy_t *f) {
-  return f->read.half || !pio_sm_is_rx_fifo_empty(f->read.pio, f->read.sm);
+  return f->read.half_valid || !pio_sm_is_rx_fifo_empty(f->read.pio, f->read.sm);
 }
 
 static inline uint16_t flux_read(floppy_t *f) {
-  if (f->read.half) {
-    uint16_t v = f->read.half;
-    f->read.half = 0;
-    return v;
+  if (f->read.half_valid) {
+    f->read.half_valid = false;
+    return f->read.half;
   }
   uint32_t pv = pio_sm_get_blocking(f->read.pio, f->read.sm);
   f->read.half = pv >> 16;
+  f->read.half_valid = true;
   return pv & 0xffff;
 }
 
@@ -122,7 +127,7 @@ static void floppy_flux_read_start(floppy_t *f) {
   pio_sm_set_enabled(f->read.pio, f->read.sm, false);
   pio_sm_clear_fifos(f->read.pio, f->read.sm);
   pio_sm_restart(f->read.pio, f->read.sm);
-  f->read.half = 0;
+  f->read.half_valid = false;
   pio_sm_exec(f->read.pio, f->read.sm, pio_encode_set(pio_x, 0));
   pio_sm_set_enabled(f->read.pio, f->read.sm, true);
 }
@@ -230,6 +235,7 @@ static void floppy_stats_record_failure(floppy_t *f, floppy_status_t status) {
 }
 
 static floppy_status_t floppy_jog(floppy_t *f, uint8_t track, uint8_t distance) {
+  floppy_touch(f);
   uint8_t away = (track <= distance) ? track + distance : track - distance;
   floppy_status_t status = floppy_seek(f, away);
   if (status != FLOPPY_OK) return status;
@@ -245,6 +251,7 @@ typedef bool (*sector_callback_t)(sector_t *sector, void *ctx);
 
 static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
                                         sector_callback_t cb, void *ctx) {
+  floppy_touch(f);
   floppy_status_t status = floppy_seek(f, track);
   if (status != FLOPPY_OK) {
     return status;
@@ -305,6 +312,26 @@ static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
   return res;
 }
 
+static floppy_status_t floppy_read_recover(floppy_t *f, int track, int side,
+                                           sector_callback_t cb, void *ctx) {
+  floppy_status_t res = floppy_read_flux(f, track, side, cb, ctx);
+  if (res == FLOPPY_OK || !floppy_status_retryable(res)) return res;
+
+  static const uint8_t jog_distance[] = {10, 20};
+  for (unsigned i = 0; i < sizeof(jog_distance); i++) {
+    f->stats.retries++;
+    res = floppy_jog(f, track, jog_distance[i]);
+    if (res != FLOPPY_OK) return res;
+    res = floppy_read_flux(f, track, side, cb, ctx);
+    if (res == FLOPPY_OK) {
+      f->stats.recovered++;
+      return res;
+    }
+    if (!floppy_status_retryable(res)) return res;
+  }
+  return res;
+}
+
 struct complete_track_ctx {
   track_t *t;
 };
@@ -331,24 +358,10 @@ static floppy_status_t floppy_complete_track(floppy_t *f, track_t *t) {
 
 need_read:;
   struct complete_track_ctx ctx = { .t = t };
-  uint8_t target = t->track;
-
-  floppy_status_t res = floppy_read_flux(f, target, t->side, complete_track_cb, &ctx);
-  if (res == FLOPPY_OK) return res;
-  if (!floppy_status_retryable(res)) return res;
-
-  res = floppy_jog(f, target, 10);
-  if (res != FLOPPY_OK) return res;
-  res = floppy_read_flux(f, target, t->side, complete_track_cb, &ctx);
-  if (res == FLOPPY_OK) return res;
-  if (!floppy_status_retryable(res)) return res;
-
-  res = floppy_jog(f, target, 20);
-  if (res != FLOPPY_OK) return res;
-  res = floppy_read_flux(f, target, t->side, complete_track_cb, &ctx);
+  floppy_status_t res = floppy_read_recover(f, t->track, t->side, complete_track_cb, &ctx);
 
   if (res == FLOPPY_ERR_TIMEOUT) {
-    FLOPPY_ERR("[floppy] timeout reading track %d side %d, missing sectors:", target, t->side);
+    FLOPPY_ERR("[floppy] timeout reading track %d side %d, missing sectors:", t->track, t->side);
     for (int i = 0; i < SECTORS_PER_TRACK; i++) {
       if (!t->sectors[i].valid) {
         FLOPPY_ERR(" %d", i + 1);
@@ -373,16 +386,6 @@ static bool read_sector_cb(sector_t *sector, void *ctx) {
   return false;
 }
 
-static floppy_status_t floppy_read_internal(floppy_t *f, int track, int side, int sector_n, sector_t *out) {
-  struct read_sector_ctx ctx = { .sector_n = sector_n, .out = out };
-  floppy_status_t res = floppy_read_flux(f, track, side, read_sector_cb, &ctx);
-
-  if (res == FLOPPY_ERR_TIMEOUT) {
-    FLOPPY_ERR("[floppy] timeout reading track %d side %d sector %d\n", track, side, sector_n);
-  }
-  return res;
-}
-
 void floppy_init(floppy_t *f) {
   uint inputs[] = {f->pins.index, f->pins.track0, f->pins.write_protect,
                    f->pins.read_data, f->pins.disk_change};
@@ -404,7 +407,7 @@ void floppy_init(floppy_t *f) {
   f->read.pio = pio0;
   f->read.offset = pio_add_program(f->read.pio, &flux_read_program);
   f->read.sm = pio_claim_unused_sm(f->read.pio, true);
-  f->read.half = 0;
+  f->read.half_valid = false;
   flux_read_program_init(f->read.pio, f->read.sm, f->read.offset,
                          f->pins.read_data, f->pins.index);
 
@@ -415,7 +418,7 @@ void floppy_init(floppy_t *f) {
   f->write.pio = pio1;
   f->write.offset = pio_add_program(f->write.pio, &flux_write_program);
   f->write.sm = pio_claim_unused_sm(f->write.pio, true);
-  f->write.half = 0;
+  f->write.half_valid = false;
   flux_write_program_init(f->write.pio, f->write.sm, f->write.offset, f->pins.write_data);
 
   f->track = 0;
@@ -456,7 +459,7 @@ void floppy_set_density(floppy_t *f, bool hd) {
 
 floppy_status_t floppy_seek(floppy_t *f, uint8_t target) {
   if (target >= FLOPPY_TRACKS) {
-    target = FLOPPY_TRACKS - 1;
+    return FLOPPY_ERR_WRONG_TRACK;
   }
 
   if (!f->track0_confirmed) {
@@ -501,41 +504,16 @@ floppy_stats_t floppy_stats(floppy_t *f) {
 floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector) {
   sector->valid = false;
   floppy_prepare(f);
-  uint8_t target = sector->track;
   f->stats.reads++;
 
-  floppy_status_t st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
-  if (st == FLOPPY_OK) return st;
-  if (!floppy_status_retryable(st)) {
-    floppy_stats_record_failure(f, st);
-    return st;
-  }
+  struct read_sector_ctx ctx = { .sector_n = sector->sector_n, .out = sector };
+  floppy_status_t st = floppy_read_recover(f, sector->track, sector->side, read_sector_cb, &ctx);
 
-  f->stats.retries++;
-  st = floppy_jog(f, target, 10);
-  if (st != FLOPPY_OK) {
-    floppy_stats_record_failure(f, st);
-    return st;
+  if (st == FLOPPY_ERR_TIMEOUT) {
+    FLOPPY_ERR("[floppy] timeout reading track %d side %d sector %d\n",
+               sector->track, sector->side, sector->sector_n);
   }
-  st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
-  if (st == FLOPPY_OK) {
-    f->stats.recovered++;
-    return st;
-  }
-  if (!floppy_status_retryable(st)) {
-    floppy_stats_record_failure(f, st);
-    return st;
-  }
-
-  f->stats.retries++;
-  st = floppy_jog(f, target, 20);
-  if (st != FLOPPY_OK) {
-    floppy_stats_record_failure(f, st);
-    return st;
-  }
-  st = floppy_read_internal(f, target, sector->side, sector->sector_n, sector);
-  if (st == FLOPPY_OK) f->stats.recovered++;
-  else floppy_stats_record_failure(f, st);
+  if (st != FLOPPY_OK) floppy_stats_record_failure(f, st);
   return st;
 }
 
@@ -608,9 +586,11 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
 
     struct verify_ctx vctx = { .expected = t };
     for (int verify = 0; verify < 3; verify++) {
-      status = floppy_jog(f, t->track, 10);
-      if (status != FLOPPY_OK) {
-        return status;
+      if (verify > 0) {
+        status = floppy_jog(f, t->track, 10);
+        if (status != FLOPPY_OK) {
+          return status;
+        }
       }
 
       floppy_status_t verify_status =
