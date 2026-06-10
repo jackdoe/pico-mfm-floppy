@@ -414,7 +414,7 @@ static fat12_err_t fat12_write_batch_add(fat12_write_batch_t *batch, uint16_t lb
   return FAT12_OK;
 }
 
-static fat12_err_t fat12_write_batch_flush(fat12_t *fat) {
+static fat12_err_t fat12_write_batch_flush_from(fat12_t *fat, uint16_t min_lba) {
   fat12_write_batch_t *batch = &fat->batch;
   if (batch->count == 0) return FAT12_OK;
 
@@ -432,9 +432,12 @@ static fat12_err_t fat12_write_batch_flush(fat12_t *fat) {
     memcpy(batch->data[j + 1], tmp, SECTOR_SIZE);
   }
 
-  while (batch->count > 0) {
+  uint8_t keep = 0;
+  while (keep < batch->count && batch->lbas[keep] < min_lba) keep++;
+
+  while (batch->count > keep) {
     uint8_t c, h, s;
-    fat12_lba_to_chs(&fat->bpb, batch->lbas[0], &c, &h, &s);
+    fat12_lba_to_chs(&fat->bpb, batch->lbas[keep], &c, &h, &s);
 
     track_t *track = &fat->write_track;
     memset(track, 0, sizeof(*track));
@@ -448,8 +451,8 @@ static fat12_err_t fat12_write_batch_flush(fat12_t *fat) {
       track->sectors[i].valid = false;
     }
 
-    uint8_t new_count = 0;
-    for (uint8_t i = 0; i < batch->count; i++) {
+    uint8_t new_count = keep;
+    for (uint8_t i = keep; i < batch->count; i++) {
       uint8_t bc, bh, bs;
       fat12_lba_to_chs(&fat->bpb, batch->lbas[i], &bc, &bh, &bs);
 
@@ -476,11 +479,18 @@ static fat12_err_t fat12_write_batch_flush(fat12_t *fat) {
   return FAT12_OK;
 }
 
+static fat12_err_t fat12_write_batch_flush(fat12_t *fat) {
+  return fat12_write_batch_flush_from(fat, 0);
+}
+
 static fat12_err_t fat12_write_sector_batched(fat12_t *fat,
                                               uint16_t lba, const uint8_t *data) {
   fat12_err_t err = fat12_write_batch_add(&fat->batch, lba, data);
   if (err == FAT12_ERR_FULL) {
-    err = fat12_write_batch_flush(fat);
+    err = fat12_write_batch_flush_from(fat, fat->data_start_sector);
+    if (err == FAT12_OK && fat->batch.count >= FAT12_WRITE_BATCH_MAX) {
+      err = fat12_write_batch_flush(fat);
+    }
     if (err != FAT12_OK) return err;
     return fat12_write_batch_add(&fat->batch, lba, data);
   }

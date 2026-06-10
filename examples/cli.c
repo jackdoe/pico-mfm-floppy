@@ -2800,7 +2800,7 @@ static void cmd_rpm(int argc, char **argv) {
 static void cmd_selftest4(int argc, char **argv) {
   (void)argc; (void)argv;
 
-  printf("This will FORMAT the disk and test fsck against a simulated power-loss leak.\n");
+  printf("This will FORMAT the disk and test fsck against an abandoned write and physical FAT corruption.\n");
   printf("Continue? [y/N] ");
 
   char line[CMD_BUF_SIZE];
@@ -2863,23 +2863,50 @@ static void cmd_selftest4(int argc, char **argv) {
     printf("  power cut simulated: writer abandoned, close never ran\n");
   }
 
-  printf("\n--- Phase 3: Detect ---\n");
+  printf("\n--- Phase 3: Abandoned Write Leaks Nothing ---\n");
   fat12_fsck_t report;
   check(f12_fsck(&fs, &report, false) == F12_OK, "fsck check runs", &pass, &fail);
   print_fsck_report(&report);
-  check(report.lost_clusters > 0, "leak detected on real media", &pass, &fail);
+  check(!fsck_dirty(&report), "no leak after abandoned write", &pass, &fail);
   check(f12_stat(&fs, "GHOST.BIN", &(f12_stat_t){0}) == F12_ERR_NOT_FOUND,
         "GHOST.BIN has no dirent", &pass, &fail);
-  uint16_t lost = report.lost_clusters;
+  check(count_free_clusters() == free_before, "free clusters unchanged", &pass, &fail);
 
-  printf("\n--- Phase 4: Repair ---\n");
-  check(f12_fsck(&fs, &report, true) == F12_OK && report.freed == lost,
-        "fsck fix frees the leak", &pass, &fail);
+  printf("\n--- Phase 4: Physical FAT Corruption ---\n");
+  f12_unmount(&fs);
+  mounted = false;
+  track_t *t = &fs.fat.write_track;
+  memset(t, 0, sizeof(*t));
+  t->track = 0;
+  t->side = 0;
+  check(floppy_read_track(&floppy, t) == FLOPPY_OK, "read FAT track from media", &pass, &fail);
+  t->sectors[1].data[150] = 0x65;
+  t->sectors[1].data[151] = 0xF0;
+  t->sectors[1].data[152] = 0xFF;
+  check(floppy_write_track(&floppy, t) == FLOPPY_OK,
+        "write orphan chain 100->101->EOF into FAT1 on media", &pass, &fail);
+
+  err = do_mount();
+  check(err == F12_OK, "remount damaged disk", &pass, &fail);
+  if (err != F12_OK) return;
+  mounted = true;
+
+  printf("\n--- Phase 5: Detect ---\n");
+  check(f12_fsck(&fs, &report, false) == F12_OK, "fsck check runs", &pass, &fail);
+  print_fsck_report(&report);
+  check(report.lost_clusters == 2, "orphan chain detected on real media", &pass, &fail);
+  check(report.fat_mismatch, "FAT copy mismatch detected", &pass, &fail);
+  check(report.freed == 0, "check mode modifies nothing", &pass, &fail);
+
+  printf("\n--- Phase 6: Repair ---\n");
+  check(f12_fsck(&fs, &report, true) == F12_OK && report.freed == 2,
+        "fsck fix frees the orphan chain", &pass, &fail);
+  check(report.repaired_fat2, "FAT2 rewritten from FAT1", &pass, &fail);
   check(f12_fsck(&fs, &report, false) == F12_OK && !fsck_dirty(&report),
         "fsck clean after fix", &pass, &fail);
   check(count_free_clusters() == free_before, "free clusters fully restored", &pass, &fail);
 
-  printf("\n--- Phase 5: Survivors Intact After Remount ---\n");
+  printf("\n--- Phase 7: Survivors Intact After Remount ---\n");
   f12_unmount(&fs);
   mounted = false;
   err = do_mount();

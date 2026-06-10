@@ -932,6 +932,8 @@ TEST(test_fsck_through_f12) {
   memset(&fs, 0, sizeof(fs));
   fs.io = vdisk_f12_io();
   f12_format(&fs, "T", false);
+  vdisk_set_fat_entry(&vdisk, 5, 6);
+  vdisk_set_fat_entry(&vdisk, 6, 0xFFF);
   f12_mount(&fs, vdisk_f12_io());
 
   static uint8_t data[30000];
@@ -944,7 +946,7 @@ TEST(test_fsck_through_f12) {
 
   fat12_fsck_t report;
   ASSERT_EQ(f12_fsck(&fs, &report, false), F12_OK);
-  ASSERT(report.lost_clusters > 0);
+  ASSERT_EQ(report.lost_clusters, 2);
   ASSERT_EQ(report.freed, 0);
 
   vdisk.write_protected = true;
@@ -1356,6 +1358,46 @@ TEST(test_fat2_sectors_not_pinned) {
   f12_unmount(&fs);
 }
 
+TEST(test_large_write_avoids_cylinder_zero) {
+  vdisk_format_valid(&vdisk);
+
+  f12_t fs;
+  memset(&fs, 0, sizeof(fs));
+  ASSERT_EQ(f12_mount(&fs, vdisk_f12_io()), F12_OK);
+
+  uint8_t buf[SECTOR_SIZE];
+  f12_file_t *pad = f12_open(&fs, "PAD.BIN", "w");
+  ASSERT_NOT_NULL(pad);
+  memset(buf, 0x11, sizeof(buf));
+  for (int i = 0; i < 6; i++) {
+    ASSERT_EQ(f12_write(pad, buf, sizeof(buf)), (int)sizeof(buf));
+  }
+  ASSERT_EQ(f12_close(pad), F12_OK);
+
+  int before = vdisk.cyl_writes[0];
+
+  f12_file_t *f = f12_open(&fs, "BIG.BIN", "w");
+  ASSERT_NOT_NULL(f);
+  for (int i = 0; i < 96; i++) {
+    memset(buf, (uint8_t)i, sizeof(buf));
+    ASSERT_EQ(f12_write(f, buf, sizeof(buf)), (int)sizeof(buf));
+  }
+  ASSERT_EQ(f12_close(f), F12_OK);
+
+  ASSERT(vdisk.cyl_writes[0] - before <= 2);
+
+  f = f12_open(&fs, "BIG.BIN", "r");
+  ASSERT_NOT_NULL(f);
+  for (int i = 0; i < 96; i++) {
+    ASSERT_EQ(f12_read(f, buf, sizeof(buf)), (int)sizeof(buf));
+    ASSERT_EQ(buf[0], (uint8_t)i);
+    ASSERT_EQ(buf[SECTOR_SIZE - 1], (uint8_t)i);
+  }
+  ASSERT_EQ(f12_close(f), F12_OK);
+
+  f12_unmount(&fs);
+}
+
 int main(void) {
   printf("=== F12 High-Level API Tests ===\n\n");
 
@@ -1376,6 +1418,7 @@ int main(void) {
   RUN_TEST(test_file_not_found);
   RUN_TEST(test_large_file);
   RUN_TEST(test_large_single_call_io);
+  RUN_TEST(test_large_write_avoids_cylinder_zero);
   RUN_TEST(test_multiple_small_writes);
   RUN_TEST(test_single_byte_writes);
   RUN_TEST(test_rpc_chunk_writes);

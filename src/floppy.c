@@ -55,6 +55,10 @@
 #define FLOPPY_WRITE_FLUX_TIMEOUT_MS 1000
 #endif
 
+#ifndef FLOPPY_STEP_MS
+#define FLOPPY_STEP_MS 6
+#endif
+
 #define FLOPPY_FLUX_DMA_COUNT 0x0FFFFFFFu
 
 void floppy_pin_oc(uint pin, bool value) {
@@ -106,7 +110,7 @@ static inline uint32_t flux_ring_produced(floppy_t *f) {
 }
 
 static inline bool flux_data_available(floppy_t *f) {
-  return f->read.half_valid || flux_ring_produced(f) != f->ring_consumed;
+  return f->read.half_valid || flux_ring_produced(f) != f->ring_cpu;
 }
 
 static inline uint16_t flux_read(floppy_t *f) {
@@ -116,17 +120,17 @@ static inline uint16_t flux_read(floppy_t *f) {
   }
 
   uint32_t produced = flux_ring_produced(f);
-  uint32_t lag = produced - f->ring_consumed;
+  uint32_t lag = produced - f->ring_cpu;
   if (lag > FLOPPY_FLUX_RING_WORDS) {
     f->stats.overruns++;
-    f->ring_consumed = produced - FLOPPY_FLUX_RING_WORDS / 2;
+    f->ring_cpu = produced - FLOPPY_FLUX_RING_WORDS / 2;
     lag = FLOPPY_FLUX_RING_WORDS;
   }
   if (lag > f->stats.ring_peak) f->stats.ring_peak = lag;
   f->stats.flux_words++;
 
-  uint32_t pv = f->flux_ring[f->ring_consumed & (FLOPPY_FLUX_RING_WORDS - 1)];
-  f->ring_consumed++;
+  uint32_t pv = f->flux_ring[f->ring_cpu & (FLOPPY_FLUX_RING_WORDS - 1)];
+  f->ring_cpu++;
   f->read.half = pv >> 16;
   f->read.half_valid = true;
   return pv & 0xffff;
@@ -151,7 +155,7 @@ static void floppy_flux_read_start(floppy_t *f) {
   pio_sm_restart(f->read.pio, f->read.sm);
   f->read.half_valid = false;
   f->read.primed = false;
-  f->ring_consumed = 0;
+  f->ring_cpu = 0;
   pio_sm_exec(f->read.pio, f->read.sm, pio_encode_set(pio_x, 0));
 
   dma_channel_config c = dma_channel_get_default_config(f->dma_ch);
@@ -260,7 +264,7 @@ static void floppy_step(floppy_t *f, int direction) {
   sleep_us(10);
   floppy_pin_oc(f->pins.step, 1);
 
-  sleep_ms(10);
+  sleep_ms(FLOPPY_STEP_MS);
 
   if (direction == DIR_INWARD && f->track < FLOPPY_TRACKS - 1) {
     f->track++;
@@ -479,7 +483,7 @@ void floppy_init(floppy_t *f) {
   flux_write_program_init(f->write.pio, f->write.sm, f->write.offset, f->pins.write_data);
 
   f->dma_ch = dma_claim_unused_channel(true);
-  f->ring_consumed = 0;
+  f->ring_cpu = 0;
 
   f->track = 0;
   f->track0_confirmed = false;
@@ -599,6 +603,64 @@ static bool verify_track_cb(sector_t *sector, void *ctx) {
   return true;
 }
 
+typedef struct {
+  floppy_t *f;
+  floppy_status_t status;
+  bool started;
+} flux_tx_t;
+
+static inline uint32_t flux_tx_consumed(floppy_t *f) {
+  return FLOPPY_FLUX_DMA_COUNT - dma_channel_hw_addr(f->dma_ch)->transfer_count;
+}
+
+static floppy_status_t flux_tx_begin(floppy_t *f) {
+  if (!floppy_wait_for_index(f)) {
+    return FLOPPY_ERR_TIMEOUT;
+  }
+  floppy_flux_write_start(f);
+
+  dma_channel_config c = dma_channel_get_default_config(f->dma_ch);
+  channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+  channel_config_set_read_increment(&c, true);
+  channel_config_set_write_increment(&c, false);
+  channel_config_set_ring(&c, false, FLOPPY_FLUX_RING_BITS);
+  channel_config_set_dreq(&c, pio_get_dreq(f->write.pio, f->write.sm, true));
+  dma_channel_configure(f->dma_ch, &c, &f->write.pio->txf[f->write.sm], f->flux_ring,
+                        FLOPPY_FLUX_DMA_COUNT, true);
+  return FLOPPY_OK;
+}
+
+static void flux_tx_emit(void *ctx, uint8_t pulse) {
+  flux_tx_t *tx = (flux_tx_t *)ctx;
+  floppy_t *f = tx->f;
+  if (tx->status != FLOPPY_OK) return;
+  uint8_t *ring = (uint8_t *)f->flux_ring;
+
+  if (!tx->started) {
+    if (f->ring_cpu < FLOPPY_FLUX_RING_BYTES) {
+      ring[f->ring_cpu++] = pulse;
+      return;
+    }
+    tx->status = flux_tx_begin(f);
+    if (tx->status != FLOPPY_OK) return;
+    tx->started = true;
+  }
+
+  if (f->ring_cpu - flux_tx_consumed(f) >= FLOPPY_FLUX_RING_BYTES) {
+    uint32_t start_ms = to_ms_since_boot(get_absolute_time());
+    while (f->ring_cpu - flux_tx_consumed(f) >= FLOPPY_FLUX_RING_BYTES) {
+      if ((uint32_t)(to_ms_since_boot(get_absolute_time()) - start_ms) >= FLOPPY_WRITE_FLUX_TIMEOUT_MS) {
+        tx->status = FLOPPY_ERR_TIMEOUT;
+        return;
+      }
+      tight_loop_contents();
+    }
+  }
+
+  ring[f->ring_cpu & (FLOPPY_FLUX_RING_BYTES - 1)] = pulse;
+  f->ring_cpu++;
+}
+
 floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
   if (floppy_write_protected(f)) {
     FLOPPY_ERR("[floppy] write track %d side %d: disk is write protected\n", t->track, t->side);
@@ -610,14 +672,6 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
   floppy_status_t status = floppy_complete_track(f, t);
   if (status != FLOPPY_OK) {
     return status;
-  }
-
-  mfm_encode_t enc;
-  mfm_encode_init(&enc, f->flux_buf, sizeof(f->flux_buf));
-  mfm_encode_track(&enc, t);
-  if (enc.overflow) {
-    FLOPPY_ERR("[floppy] encode overflow track %d side %d\n", t->track, t->side);
-    return FLOPPY_ERR_ENCODE_OVERFLOW;
   }
 
   for (int attempt = 0; attempt < FLOPPY_WRITE_ATTEMPTS; attempt++) {
@@ -633,32 +687,36 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
       return status;
     }
     floppy_side_select(f, t->side);
-    if (!floppy_wait_for_index(f)) {
-      return FLOPPY_ERR_TIMEOUT;
+
+    flux_tx_t tx = { .f = f, .status = FLOPPY_OK, .started = false };
+    f->ring_cpu = 0;
+    mfm_encode_t enc;
+    mfm_encode_init_emit(&enc, flux_tx_emit, &tx);
+    mfm_encode_track(&enc, t);
+
+    if (tx.status == FLOPPY_OK && !tx.started) {
+      tx.status = flux_tx_begin(f);
+      if (tx.status == FLOPPY_OK) tx.started = true;
     }
-    floppy_flux_write_start(f);
 
-    dma_channel_config c = dma_channel_get_default_config(f->dma_ch);
-    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-    channel_config_set_read_increment(&c, true);
-    channel_config_set_write_increment(&c, false);
-    channel_config_set_dreq(&c, pio_get_dreq(f->write.pio, f->write.sm, true));
-    dma_channel_configure(f->dma_ch, &c, &f->write.pio->txf[f->write.sm],
-                          f->flux_buf, enc.pos, true);
-
-    uint32_t start_ms = to_ms_since_boot(get_absolute_time());
-    bool fed = true;
-    while (dma_channel_is_busy(f->dma_ch)) {
-      if ((uint32_t)(to_ms_since_boot(get_absolute_time()) - start_ms) >= FLOPPY_WRITE_FLUX_TIMEOUT_MS) {
-        dma_channel_abort(f->dma_ch);
-        fed = false;
-        break;
+    if (tx.status == FLOPPY_OK) {
+      uint32_t start_ms = to_ms_since_boot(get_absolute_time());
+      while (flux_tx_consumed(f) != f->ring_cpu) {
+        if ((uint32_t)(to_ms_since_boot(get_absolute_time()) - start_ms) >= FLOPPY_WRITE_FLUX_TIMEOUT_MS) {
+          tx.status = FLOPPY_ERR_TIMEOUT;
+          break;
+        }
+        tight_loop_contents();
       }
-      tight_loop_contents();
     }
 
-    bool drained = floppy_flux_write_stop(f);
-    if (!fed || !drained) {
+    dma_channel_abort(f->dma_ch);
+    bool drained = tx.started ? floppy_flux_write_stop(f) : false;
+    if (tx.status != FLOPPY_OK) {
+      FLOPPY_ERR("[floppy] write flux track %d side %d failed: %d\n", t->track, t->side, tx.status);
+      return tx.status;
+    }
+    if (!drained) {
       return FLOPPY_ERR_TIMEOUT;
     }
     f->stats.dma_writes++;

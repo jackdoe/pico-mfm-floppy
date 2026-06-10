@@ -15,7 +15,7 @@ Application
 f12 API ──── open / read / write / seek / delete / rename / readdir / fsck
     │
     ▼
-LRU Cache ── 54 sectors (3 tracks)
+LRU Cache ── 128 sectors (7 tracks)
     │
     ▼
 FAT12 ────── BPB, FAT tables, directories, cluster chains, batched writes
@@ -90,7 +90,6 @@ set(PICO_BOARD pico2)   # RP2350
 ```
 
 RP2040 differences (handled automatically via `#if PICO_RP2040`):
-- MFM flux buffer: 110 KB (vs 200 KB on RP2350)
 - System clock: overclocked to 144 MHz so PIO dividers are exact integers (read: 144/72 = 2, write: 144/24 = 6), avoiding the massive jitter from fractional dividers with `div_int=1` at 125 MHz
 
 Tests (host-side, no hardware needed):
@@ -100,7 +99,7 @@ Tests (host-side, no hardware needed):
 
 ## Key Features
 
-**DMA flux transfer** — reads stream through a DMA ring buffer (~6ms of IRQ tolerance instead of the RX FIFO's ~50µs), writes are DMA-fed from the encode buffer. Interrupt latency (USB, timers) can no longer drop flux samples or underrun the write stream. Ring overruns are counted in drive stats.
+**DMA flux transfer** — reads and writes both stream through one 4KB DMA ring buffer (~6ms of IRQ tolerance instead of the FIFOs' ~50µs). Writes are encoded live into the ring while DMA feeds the drive — no track-sized encode buffer exists, saving 110-200KB of RAM. Write precompensation is applied in the streaming emit path, byte-identical to the old buffered pass. Interrupt latency (USB, timers) can no longer drop flux samples or underrun the write stream; ring overruns are counted in drive stats.
 
 **Adaptive MFM timing** — the decoder measures preamble pulse widths before each sector and calibrates classification thresholds dynamically. Handles ±8% drive speed variation (professional controllers required ±5%).
 
@@ -110,20 +109,20 @@ Tests (host-side, no hardware needed):
 
 **Explicit fsck, read-only mount** — mounting never modifies the disk. `fsck` detects lost clusters, broken chains, cross-linked files, and FAT copy mismatches; `fsck fix` frees lost chains, terminates broken ones, and rewrites FAT2 from FAT1. The CLI warns after mount if the filesystem is dirty.
 
-**Batch-aware FAT writes** — the write batch system coalesces sector writes by track and deduplicates FAT sector updates in-place, minimizing physical I/O. The free cluster search reads through the batch to see pending FAT updates, avoiding unnecessary flushes.
+**Batch-aware FAT writes** — the write batch system coalesces sector writes by track and deduplicates FAT sector updates in-place, minimizing physical I/O. The free cluster search reads through the batch to see pending FAT updates, avoiding unnecessary flushes. When the batch fills mid-write, only data-track sectors are evicted — FAT and root-directory sectors stay resident until the commit point, eliminating the seek-to-track-0 round trip per batch and leaving the on-disk FAT clean if power is lost before close.
 
 **Shared write batch** — a single 18KB write batch in `fat12_t` is shared across all writers, eliminating 166KB of wasted memory from per-file-handle batch storage.
 
 ## Testing
 
-267 unit tests, 12,001 fuzz iterations, 100 SCP roundtrip fuzz iterations, 200 fsck convergence fuzz iterations. Tested against real 1994 floppy disks. Tests run for both RP2040 and RP2350 configurations. CI runs the full suite under AddressSanitizer/UBSan and builds firmware for both boards.
+271 unit tests, 12,001 fuzz iterations, 100 SCP roundtrip fuzz iterations, 200 fsck convergence fuzz iterations. Tested against real 1994 floppy disks. Tests run for both RP2040 and RP2350 configurations. CI runs the full suite under AddressSanitizer/UBSan and builds firmware for both boards.
 
 ```
 tests/
 ├── test_lru.c            32 tests: cache operations, eviction, edge cases
-├── test_mfm.c            15 tests: encode/decode roundtrip, all byte patterns
-├── test_fat12.c          82 tests: filesystem operations, format, rename, fsck, cluster chains
-├── test_f12.c            53 tests: high-level API, directory listing, seek, rename, fsck
+├── test_mfm.c            17 tests: encode/decode roundtrip, all byte patterns, streaming precomp identity
+├── test_fat12.c          83 tests: filesystem operations, format, rename, fsck, cluster chains
+├── test_f12.c            54 tests: high-level API, directory listing, seek, rename, fsck
 ├── test_robustness.c     29 tests: corrupt BPB, invalid pulses, truncated sectors
 ├── test_fuzz.c           12,001 iterations: random pulses, corrupt disks, FAT chaos
 ├── test_flux_sim.c        9 tests: synthetic flux + real SCP decode (all 9 disks)

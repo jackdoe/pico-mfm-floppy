@@ -9,7 +9,9 @@
 #include "lru.h"
 
 #define F12_MAX_OPEN_FILES 10
-#define F12_CACHE_SIZE 54
+#ifndef F12_CACHE_SIZE
+#define F12_CACHE_SIZE 128
+#endif
 #define F12_CACHE_ENTRY_STRIDE ((sizeof(lru_entry_t) + SECTOR_SIZE + 7u) & ~7u)
 #define F12_CACHE_STORAGE_SIZE (F12_CACHE_SIZE * F12_CACHE_ENTRY_STRIDE)
 

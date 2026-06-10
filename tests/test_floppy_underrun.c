@@ -47,22 +47,23 @@ static void fill_track(track_t *track) {
   }
 }
 
-TEST(test_write_track_aborts_on_encode_overflow) {
+TEST(test_write_track_times_out_on_tx_underrun) {
   setup_floppy();
+  sim_drive.tx_stall = true;
 
   track_t track;
   fill_track(&track);
 
-  ASSERT_EQ(floppy_write_track(&floppy, &track), FLOPPY_ERR_ENCODE_OVERFLOW);
+  ASSERT_EQ(floppy_write_track(&floppy, &track), FLOPPY_ERR_TIMEOUT);
   ASSERT_EQ(sim_drive.write_capture_count, 0);
 
   pio_sim_free(&sim_drive);
 }
 
 int main(void) {
-  printf("=== Floppy Overflow Tests ===\n\n");
+  printf("=== Floppy TX Underrun Tests ===\n\n");
 
-  RUN_TEST(test_write_track_aborts_on_encode_overflow);
+  RUN_TEST(test_write_track_times_out_on_tx_underrun);
 
   TEST_RESULTS();
 }

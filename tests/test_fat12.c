@@ -1942,7 +1942,7 @@ TEST(test_fsck_repairs_fat2) {
   ASSERT(!fat2.fat_mismatch);
 }
 
-TEST(test_fsck_reclaims_abandoned_write) {
+TEST(test_abandoned_write_leaves_disk_clean) {
   vdisk_t disk;
   vdisk_format_valid(&disk);
 
@@ -1960,6 +1960,59 @@ TEST(test_fsck_reclaims_abandoned_write) {
   ASSERT_EQ(fat12_open_write(&fat, "GHOST.BIN", &w), FAT12_OK);
   ASSERT_EQ(fat12_write(&w, data, sizeof(data)), (int)sizeof(data));
   fat12_abort_write(&fat);
+
+  uint16_t free_after = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free_after), FAT12_OK);
+  ASSERT_EQ(free_after, free_before);
+
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT_EQ(report.lost_clusters, 0);
+  ASSERT_EQ(report.broken_chains, 0);
+
+  fat12_dirent_t e;
+  ASSERT_EQ(fat12_find(&fat, "GHOST.BIN", &e), FAT12_ERR_NOT_FOUND);
+}
+
+typedef struct {
+  vdisk_t *disk;
+  bool armed;
+  bool tripped;
+} trip_vdisk_t;
+
+static bool trip_vdisk_read(void *ctx, sector_t *sector) {
+  return vdisk_read(((trip_vdisk_t *)ctx)->disk, sector);
+}
+
+static bool trip_vdisk_write(void *ctx, track_t *track) {
+  trip_vdisk_t *io = (trip_vdisk_t *)ctx;
+  if (io->armed && track->track == 0 && track->side == 1) io->tripped = true;
+  if (io->tripped) return false;
+  return vdisk_write(io->disk, track);
+}
+
+TEST(test_fsck_reclaims_interrupted_commit) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  trip_vdisk_t tio = { .disk = &disk };
+  fat12_t fat;
+  fat12_io_t io = { .read = trip_vdisk_read, .write = trip_vdisk_write, .ctx = &tio };
+  fat12_init(&fat, io);
+
+  uint16_t free_before = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free_before), FAT12_OK);
+
+  static uint8_t data[30000];
+  memset(data, 0xEE, sizeof(data));
+
+  fat12_writer_t w;
+  ASSERT_EQ(fat12_open_write(&fat, "GHOST.BIN", &w), FAT12_OK);
+  ASSERT_EQ(fat12_write(&w, data, sizeof(data)), (int)sizeof(data));
+  tio.armed = true;
+  ASSERT_EQ(fat12_close_write(&w), FAT12_ERR_WRITE);
+  tio.armed = false;
+  tio.tripped = false;
 
   uint16_t free_leaked = 0;
   ASSERT_EQ(fat12_free_count(&fat, &free_leaked), FAT12_OK);
@@ -2481,7 +2534,8 @@ int main(void) {
   RUN_TEST(test_fsck_broken_chain);
   RUN_TEST(test_fsck_crosslink_reported_not_freed);
   RUN_TEST(test_fsck_repairs_fat2);
-  RUN_TEST(test_fsck_reclaims_abandoned_write);
+  RUN_TEST(test_abandoned_write_leaves_disk_clean);
+  RUN_TEST(test_fsck_reclaims_interrupted_commit);
   RUN_TEST(test_fsck_walks_subdirectories);
   RUN_TEST(test_fsck_nested_subdirectories);
   RUN_TEST(test_fsck_incomplete_disables_freeing);

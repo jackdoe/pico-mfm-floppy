@@ -69,12 +69,12 @@ target_include_directories(test_write_verify PRIVATE ${STUBS} ${SRCDIR})
 target_compile_definitions(test_write_verify PRIVATE FLOPPY_DEBUG=0)
 add_test(NAME test_write_verify COMMAND test_write_verify)
 
-add_executable(test_floppy_overflow test_floppy_overflow.c pio_sim.c ${SRCS} ${SRCDIR}/floppy.c)
-target_include_directories(test_floppy_overflow PRIVATE ${STUBS} ${SRCDIR})
-target_compile_definitions(test_floppy_overflow PRIVATE
+add_executable(test_floppy_underrun test_floppy_underrun.c pio_sim.c ${SRCS} ${SRCDIR}/floppy.c)
+target_include_directories(test_floppy_underrun PRIVATE ${STUBS} ${SRCDIR})
+target_compile_definitions(test_floppy_underrun PRIVATE
     FLOPPY_DEBUG=0
-    FLOPPY_FLUX_BUF_SIZE=64)
-add_test(NAME test_floppy_overflow COMMAND test_floppy_overflow)
+    FLOPPY_WRITE_FLUX_TIMEOUT_MS=5)
+add_test(NAME test_floppy_underrun COMMAND test_floppy_underrun)
 
 add_executable(test_floppy_timeouts test_floppy_timeouts.c pio_sim.c ${SRCS} ${SRCDIR}/floppy.c)
 target_include_directories(test_floppy_timeouts PRIVATE ${STUBS} ${SRCDIR})

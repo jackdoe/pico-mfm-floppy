@@ -15,6 +15,7 @@ typedef struct {
   int read_count;
   int write_count;
   int track_writes;
+  int cyl_writes[VDISK_TRACKS];
   bool write_protected;
   bool disk_changed;
 } vdisk_t;
@@ -65,6 +66,7 @@ static bool vdisk_write(void *ctx, track_t *track) {
   }
   disk->write_count += SECTORS_PER_TRACK;
   disk->track_writes++;
+  if (track->track < VDISK_TRACKS) disk->cyl_writes[track->track]++;
   return true;
 }
 

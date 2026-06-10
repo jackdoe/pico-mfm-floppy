@@ -265,9 +265,13 @@ void pio_sm_put_blocking(PIO pio, uint sm, uint32_t data) {
 
 typedef struct {
     bool read_active;
+    bool write_active;
     uint32_t *ring;
     uint32_t ring_mask;
     uint32_t ring_pos;
+    const uint8_t *tx_ring;
+    uint32_t tx_mask;
+    uint32_t tx_consumed;
     dma_channel_hw_t hw;
 } sim_dma_t;
 
@@ -285,28 +289,30 @@ void dma_channel_configure(uint channel, const dma_channel_config *config,
 
     if (config->ring_write) {
         sim_dma.read_active = true;
+        sim_dma.write_active = false;
         sim_dma.ring = (uint32_t *)write_addr;
         sim_dma.ring_mask = ((1u << config->ring_bits) / 4) - 1;
         sim_dma.ring_pos = 0;
         sim_dma.hw.transfer_count = transfer_count;
     } else {
-        const uint8_t *src = (const uint8_t *)read_addr;
-        for (uint i = 0; i < transfer_count; i++) {
-            pio_sim_capture_byte(src[i]);
-        }
+        sim_dma.write_active = true;
         sim_dma.read_active = false;
-        sim_dma.hw.transfer_count = 0;
+        sim_dma.tx_ring = (const uint8_t *)read_addr;
+        sim_dma.tx_mask = (1u << config->ring_bits) - 1;
+        sim_dma.tx_consumed = 0;
+        sim_dma.hw.transfer_count = transfer_count;
     }
 }
 
 bool dma_channel_is_busy(uint channel) {
     (void)channel;
-    return sim_dma.read_active;
+    return sim_dma.read_active || sim_dma.write_active;
 }
 
 void dma_channel_abort(uint channel) {
     (void)channel;
     sim_dma.read_active = false;
+    sim_dma.write_active = false;
 }
 
 dma_channel_hw_t *dma_channel_hw_addr(uint channel) {
@@ -315,11 +321,19 @@ dma_channel_hw_t *dma_channel_hw_addr(uint channel) {
     if (sim_dma.read_active && g_drive && g_drive->read_buf &&
         g_drive->read_count > 0 && sim_dma.hw.transfer_count > 0 &&
         pio_sim_floppy_ref &&
-        sim_dma.ring_pos - pio_sim_floppy_ref->ring_consumed < 4) {
+        sim_dma.ring_pos - pio_sim_floppy_ref->ring_cpu < 4) {
         uint16_t lo = pio_sim_next_sample();
         uint16_t hi = pio_sim_next_sample();
         sim_dma.ring[sim_dma.ring_pos & sim_dma.ring_mask] = ((uint32_t)hi << 16) | lo;
         sim_dma.ring_pos++;
+        sim_dma.hw.transfer_count--;
+    }
+
+    if (sim_dma.write_active && g_drive && !g_drive->tx_stall &&
+        pio_sim_floppy_ref && sim_dma.hw.transfer_count > 0 &&
+        sim_dma.tx_consumed != pio_sim_floppy_ref->ring_cpu) {
+        pio_sim_capture_byte(sim_dma.tx_ring[sim_dma.tx_consumed & sim_dma.tx_mask]);
+        sim_dma.tx_consumed++;
         sim_dma.hw.transfer_count--;
     }
 

@@ -19,16 +19,27 @@
 #define MFM_PRECOMP_SHIFT 3
 #define MFM_PRECOMP_START_TRACK 40
 
+typedef void (*mfm_emit_fn)(void *ctx, uint8_t pulse);
+
 typedef struct {
     uint8_t *buf;
     size_t size;
     size_t pos;
+    mfm_emit_fn emit;
+    void *emit_ctx;
     int prev_bit;
     int pending_cells;
     bool overflow;
+    int precomp_shift;
+    uint8_t held;
+    uint8_t last_out;
+    bool held_valid;
+    bool held_first;
 } mfm_encode_t;
 
 void mfm_encode_init(mfm_encode_t *e, uint8_t *buf, size_t size);
+
+void mfm_encode_init_emit(mfm_encode_t *e, mfm_emit_fn emit, void *ctx);
 
 void mfm_encode_bytes(mfm_encode_t *e, const uint8_t *data, size_t len);
 

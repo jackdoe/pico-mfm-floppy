@@ -18,6 +18,6 @@ done
 ./test_pio_sim
 ./test_pio_emu
 ./test_write_verify
-./test_floppy_overflow
+./test_floppy_underrun
 ./test_floppy_timeouts
 ./test_e2e_corruption

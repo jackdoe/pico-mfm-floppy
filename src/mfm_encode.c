@@ -2,12 +2,38 @@
 #include "crc.h"
 #include <string.h>
 
-static void mfm_encode_pulse(mfm_encode_t *e, uint8_t timing) {
-    if (e->pos < e->size) {
+static void mfm_encode_out(mfm_encode_t *e, uint8_t timing) {
+    if (e->emit) {
+        e->emit(e->emit_ctx, timing);
+        e->pos++;
+    } else if (e->pos < e->size) {
         e->buf[e->pos++] = timing;
     } else {
         e->overflow = true;
     }
+}
+
+static void mfm_encode_pulse(mfm_encode_t *e, uint8_t timing) {
+    if (!e->precomp_shift) {
+        mfm_encode_out(e, timing);
+        return;
+    }
+    if (!e->held_valid) {
+        e->held = timing;
+        e->held_valid = true;
+        return;
+    }
+    uint8_t out = e->held;
+    if (!e->held_first && out == MFM_PULSE_SHORT) {
+        bool prev_long = (e->last_out == MFM_PULSE_LONG);
+        bool next_long = (timing == MFM_PULSE_LONG);
+        if (prev_long && !next_long) out -= e->precomp_shift;
+        else if (next_long && !prev_long) out += e->precomp_shift;
+    }
+    mfm_encode_out(e, out);
+    e->last_out = out;
+    e->held = timing;
+    e->held_first = false;
 }
 
 static void mfm_encode_emit(mfm_encode_t *e) {
@@ -22,12 +48,15 @@ static void mfm_encode_emit(mfm_encode_t *e) {
 }
 
 void mfm_encode_init(mfm_encode_t *e, uint8_t *buf, size_t size) {
+    memset(e, 0, sizeof(*e));
     e->buf = buf;
     e->size = size;
-    e->pos = 0;
-    e->prev_bit = 0;
-    e->pending_cells = 0;
-    e->overflow = false;
+}
+
+void mfm_encode_init_emit(mfm_encode_t *e, mfm_emit_fn emit, void *ctx) {
+    memset(e, 0, sizeof(*e));
+    e->emit = emit;
+    e->emit_ctx = ctx;
 }
 
 void mfm_encode_bytes(mfm_encode_t *e, const uint8_t *data, size_t len) {
@@ -104,20 +133,13 @@ void mfm_encode_sector(mfm_encode_t *e, const sector_t *s) {
     mfm_encode_bytes(e, data_crc_bytes, 2);
 }
 
-static void mfm_encode_precomp(uint8_t *buf, size_t len, uint8_t track) {
-    if (len < 3) return;
-    int shift = MFM_PRECOMP_SHIFT + (track - MFM_PRECOMP_START_TRACK) / 13;
-    for (size_t i = 1; i < len - 1; i++) {
-        if (buf[i] != MFM_PULSE_SHORT) continue;
-        bool prev_long = (buf[i - 1] == MFM_PULSE_LONG);
-        bool next_long = (buf[i + 1] == MFM_PULSE_LONG);
-        if (prev_long && next_long) continue;
-        if (prev_long) buf[i] -= shift;
-        else if (next_long) buf[i] += shift;
-    }
-}
-
 size_t mfm_encode_track(mfm_encode_t *e, const track_t *t) {
+    if (t->track >= MFM_PRECOMP_START_TRACK) {
+        e->precomp_shift = MFM_PRECOMP_SHIFT + (t->track - MFM_PRECOMP_START_TRACK) / 13;
+        e->held_valid = false;
+        e->held_first = true;
+    }
+
     mfm_encode_gap(e, 80);
 
     for (int i = 0; i < SECTORS_PER_TRACK; i++) {
@@ -126,8 +148,12 @@ size_t mfm_encode_track(mfm_encode_t *e, const track_t *t) {
         mfm_encode_gap(e, 54);
     }
 
-    if (t->track >= MFM_PRECOMP_START_TRACK) {
-        mfm_encode_precomp(e->buf, e->pos, t->track);
+    if (e->precomp_shift) {
+        e->precomp_shift = 0;
+        if (e->held_valid) {
+            mfm_encode_out(e, e->held);
+            e->held_valid = false;
+        }
     }
 
     return e->pos;

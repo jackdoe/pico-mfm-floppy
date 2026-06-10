@@ -11,16 +11,9 @@
 #define FLOPPY_TRACKS 80
 #define SECTORS_PER_TRACK 18
 
-#ifndef FLOPPY_FLUX_BUF_SIZE
-#if PICO_RP2040
-#define FLOPPY_FLUX_BUF_SIZE 110000
-#else
-#define FLOPPY_FLUX_BUF_SIZE 200000
-#endif
-#endif
-
 #define FLOPPY_FLUX_RING_BITS 12
-#define FLOPPY_FLUX_RING_WORDS (1u << (FLOPPY_FLUX_RING_BITS - 2))
+#define FLOPPY_FLUX_RING_BYTES (1u << FLOPPY_FLUX_RING_BITS)
+#define FLOPPY_FLUX_RING_WORDS (FLOPPY_FLUX_RING_BYTES / 4)
 
 typedef struct {
   uint8_t track;
@@ -64,7 +57,6 @@ typedef enum {
   FLOPPY_ERR_TIMEOUT,
   FLOPPY_ERR_NO_TRACK0,
   FLOPPY_ERR_WRITE_PROTECTED,
-  FLOPPY_ERR_ENCODE_OVERFLOW,
   FLOPPY_ERR_VERIFY,
 } floppy_status_t;
 
@@ -102,7 +94,7 @@ struct floppy {
   floppy_pio_t read;
   floppy_pio_t write;
   int dma_ch;
-  uint32_t ring_consumed;
+  uint32_t ring_cpu;
 
   uint8_t track;
   bool track0_confirmed;
@@ -113,7 +105,6 @@ struct floppy {
   bool auto_motor;
   volatile uint32_t last_io_time_ms;
   struct repeating_timer idle_timer;
-  uint8_t flux_buf[FLOPPY_FLUX_BUF_SIZE];
   floppy_stats_t stats;
 };
 

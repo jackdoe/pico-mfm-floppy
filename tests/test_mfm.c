@@ -516,6 +516,92 @@ TEST(test_roundtrip_full_track) {
     }
 }
 
+static void reference_precomp(uint8_t *buf, size_t len, uint8_t track) {
+    if (len < 3) return;
+    int shift = MFM_PRECOMP_SHIFT + (track - MFM_PRECOMP_START_TRACK) / 13;
+    for (size_t i = 1; i < len - 1; i++) {
+        if (buf[i] != MFM_PULSE_SHORT) continue;
+        bool prev_long = (buf[i - 1] == MFM_PULSE_LONG);
+        bool next_long = (buf[i + 1] == MFM_PULSE_LONG);
+        if (prev_long && next_long) continue;
+        if (prev_long) buf[i] -= shift;
+        else if (next_long) buf[i] += shift;
+    }
+}
+
+static void build_random_track(track_t *trk, uint8_t track, uint32_t seed) {
+    memset(trk, 0, sizeof(*trk));
+    trk->track = track;
+    trk->side = 1;
+    for (int s = 0; s < SECTORS_PER_TRACK; s++) {
+        trk->sectors[s].track = track;
+        trk->sectors[s].side = 1;
+        trk->sectors[s].sector_n = s + 1;
+        trk->sectors[s].valid = true;
+        for (int i = 0; i < SECTOR_SIZE; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            trk->sectors[s].data[i] = seed >> 24;
+        }
+    }
+}
+
+TEST(test_streaming_precomp_matches_reference_post_pass) {
+    static uint8_t expected[200000], actual[200000];
+
+    for (int tn = MFM_PRECOMP_START_TRACK; tn < FLOPPY_TRACKS; tn += 13) {
+        track_t trk;
+        build_random_track(&trk, tn, 0xC0FFEE + tn);
+
+        mfm_encode_t e;
+        mfm_encode_init(&e, expected, sizeof(expected));
+        mfm_encode_gap(&e, 80);
+        for (int s = 0; s < SECTORS_PER_TRACK; s++) {
+            mfm_encode_sector(&e, &trk.sectors[s]);
+            mfm_encode_gap(&e, 54);
+        }
+        size_t raw_len = e.pos;
+        reference_precomp(expected, raw_len, tn);
+
+        mfm_encode_init(&e, actual, sizeof(actual));
+        size_t len = mfm_encode_track(&e, &trk);
+
+        ASSERT_EQ(len, raw_len);
+        ASSERT(memcmp(expected, actual, len) == 0);
+    }
+}
+
+typedef struct {
+    uint8_t *buf;
+    size_t pos;
+} emit_capture_t;
+
+static void emit_capture(void *ctx, uint8_t pulse) {
+    emit_capture_t *c = (emit_capture_t *)ctx;
+    c->buf[c->pos++] = pulse;
+}
+
+TEST(test_emit_mode_matches_linear_mode) {
+    static uint8_t linear[200000], streamed[200000];
+
+    int tracks[] = {5, 70};
+    for (unsigned i = 0; i < sizeof(tracks) / sizeof(tracks[0]); i++) {
+        track_t trk;
+        build_random_track(&trk, tracks[i], 0xBEEF + tracks[i]);
+
+        mfm_encode_t e;
+        mfm_encode_init(&e, linear, sizeof(linear));
+        size_t linear_len = mfm_encode_track(&e, &trk);
+
+        emit_capture_t cap = { .buf = streamed, .pos = 0 };
+        mfm_encode_init_emit(&e, emit_capture, &cap);
+        size_t streamed_len = mfm_encode_track(&e, &trk);
+
+        ASSERT_EQ(streamed_len, linear_len);
+        ASSERT_EQ(cap.pos, linear_len);
+        ASSERT(memcmp(linear, streamed, linear_len) == 0);
+    }
+}
+
 int main(void) {
     printf("=== MFM Encoder/Decoder Tests ===\n\n");
 
@@ -534,6 +620,8 @@ int main(void) {
     RUN_TEST(test_roundtrip_with_jitter);
     RUN_TEST(test_roundtrip_stress_patterns);
     RUN_TEST(test_roundtrip_full_track);
+    RUN_TEST(test_streaming_precomp_matches_reference_post_pass);
+    RUN_TEST(test_emit_mode_matches_linear_mode);
 
     TEST_RESULTS();
 }
