@@ -98,6 +98,7 @@ int f12_read_at(f12_file_t *file, uint32_t offset, void *buf, size_t len);
 
 f12_err_t f12_stat(f12_t *fs, const char *path, f12_stat_t *stat);
 f12_err_t f12_delete(f12_t *fs, const char *path);
+f12_err_t f12_rename(f12_t *fs, const char *from, const char *to);
 
 f12_err_t f12_opendir(f12_t *fs, const char *path, f12_dir_t *dir);
 f12_err_t f12_readdir(f12_dir_t *dir, f12_stat_t *stat);

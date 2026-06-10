@@ -1,5 +1,6 @@
 #include "pio_sim.h"
 #include "flux_sim.h"
+#include "hardware/dma.h"
 #include "../src/floppy.h"
 #include "../src/mfm_encode.h"
 #include <stdlib.h>
@@ -246,8 +247,7 @@ bool pio_sm_is_tx_fifo_empty(PIO pio, uint sm) {
     return true;
 }
 
-void pio_sm_put_blocking(PIO pio, uint sm, uint32_t data) {
-    (void)pio; (void)sm;
+static void pio_sim_capture_byte(uint8_t byte) {
     if (!g_drive) return;
 
     if (g_drive->write_capture_count >= g_drive->write_capture_capacity) {
@@ -255,7 +255,75 @@ void pio_sm_put_blocking(PIO pio, uint sm, uint32_t data) {
         g_drive->write_capture = realloc(g_drive->write_capture, cap);
         g_drive->write_capture_capacity = cap;
     }
-    g_drive->write_capture[g_drive->write_capture_count++] = data & 0xFF;
+    g_drive->write_capture[g_drive->write_capture_count++] = byte;
+}
+
+void pio_sm_put_blocking(PIO pio, uint sm, uint32_t data) {
+    (void)pio; (void)sm;
+    pio_sim_capture_byte(data & 0xFF);
+}
+
+typedef struct {
+    bool read_active;
+    uint32_t *ring;
+    uint32_t ring_mask;
+    uint32_t ring_pos;
+    dma_channel_hw_t hw;
+} sim_dma_t;
+
+static sim_dma_t sim_dma;
+
+int dma_claim_unused_channel(bool required) {
+    (void)required;
+    return 0;
+}
+
+void dma_channel_configure(uint channel, const dma_channel_config *config,
+                           volatile void *write_addr, const volatile void *read_addr,
+                           uint transfer_count, bool trigger) {
+    (void)channel; (void)trigger;
+
+    if (config->ring_write) {
+        sim_dma.read_active = true;
+        sim_dma.ring = (uint32_t *)write_addr;
+        sim_dma.ring_mask = ((1u << config->ring_bits) / 4) - 1;
+        sim_dma.ring_pos = 0;
+        sim_dma.hw.transfer_count = transfer_count;
+    } else {
+        const uint8_t *src = (const uint8_t *)read_addr;
+        for (uint i = 0; i < transfer_count; i++) {
+            pio_sim_capture_byte(src[i]);
+        }
+        sim_dma.read_active = false;
+        sim_dma.hw.transfer_count = 0;
+    }
+}
+
+bool dma_channel_is_busy(uint channel) {
+    (void)channel;
+    return sim_dma.read_active;
+}
+
+void dma_channel_abort(uint channel) {
+    (void)channel;
+    sim_dma.read_active = false;
+}
+
+dma_channel_hw_t *dma_channel_hw_addr(uint channel) {
+    (void)channel;
+
+    if (sim_dma.read_active && g_drive && g_drive->read_buf &&
+        g_drive->read_count > 0 && sim_dma.hw.transfer_count > 0 &&
+        pio_sim_floppy_ref &&
+        sim_dma.ring_pos - pio_sim_floppy_ref->ring_consumed < 4) {
+        uint16_t lo = pio_sim_next_sample();
+        uint16_t hi = pio_sim_next_sample();
+        sim_dma.ring[sim_dma.ring_pos & sim_dma.ring_mask] = ((uint32_t)hi << 16) | lo;
+        sim_dma.ring_pos++;
+        sim_dma.hw.transfer_count--;
+    }
+
+    return &sim_dma.hw;
 }
 
 static pio_hw_t pio0_hw = { .id = 0 };

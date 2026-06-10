@@ -25,6 +25,9 @@ static uint8_t disk_modified[2880][512];
 static uint8_t disk_roundtrip[2880][512];
 static vdisk_t shared_vdisk;
 static vdisk_t shared_vdisk2;
+static char renamed_src[13];
+static uint32_t renamed_size;
+static uint32_t renamed_checksum;
 
 static void decode_scp_to_image(uint8_t *scp_data, size_t scp_size,
                                  uint8_t image[2880][512]) {
@@ -222,6 +225,57 @@ TEST(test_f12_heavy_modifications) {
     f12_stat(&fs, "CYB.CFG", &stat);
     ASSERT_EQ(stat.size, (uint32_t)strlen(new_cfg));
 
+    f12_dir_t scan;
+    f12_opendir(&fs, "/", &scan);
+    renamed_src[0] = '\0';
+    while (f12_readdir(&scan, &stat) == F12_OK) {
+        if (strcmp(stat.name, "README.SS") == 0) continue;
+        if (strcmp(stat.name, "CYB.CFG") == 0) continue;
+        if (strcmp(stat.name, "INSTALL.EXE") == 0) continue;
+        if (strcmp(stat.name, "BASE.LZH") == 0) continue;
+        if (strcmp(stat.name, "HELLO.TXT") == 0) continue;
+        if (strcmp(stat.name, "BIG.DAT") == 0) continue;
+        if (strcmp(stat.name, "TINY.BIN") == 0) continue;
+        if (strcmp(stat.name, "EMPTY.TXT") == 0) continue;
+        if (stat.size == 0 || stat.size > 200000) continue;
+        strcpy(renamed_src, stat.name);
+        renamed_size = stat.size;
+        break;
+    }
+    f12_closedir(&scan);
+    ASSERT(renamed_src[0] != '\0');
+
+    f = f12_open(&fs, renamed_src, "r");
+    ASSERT(f != NULL);
+    uint8_t *victim_before = malloc(renamed_size);
+    uint32_t got = f12_read_full(f, victim_before, renamed_size);
+    ASSERT_EQ(f12_close(f), F12_OK);
+    ASSERT_EQ(got, renamed_size);
+    renamed_checksum = checksum_buf(victim_before, renamed_size);
+
+    ASSERT_EQ(f12_rename(&fs, renamed_src, "RENAMED.OLD"), F12_OK);
+    printf("  [RENAME] %s -> RENAMED.OLD (%u bytes, 0x%08X)\n",
+           renamed_src, renamed_size, renamed_checksum);
+
+    ASSERT_EQ(f12_stat(&fs, renamed_src, &stat), F12_ERR_NOT_FOUND);
+    ASSERT_EQ(f12_stat(&fs, "RENAMED.OLD", &stat), F12_OK);
+    ASSERT_EQ(stat.size, renamed_size);
+
+    f = f12_open(&fs, "RENAMED.OLD", "r");
+    ASSERT(f != NULL);
+    uint8_t *victim_after = malloc(renamed_size);
+    got = f12_read_full(f, victim_after, renamed_size);
+    ASSERT_EQ(f12_close(f), F12_OK);
+    ASSERT_EQ(got, renamed_size);
+    ASSERT_MEM_EQ(victim_before, victim_after, renamed_size);
+    free(victim_before);
+    free(victim_after);
+
+    ASSERT_EQ(f12_rename(&fs, "HELLO.TXT", "GREET.TXT"), F12_OK);
+    printf("  [RENAME] HELLO.TXT -> GREET.TXT\n");
+    ASSERT_EQ(f12_rename(&fs, "GREET.TXT", "CYB.CFG"), F12_ERR_EXISTS);
+    ASSERT_EQ(f12_rename(&fs, "HELLO.TXT", "AGAIN.TXT"), F12_ERR_NOT_FOUND);
+
     printf("\n  --- Verify all modifications in vdisk ---\n");
 
     f = f12_open(&fs, "README.SS", "r");
@@ -242,14 +296,14 @@ TEST(test_f12_heavy_modifications) {
     ASSERT_EQ(err, F12_ERR_NOT_FOUND);
     printf("  SHOCKGUS.BAT: confirmed deleted\n");
 
-    f = f12_open(&fs, "HELLO.TXT", "r");
+    f = f12_open(&fs, "GREET.TXT", "r");
     ASSERT(f != NULL);
     char hello_buf[256] = {0};
     t = f12_read_full(f, hello_buf, sizeof(hello_buf));
     ASSERT_EQ(f12_close(f), F12_OK);
     ASSERT_EQ(t, (uint32_t)strlen(hello));
     ASSERT(memcmp(hello_buf, hello, strlen(hello)) == 0);
-    printf("  HELLO.TXT: content verified\n");
+    printf("  GREET.TXT: content verified (was HELLO.TXT)\n");
 
     f = f12_open(&fs, "BIG.DAT", "r");
     ASSERT(f != NULL);
@@ -379,16 +433,31 @@ TEST(test_verify_all_after_roundtrip) {
     ASSERT_EQ(f12_stat(&fs, "SHOCKGUS.BAT", &stat), F12_ERR_NOT_FOUND);
     printf("  SHOCKGUS.BAT: confirmed deleted\n");
 
-    f = f12_open(&fs, "HELLO.TXT", "r");
+    ASSERT_EQ(f12_stat(&fs, "HELLO.TXT", &stat), F12_ERR_NOT_FOUND);
+    f = f12_open(&fs, "GREET.TXT", "r");
     ASSERT(f != NULL);
-    f12_stat(&fs, "HELLO.TXT", &stat);
+    f12_stat(&fs, "GREET.TXT", &stat);
     char *hello = malloc(stat.size + 1);
     t = f12_read_full(f, hello, stat.size);
     ASSERT_EQ(f12_close(f), F12_OK);
     hello[t] = '\0';
     ASSERT(strstr(hello, "floppy controller") != NULL);
-    printf("  HELLO.TXT: content survived (%u bytes)\n", t);
+    printf("  GREET.TXT: content survived rename (%u bytes)\n", t);
     free(hello);
+
+    ASSERT_EQ(f12_stat(&fs, renamed_src, &stat), F12_ERR_NOT_FOUND);
+    f = f12_open(&fs, "RENAMED.OLD", "r");
+    ASSERT(f != NULL);
+    f12_stat(&fs, "RENAMED.OLD", &stat);
+    ASSERT_EQ(stat.size, renamed_size);
+    uint8_t *renamed = malloc(renamed_size);
+    t = f12_read_full(f, renamed, renamed_size);
+    ASSERT_EQ(f12_close(f), F12_OK);
+    ASSERT_EQ(t, renamed_size);
+    ASSERT_EQ(checksum_buf(renamed, t), renamed_checksum);
+    printf("  RENAMED.OLD: %u bytes, checksum 0x%08X verified (was %s)\n",
+           t, renamed_checksum, renamed_src);
+    free(renamed);
 
     f = f12_open(&fs, "BIG.DAT", "r");
     ASSERT(f != NULL);
@@ -905,6 +974,7 @@ TEST(test_fuzz_roundtrip) {
 
     int total_files_created = 0;
     int total_files_deleted = 0;
+    int total_files_renamed = 0;
     int total_files_verified = 0;
     int total_roundtrips = 0;
 
@@ -979,13 +1049,26 @@ TEST(test_fuzz_roundtrip) {
                 }
                 total_files_created++;
 
-            } else if (action < 9 && mc > 0) {
+            } else if (action < 8 && mc > 0) {
                 int victim = fuzz_rand() % mc;
                 f12_err_t err = f12_delete(&fs, manifest[victim].name);
                 if (err == F12_OK) {
                     manifest[victim] = manifest[mc - 1];
                     mc--;
                     total_files_deleted++;
+                }
+            } else if (mc > 0) {
+                int victim = fuzz_rand() % mc;
+                char newname[13];
+                fuzz_rand_name(newname);
+
+                f12_err_t err = f12_rename(&fs, manifest[victim].name, newname);
+                if (err == F12_OK) {
+                    memset(manifest[victim].name, 0, 13);
+                    strncpy(manifest[victim].name, newname, 12);
+                    total_files_renamed++;
+                } else {
+                    ASSERT_EQ(err, F12_ERR_EXISTS);
                 }
             }
         }
@@ -1069,6 +1152,7 @@ TEST(test_fuzz_roundtrip) {
     printf("  Roundtrips:      %d\n", total_roundtrips);
     printf("  Files created:   %d\n", total_files_created);
     printf("  Files deleted:   %d\n", total_files_deleted);
+    printf("  Files renamed:   %d\n", total_files_renamed);
     printf("  Files verified:  %d\n", total_files_verified);
     printf("  Seed: %u\n  ", fuzz_seed);
 

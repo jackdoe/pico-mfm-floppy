@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.13)
-#set(PICO_BOARD pico2)
+set(PICO_BOARD pico)
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 
 project(floppy C CXX ASM)
@@ -30,6 +30,7 @@ target_link_libraries(floppy_lib INTERFACE
     pico_stdlib
     hardware_gpio
     hardware_pio
+    hardware_dma
     hardware_clocks
 )
 

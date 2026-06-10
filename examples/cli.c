@@ -167,12 +167,7 @@ static uint32_t f12_read_full(f12_file_t *f, void *buf, uint32_t max_len) {
 
 static uint16_t count_free_clusters(void) {
   uint16_t free_clusters = 0;
-  for (uint16_t c = 2; c < fs.fat.total_clusters + 2; c++) {
-    uint16_t next;
-    if (fat12_get_entry(&fs.fat, c, &next) == FAT12_OK && next == 0) {
-      free_clusters++;
-    }
-  }
+  fat12_free_count(&fs.fat, &free_clusters);
   return free_clusters;
 }
 
@@ -297,34 +292,19 @@ typedef struct {
 
 static diskdump_stats_t run_diskdump(bool verbose);
 
-static inline bool flux_data_available(void) {
-  return floppy.read.half_valid || !pio_sm_is_rx_fifo_empty(floppy.read.pio, floppy.read.sm);
-}
-
-static inline uint16_t flux_read_raw(void) {
-  if (floppy.read.half_valid) {
-    floppy.read.half_valid = false;
-    return floppy.read.half;
+static void print_drive_stats(const floppy_stats_t *s) {
+  printf("  Sector reads:  %lu\n", s->reads);
+  printf("  Flux words:    %lu\n", s->flux_words);
+  printf("  Track writes:  %lu (DMA)\n", s->dma_writes);
+  printf("  Read retries:  %lu attempts, %lu recovered, %lu failed\n",
+         s->retries, s->recovered, s->failed);
+  if (s->timeout || s->wrong_track || s->wrong_side) {
+    printf("  Retry causes:  timeout=%lu wrong_track=%lu wrong_side=%lu\n",
+           s->timeout, s->wrong_track, s->wrong_side);
   }
-  uint32_t pv = pio_sm_get_blocking(floppy.read.pio, floppy.read.sm);
-  floppy.read.half = pv >> 16;
-  floppy.read.half_valid = true;
-  return pv & 0xffff;
-}
-
-static inline uint16_t flux_read_wait(void) {
-  while (!flux_data_available()) {
-    tight_loop_contents();
-  }
-  return flux_read_raw();
-}
-
-static void gpio_put_oc(uint pin, bool value) {
-  if (value == 0) {
-    gpio_put(pin, 0);
-    gpio_set_dir(pin, GPIO_OUT);
-  } else {
-    gpio_set_dir(pin, GPIO_IN);
+  printf("  Ring peak:     %lu/%u words\n", s->ring_peak, FLOPPY_FLUX_RING_WORDS);
+  if (s->overruns) {
+    printf("  Ring overruns: %lu\n", s->overruns);
   }
 }
 
@@ -332,32 +312,26 @@ static void read_track_stats(int track, int side, track_stats_t *stats) {
   memset(stats, 0, sizeof(*stats));
 
   floppy_seek(&floppy, track);
-  gpio_put_oc(floppy.pins.side_select, side == 0 ? 1 : 0);
-
-  pio_sm_exec(floppy.read.pio, floppy.read.sm, pio_encode_jmp(floppy.read.offset));
-  pio_sm_restart(floppy.read.pio, floppy.read.sm);
-  pio_sm_clear_fifos(floppy.read.pio, floppy.read.sm);
-  floppy.read.half_valid = false;
-  pio_sm_set_enabled(floppy.read.pio, floppy.read.sm, true);
+  floppy_side_select(&floppy, side);
+  floppy_flux_begin(&floppy);
 
   mfm_t mfm;
   mfm_init(&mfm);
   mfm_reset(&mfm);
 
-  uint16_t prev = flux_read_wait() >> 1;
   bool ix_prev = false;
+  bool ix_primed = false;
   sector_t sector;
   int ix_edges = 0;
 
   while (ix_edges < 6) {
-    uint16_t value = flux_read_wait();
-    uint8_t ix = value & 1;
-    uint16_t cnt = value >> 1;
-    int delta = prev - cnt;
-    if (delta < 0) delta += 0x8000;
+    uint16_t delta;
+    bool ix;
+    if (!floppy_flux_next(&floppy, &delta, &ix)) break;
 
-    if (ix != ix_prev) ix_edges++;
+    if (ix_primed && ix != ix_prev) ix_edges++;
     ix_prev = ix;
+    ix_primed = true;
 
     if (delta > 0 && delta < PULSE_BINS) {
       stats->histogram[delta]++;
@@ -382,10 +356,9 @@ static void read_track_stats(int track, int side, track_stats_t *stats) {
         stats->unique_sectors++;
       }
     }
-    prev = cnt;
   }
 
-  pio_sm_set_enabled(floppy.read.pio, floppy.read.sm, false);
+  floppy_flux_end(&floppy);
 
   stats->T2_max = mfm.T2_max;
   stats->T3_max = mfm.T3_max;
@@ -944,43 +917,12 @@ static void cmd_mv(int argc, char **argv) {
   upcase(src);
   upcase(dst);
 
-  // Copy
-  f12_file_t *rf = f12_open(&fs, src, "r");
-  if (!rf) {
-    printf("Error opening %s: %s\n", src, f12_strerror(f12_errno(&fs)));
-    return;
-  }
-
-  f12_file_t *wf = f12_open(&fs, dst, "w");
-  if (!wf) {
-    printf("Error creating %s: %s\n", dst, f12_strerror(f12_errno(&fs)));
-    f12_close(rf);
-    return;
-  }
-
-  uint32_t total = 0;
-  int n;
-  while ((n = f12_read(rf, io_buf, IO_BUF_SIZE)) > 0) {
-    int w = f12_write(wf, io_buf, n);
-    if (w < 0) {
-      printf("Write error: %s\n", f12_strerror(f12_errno(&fs)));
-      f12_close(rf);
-      f12_close(wf);
-      return;
-    }
-    total += w;
-  }
-
-  f12_close(rf);
-  f12_close(wf);
-
-  // Delete source
-  f12_err_t err = f12_delete(&fs, src);
+  f12_err_t err = f12_rename(&fs, src, dst);
   if (err != F12_OK) {
-    printf("Warning: copied but failed to delete %s: %s\n", src, f12_strerror(err));
+    printf("Error: %s\n", f12_strerror(err));
     return;
   }
-  printf("Moved %lu bytes: %s -> %s\n", total, src, dst);
+  printf("Renamed %s -> %s\n", src, dst);
 }
 
 static void cmd_stat(int argc, char **argv) {
@@ -1154,6 +1096,9 @@ static void cmd_status(int argc, char **argv) {
   printf("    Sectors/FAT:      %d\n", bpb->sectors_per_fat);
   printf("    Sectors/track:    %d\n", bpb->sectors_per_track);
   printf("    Heads:            %d\n", bpb->num_heads);
+  if (fs.fat.fat_mismatch) {
+    printf("  WARNING: FAT copies disagree (FAT1 is authoritative)\n");
+  }
 
   uint16_t free_cl = count_free_clusters();
   uint32_t free_bytes = (uint32_t)free_cl * bpb->sectors_per_cluster * bpb->bytes_per_sector;
@@ -1284,60 +1229,27 @@ static void cmd_flux(int argc, char **argv) {
   if (count < 1) count = 1;
   if (count > 10000) count = 10000;
 
-  touch_io_time();
-  if (!floppy.motor_on || !floppy.selected) {
-    printf("  Starting motor and selecting drive...\n");
-    floppy_select(&floppy, true);
-    floppy_motor_on(&floppy);
-  }
-
-  printf("  Reading %d raw flux transitions (5s timeout)...\n", count);
+  printf("  Reading %d raw flux transitions...\n", count);
   printf("  read_data=GP%d  index=GP%d\n", floppy.pins.read_data, floppy.pins.index);
 
-  pio_sm_exec(floppy.read.pio, floppy.read.sm, pio_encode_jmp(floppy.read.offset));
-  pio_sm_restart(floppy.read.pio, floppy.read.sm);
-  pio_sm_clear_fifos(floppy.read.pio, floppy.read.sm);
-  floppy.read.half_valid = false;
-  pio_sm_set_enabled(floppy.read.pio, floppy.read.sm, true);
+  floppy_flux_begin(&floppy);
 
-  // Wait for first transition with timeout
-  absolute_time_t deadline = make_timeout_time_ms(5000);
-  while (!flux_data_available()) {
-    if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
-      printf("  TIMEOUT: no flux data received.\n");
+  for (int i = 0; i < count; i++) {
+    uint16_t delta;
+    bool ix;
+    if (!floppy_flux_next(&floppy, &delta, &ix)) {
+      printf("  TIMEOUT after %d transitions.\n", i);
       printf("  Check: disk inserted? read_data wiring? motor spinning?\n");
       printf("  Current read_data (GP%d) = %d\n",
              floppy.pins.read_data, gpio_get(floppy.pins.read_data));
-      pio_sm_set_enabled(floppy.read.pio, floppy.read.sm, false);
+      floppy_flux_end(&floppy);
       return;
     }
-    tight_loop_contents();
+
+    printf("  %4d: delta=%3d  ix=%d\n", i, delta, ix);
   }
 
-  uint16_t prev = flux_read_raw() >> 1;
-
-  for (int i = 0; i < count; i++) {
-    deadline = make_timeout_time_ms(1000);
-    while (!flux_data_available()) {
-      if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
-        printf("  TIMEOUT after %d transitions.\n", i);
-        pio_sm_set_enabled(floppy.read.pio, floppy.read.sm, false);
-        return;
-      }
-      tight_loop_contents();
-    }
-
-    uint16_t value = flux_read_raw();
-    uint8_t ix = value & 1;
-    uint16_t cnt = value >> 1;
-    int delta = prev - cnt;
-    if (delta < 0) delta += 0x8000;
-    prev = cnt;
-
-    printf("  %4d: delta=%3d  ix=%d  raw=0x%04X\n", i, delta, ix, value);
-  }
-
-  pio_sm_set_enabled(floppy.read.pio, floppy.read.sm, false);
+  floppy_flux_end(&floppy);
   printf("  Done.\n");
 }
 
@@ -2146,6 +2058,7 @@ static void cmd_selftest3(int argc, char **argv) {
     return;
   }
   mounted = true;
+  floppy_stats_reset(&floppy);
 
   const char *byte_name = "BYTEIO.BIN";
   const char *target_name = "TARGET.BIN";
@@ -2259,6 +2172,33 @@ static void cmd_selftest3(int argc, char **argv) {
   check(verify_pattern_file_chunked(filler_name, filler_id, filler_size, 4096, NULL),
         "FILLER.BIN full verify after overwrite rounds", &pass, &fail);
 
+  printf("\n--- Phase 2b: Rename With Disk Full ---\n");
+  int last_target_id = target_initial_id + rounds;
+
+  err = f12_rename(&fs, target_name, "RENAMED.BIN");
+  check(err == F12_OK, "rename TARGET.BIN with 0 free clusters", &pass, &fail);
+
+  err = f12_rename(&fs, byte_name, "RENAMED.BIN");
+  check(err == F12_ERR_EXISTS, "rename onto existing name rejected", &pass, &fail);
+
+  f12_unmount(&fs);
+  mounted = false;
+  err = do_mount();
+  check(err == F12_OK, "remount after rename", &pass, &fail);
+  if (err != F12_OK) goto done;
+  mounted = true;
+
+  err = f12_stat(&fs, target_name, &st);
+  check(err == F12_ERR_NOT_FOUND, "old name gone after remount", &pass, &fail);
+  check(verify_pattern_file_chunked("RENAMED.BIN", last_target_id, target_size, 113, NULL),
+        "RENAMED.BIN content after remount", &pass, &fail);
+  check(count_free_clusters() == 0, "disk still full after rename", &pass, &fail);
+
+  err = f12_rename(&fs, "RENAMED.BIN", target_name);
+  check(err == F12_OK, "rename back to TARGET.BIN", &pass, &fail);
+  check(verify_pattern_file_chunked(target_name, last_target_id, target_size, 257, NULL),
+        "TARGET.BIN content after rename back", &pass, &fail);
+
   printf("\n--- Phase 3: Grow/Shrink Overwrites With Free Space ---\n");
   err = f12_delete(&fs, filler_name);
   check(err == F12_OK, "delete FILLER.BIN", &pass, &fail);
@@ -2318,6 +2258,27 @@ static void cmd_selftest3(int argc, char **argv) {
   check(expected_free_after_shrink >= 0 &&
         free_after_shrink == (uint16_t)expected_free_after_shrink, tag, &pass, &fail);
 
+  printf("\n--- Phase 3b: Truncate To Empty ---\n");
+  ok = write_pattern_file_chunked(target_name, 0, 0, 1, &written, &close_err);
+  check(ok && written == 0 && close_err == F12_OK,
+        "overwrite TARGET.BIN with 0 bytes", &pass, &fail);
+
+  f12_unmount(&fs);
+  mounted = false;
+  err = do_mount();
+  check(err == F12_OK, "remount after truncate", &pass, &fail);
+  if (err != F12_OK) goto done;
+  mounted = true;
+
+  err = f12_stat(&fs, target_name, &st);
+  check(err == F12_OK && st.size == 0, "TARGET.BIN size 0 after remount", &pass, &fail);
+
+  uint16_t free_after_truncate = count_free_clusters();
+  int32_t expected_free_after_truncate =
+      (int32_t)free_after_shrink + (int32_t)clusters_for_size(shrink_size);
+  snprintf(tag, sizeof(tag), "free clusters after truncate = %ld", (long)expected_free_after_truncate);
+  check(free_after_truncate == (uint16_t)expected_free_after_truncate, tag, &pass, &fail);
+
   check(verify_pattern_file_chunked(byte_name, byte_id, byte_size, 1, NULL),
         "BYTEIO.BIN still intact at end", &pass, &fail);
 
@@ -2326,6 +2287,10 @@ done:
     f12_unmount(&fs);
     mounted = false;
   }
+
+  floppy_stats_t drive_stats = floppy_stats(&floppy);
+  printf("\n--- Drive Stats ---\n");
+  print_drive_stats(&drive_stats);
 
   printf("\n=== Selftest3 Complete ===\n");
   printf("  Checks: %d passed, %d failed\n", pass, fail);
@@ -2720,10 +2685,10 @@ static void floppy_play_note(uint16_t freq, uint16_t ms) {
     if (pos >= 78) inward = false;
     if (pos <= 1) inward = true;
 
-    gpio_put_oc(floppy.pins.direction, inward ? 0 : 1);
-    gpio_put_oc(floppy.pins.step, 0);
+    floppy_pin_oc(floppy.pins.direction, inward ? 0 : 1);
+    floppy_pin_oc(floppy.pins.step, 0);
     sleep_us(1);
-    gpio_put_oc(floppy.pins.step, 1);
+    floppy_pin_oc(floppy.pins.step, 1);
 
     if (inward) pos++; else pos--;
 
@@ -2832,12 +2797,7 @@ static diskdump_stats_t run_diskdump(bool verbose) {
   printf("\n  Total decoded: %d / 2880\n", total_valid);
   printf("  Errors:        %d\n", total_invalid);
   printf("  Disk checksum: 0x%08lX\n", disk_checksum);
-  printf("  Read retries:  %lu attempts, %lu recovered, %lu failed\n",
-         stats.retries.retries, stats.retries.recovered, stats.retries.failed);
-  if (stats.retries.timeout || stats.retries.wrong_track || stats.retries.wrong_side) {
-    printf("  Retry causes:  timeout=%lu wrong_track=%lu wrong_side=%lu\n",
-           stats.retries.timeout, stats.retries.wrong_track, stats.retries.wrong_side);
-  }
+  print_drive_stats(&stats.retries);
 
   return stats;
 }

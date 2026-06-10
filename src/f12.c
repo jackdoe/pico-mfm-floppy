@@ -165,6 +165,7 @@ static f12_err_t fat12_to_f12_err(fat12_err_t err) {
     case FAT12_ERR_NOT_FOUND: return F12_ERR_NOT_FOUND;
     case FAT12_ERR_EOF:   return F12_ERR_EOF;
     case FAT12_ERR_FULL:  return F12_ERR_FULL;
+    case FAT12_ERR_EXISTS: return F12_ERR_EXISTS;
     default:              return F12_ERR_IO;
   }
 }
@@ -460,6 +461,23 @@ f12_err_t f12_delete(f12_t *fs, const char *path) {
   if (path[0] == '/') path++;
 
   fat12_err_t ferr = fat12_delete(&fs->fat, path);
+  if (ferr != FAT12_OK) {
+    return f12_set_error(fs, fat12_to_f12_err(ferr));
+  }
+
+  return F12_OK;
+}
+
+f12_err_t f12_rename(f12_t *fs, const char *from, const char *to) {
+  if (!fs || !from || !to) return F12_ERR_INVALID;
+
+  f12_err_t err = f12_check_writable(fs);
+  if (err != F12_OK) return err;
+
+  if (from[0] == '/') from++;
+  if (to[0] == '/') to++;
+
+  fat12_err_t ferr = fat12_rename(&fs->fat, from, to);
   if (ferr != FAT12_OK) {
     return f12_set_error(fs, fat12_to_f12_err(ferr));
   }

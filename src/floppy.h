@@ -19,6 +19,9 @@
 #endif
 #endif
 
+#define FLOPPY_FLUX_RING_BITS 12
+#define FLOPPY_FLUX_RING_WORDS (1u << (FLOPPY_FLUX_RING_BITS - 2))
+
 typedef struct {
   uint8_t track;
   uint8_t side;
@@ -71,6 +74,8 @@ typedef struct {
   uint offset;
   uint16_t half;
   bool half_valid;
+  uint16_t prev;
+  bool primed;
 } floppy_pio_t;
 
 #define FLOPPY_IDLE_TIMEOUT_MS 20000
@@ -85,12 +90,19 @@ typedef struct {
   uint32_t timeout;
   uint32_t wrong_track;
   uint32_t wrong_side;
+  uint32_t overruns;
+  uint32_t flux_words;
+  uint32_t ring_peak;
+  uint32_t dma_writes;
 } floppy_stats_t;
 
 struct floppy {
+  uint32_t flux_ring[FLOPPY_FLUX_RING_WORDS] __attribute__((aligned(1u << FLOPPY_FLUX_RING_BITS)));
   floppy_pins_t pins;
   floppy_pio_t read;
   floppy_pio_t write;
+  int dma_ch;
+  uint32_t ring_consumed;
 
   uint8_t track;
   bool track0_confirmed;
@@ -107,7 +119,11 @@ struct floppy {
 
 void floppy_init(floppy_t *f);
 
+void floppy_pin_oc(uint pin, bool value);
+
 void floppy_select(floppy_t *f, bool on);
+
+void floppy_side_select(floppy_t *f, uint8_t side);
 
 void floppy_motor_on(floppy_t *f);
 void floppy_motor_off(floppy_t *f);
@@ -127,6 +143,10 @@ bool floppy_write_protected(floppy_t *f);
 void floppy_stats_reset(floppy_t *f);
 
 floppy_stats_t floppy_stats(floppy_t *f);
+
+void floppy_flux_begin(floppy_t *f);
+bool floppy_flux_next(floppy_t *f, uint16_t *delta, bool *index);
+void floppy_flux_end(floppy_t *f);
 
 floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector);
 floppy_status_t floppy_read_track(floppy_t *f, track_t *t);

@@ -1,1 +1,14 @@
 build/
+build-*/
+tests/build/
+tests/build_cov/
+tests/_verify/
+tests/test_f12
+tests/test_fat12
+tests/test_fat12_debug
+tests/test_fuzz
+tests/test_lru
+tests/test_mfm
+tests/test_mfm_size_code
+tests/test_robustness
+.#*

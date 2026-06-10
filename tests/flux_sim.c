@@ -11,11 +11,15 @@ static uint16_t read_be16(const uint8_t *p) {
     return (p[0] << 8) | p[1];
 }
 
-static void flux_rev_ensure(flux_rev_t *rev, uint32_t needed) {
-    if (rev->capacity >= needed) return;
+static bool flux_rev_ensure(flux_rev_t *rev, uint32_t needed) {
+    if (rev->capacity >= needed) return true;
     uint32_t cap = needed + needed / 4;
-    rev->deltas = realloc(rev->deltas, cap * sizeof(uint16_t));
+    if (cap < needed) return false;
+    uint16_t *deltas = realloc(rev->deltas, (size_t)cap * sizeof(uint16_t));
+    if (!deltas) return false;
+    rev->deltas = deltas;
     rev->capacity = cap;
+    return true;
 }
 
 static int16_t flux_sim_jitter(flux_sim_t *sim) {
@@ -45,21 +49,21 @@ bool flux_sim_seek(flux_sim_t *sim, uint8_t track, uint8_t side, uint8_t rev) {
     if (rev >= sim->num_revolutions) return false;
 
     uint16_t scp_idx = track * 2 + side;
-    uint32_t table_off = 0x10 + scp_idx * 4;
+    uint64_t table_off = 0x10 + (uint64_t)scp_idx * 4;
     if (table_off + 4 > sim->file_size) return false;
 
-    uint32_t tdh_off = read_le32(sim->file_data + table_off);
+    uint64_t tdh_off = read_le32(sim->file_data + table_off);
     if (tdh_off == 0) return false;
-    if (tdh_off + 4 + (rev + 1) * 12 > sim->file_size) return false;
+    if (tdh_off + 4 + ((uint64_t)rev + 1) * 12 > sim->file_size) return false;
 
     uint8_t *rev_entry = sim->file_data + tdh_off + 4 + rev * 12;
     uint32_t flux_count = read_le32(rev_entry + 4);
-    uint32_t data_off = read_le32(rev_entry + 8);
+    uint64_t data_off = read_le32(rev_entry + 8);
 
     uint8_t *flux_data = sim->file_data + tdh_off + data_off;
-    if (tdh_off + data_off + flux_count * 2 > sim->file_size) return false;
+    if (tdh_off + data_off + (uint64_t)flux_count * 2 > sim->file_size) return false;
 
-    flux_rev_ensure(&sim->rev, flux_count);
+    if (!flux_rev_ensure(&sim->rev, flux_count)) return false;
 
     uint32_t out_pos = 0;
     uint32_t accumulator = 0;
@@ -118,7 +122,7 @@ void flux_sim_set_drift(flux_sim_t *sim, int32_t ppm) {
 
 bool flux_sim_from_track(flux_sim_t *sim, const uint8_t *pulse_buf, size_t pulse_count) {
     memset(sim, 0, sizeof(*sim));
-    flux_rev_ensure(&sim->rev, pulse_count);
+    if (!flux_rev_ensure(&sim->rev, pulse_count)) return false;
 
     for (size_t i = 0; i < pulse_count; i++) {
         sim->rev.deltas[i] = pulse_buf[i] + MFM_PIO_OVERHEAD;

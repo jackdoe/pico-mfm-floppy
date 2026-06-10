@@ -109,6 +109,7 @@ typedef enum {
   FAT12_ERR_NOT_FOUND,
   FAT12_ERR_EOF,
   FAT12_ERR_FULL,
+  FAT12_ERR_EXISTS,
 } fat12_err_t;
 
 typedef struct {
@@ -145,6 +146,7 @@ fat12_err_t fat12_format(fat12_io_t io, const char *volume_label, bool write_all
 void fat12_abort_write(fat12_t *fat);
 
 fat12_err_t fat12_get_entry(fat12_t *fat, uint16_t cluster, uint16_t *next);
+fat12_err_t fat12_free_count(fat12_t *fat, uint16_t *count);
 bool fat12_is_eof(uint16_t cluster);
 
 fat12_err_t fat12_read_root_entry(fat12_t *fat, uint16_t index, fat12_dirent_t *entry);
@@ -162,6 +164,7 @@ int fat12_write(fat12_writer_t *writer, const uint8_t *buf, size_t len);
 fat12_err_t fat12_close_write(fat12_writer_t *writer);
 fat12_err_t fat12_create(fat12_t *fat, const char *filename, fat12_dirent_t *entry);
 fat12_err_t fat12_delete(fat12_t *fat, const char *filename);
+fat12_err_t fat12_rename(fat12_t *fat, const char *from, const char *to);
 
 _Static_assert(sizeof(fat12_dirent_t) == 32, "fat12_dirent_t must be 32 bytes");
 

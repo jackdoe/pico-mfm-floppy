@@ -5,8 +5,17 @@
 #include <stdbool.h>
 
 typedef unsigned int uint;
-typedef struct { int id; } pio_hw_t;
+typedef struct {
+  int id;
+  volatile uint32_t txf[4];
+  volatile uint32_t rxf[4];
+} pio_hw_t;
 typedef pio_hw_t *PIO;
+
+static inline uint pio_get_dreq(PIO pio, uint sm, bool is_tx) {
+  (void)pio; (void)sm;
+  return is_tx ? 1 : 0;
+}
 
 typedef struct { int dummy; } pio_program_t;
 

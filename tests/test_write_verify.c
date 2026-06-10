@@ -89,6 +89,12 @@ TEST(test_write_verify_success) {
     ASSERT_MEM_EQ(buf, msg, strlen(msg));
     f12_close(f);
 
+    ASSERT(floppy.stats.dma_writes >= 1);
+    ASSERT(floppy.stats.flux_words > 0);
+    ASSERT(floppy.stats.ring_peak >= 1);
+    ASSERT(floppy.stats.ring_peak <= 4);
+    ASSERT_EQ(floppy.stats.overruns, 0);
+
     f12_unmount(&fs);
 }
 

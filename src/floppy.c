@@ -8,6 +8,7 @@
 #include "hardware/gpio.h"
 #include "hardware/sync.h"
 #include "hardware/pio.h"
+#include "hardware/dma.h"
 #include "hardware/clocks.h"
 #include "flux_read.pio.h"
 #include "flux_write.pio.h"
@@ -50,7 +51,20 @@
 #define FLOPPY_TX_DRAIN_TIMEOUT_MS 100
 #endif
 
-static void gpio_put_oc(uint pin, bool value);
+#ifndef FLOPPY_WRITE_FLUX_TIMEOUT_MS
+#define FLOPPY_WRITE_FLUX_TIMEOUT_MS 1000
+#endif
+
+#define FLOPPY_FLUX_DMA_COUNT 0x0FFFFFFFu
+
+void floppy_pin_oc(uint pin, bool value) {
+  if (value == 0) {
+    gpio_put(pin, 0);
+    gpio_set_dir(pin, GPIO_OUT);
+  } else {
+    gpio_set_dir(pin, GPIO_IN);
+  }
+}
 
 static bool floppy_idle_timer_callback(struct repeating_timer *t) {
   floppy_t *f = (floppy_t *)t->user_data;
@@ -62,9 +76,9 @@ static bool floppy_idle_timer_callback(struct repeating_timer *t) {
   uint32_t now = to_ms_since_boot(get_absolute_time());
   if (now - f->last_io_time_ms >= FLOPPY_IDLE_TIMEOUT_MS) {
     uint32_t saved = save_and_disable_interrupts();
-    gpio_put_oc(f->pins.motor_enable, 1);
+    floppy_pin_oc(f->pins.motor_enable, 1);
     f->motor_on = false;
-    gpio_put_oc(f->pins.drive_select, 1);
+    floppy_pin_oc(f->pins.drive_select, 1);
     f->selected = false;
     restore_interrupts(saved);
   }
@@ -87,17 +101,12 @@ static void floppy_prepare(floppy_t *f) {
   floppy_motor_on(f);
 }
 
-static void gpio_put_oc(uint pin, bool value) {
-  if (value == 0) {
-    gpio_put(pin, 0);
-    gpio_set_dir(pin, GPIO_OUT);
-  } else {
-    gpio_set_dir(pin, GPIO_IN);
-  }
+static inline uint32_t flux_ring_produced(floppy_t *f) {
+  return FLOPPY_FLUX_DMA_COUNT - dma_channel_hw_addr(f->dma_ch)->transfer_count;
 }
 
 static inline bool flux_data_available(floppy_t *f) {
-  return f->read.half_valid || !pio_sm_is_rx_fifo_empty(f->read.pio, f->read.sm);
+  return f->read.half_valid || flux_ring_produced(f) != f->ring_consumed;
 }
 
 static inline uint16_t flux_read(floppy_t *f) {
@@ -105,7 +114,19 @@ static inline uint16_t flux_read(floppy_t *f) {
     f->read.half_valid = false;
     return f->read.half;
   }
-  uint32_t pv = pio_sm_get_blocking(f->read.pio, f->read.sm);
+
+  uint32_t produced = flux_ring_produced(f);
+  uint32_t lag = produced - f->ring_consumed;
+  if (lag > FLOPPY_FLUX_RING_WORDS) {
+    f->stats.overruns++;
+    f->ring_consumed = produced - FLOPPY_FLUX_RING_WORDS / 2;
+    lag = FLOPPY_FLUX_RING_WORDS;
+  }
+  if (lag > f->stats.ring_peak) f->stats.ring_peak = lag;
+  f->stats.flux_words++;
+
+  uint32_t pv = f->flux_ring[f->ring_consumed & (FLOPPY_FLUX_RING_WORDS - 1)];
+  f->ring_consumed++;
   f->read.half = pv >> 16;
   f->read.half_valid = true;
   return pv & 0xffff;
@@ -125,15 +146,59 @@ static inline bool flux_read_wait(floppy_t *f, uint16_t *out) {
 
 static void floppy_flux_read_start(floppy_t *f) {
   pio_sm_set_enabled(f->read.pio, f->read.sm, false);
+  dma_channel_abort(f->dma_ch);
   pio_sm_clear_fifos(f->read.pio, f->read.sm);
   pio_sm_restart(f->read.pio, f->read.sm);
   f->read.half_valid = false;
+  f->read.primed = false;
+  f->ring_consumed = 0;
   pio_sm_exec(f->read.pio, f->read.sm, pio_encode_set(pio_x, 0));
+
+  dma_channel_config c = dma_channel_get_default_config(f->dma_ch);
+  channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
+  channel_config_set_read_increment(&c, false);
+  channel_config_set_write_increment(&c, true);
+  channel_config_set_ring(&c, true, FLOPPY_FLUX_RING_BITS);
+  channel_config_set_dreq(&c, pio_get_dreq(f->read.pio, f->read.sm, false));
+  dma_channel_configure(f->dma_ch, &c, f->flux_ring, &f->read.pio->rxf[f->read.sm],
+                        FLOPPY_FLUX_DMA_COUNT, true);
+
   pio_sm_set_enabled(f->read.pio, f->read.sm, true);
 }
 
 static void floppy_flux_read_stop(floppy_t *f) {
   pio_sm_set_enabled(f->read.pio, f->read.sm, false);
+  dma_channel_abort(f->dma_ch);
+}
+
+void floppy_flux_begin(floppy_t *f) {
+  floppy_prepare(f);
+  floppy_flux_read_start(f);
+}
+
+bool floppy_flux_next(floppy_t *f, uint16_t *delta, bool *index) {
+  uint16_t value;
+
+  if (!f->read.primed) {
+    if (!flux_read_wait(f, &value)) return false;
+    f->read.prev = value >> 1;
+    f->read.primed = true;
+  }
+
+  if (!flux_read_wait(f, &value)) return false;
+
+  uint16_t cnt = value >> 1;
+  int d = f->read.prev - cnt;
+  if (d < 0) d += 0x8000;
+  f->read.prev = cnt;
+
+  *delta = (uint16_t)d;
+  *index = value & 1;
+  return true;
+}
+
+void floppy_flux_end(floppy_t *f) {
+  floppy_flux_read_stop(f);
 }
 
 static void floppy_flux_write_start(floppy_t *f) {
@@ -142,7 +207,7 @@ static void floppy_flux_write_start(floppy_t *f) {
   pio_sm_restart(f->write.pio, f->write.sm);
   pio_sm_exec(f->write.pio, f->write.sm, pio_encode_jmp(f->write.offset));
 
-  gpio_put_oc(f->pins.write_gate, 0);
+  floppy_pin_oc(f->pins.write_gate, 0);
 
   pio_sm_set_enabled(f->write.pio, f->write.sm, true);
 }
@@ -151,14 +216,14 @@ static bool floppy_flux_write_stop(floppy_t *f) {
   uint32_t start_ms = to_ms_since_boot(get_absolute_time());
   while (!pio_sm_is_tx_fifo_empty(f->write.pio, f->write.sm)) {
     if ((uint32_t)(to_ms_since_boot(get_absolute_time()) - start_ms) >= FLOPPY_TX_DRAIN_TIMEOUT_MS) {
-      gpio_put_oc(f->pins.write_gate, 1);
+      floppy_pin_oc(f->pins.write_gate, 1);
       pio_sm_set_enabled(f->write.pio, f->write.sm, false);
       return false;
     }
     tight_loop_contents();
   }
   sleep_us(5);
-  gpio_put_oc(f->pins.write_gate, 1);
+  floppy_pin_oc(f->pins.write_gate, 1);
   pio_sm_set_enabled(f->write.pio, f->write.sm, false);
   return true;
 }
@@ -183,17 +248,17 @@ static bool floppy_wait_for_index(floppy_t *f) {
   return true;
 }
 
-static void floppy_side_select(floppy_t *f, uint8_t side) {
-  gpio_put_oc(f->pins.side_select, side == 0 ? 1 : 0);
+void floppy_side_select(floppy_t *f, uint8_t side) {
+  floppy_pin_oc(f->pins.side_select, side == 0 ? 1 : 0);
 }
 
 static void floppy_step(floppy_t *f, int direction) {
-  gpio_put_oc(f->pins.direction, direction == DIR_INWARD ? 0 : 1);
+  floppy_pin_oc(f->pins.direction, direction == DIR_INWARD ? 0 : 1);
 
   sleep_us(10);
-  gpio_put_oc(f->pins.step, 0);
+  floppy_pin_oc(f->pins.step, 0);
   sleep_us(10);
-  gpio_put_oc(f->pins.step, 1);
+  floppy_pin_oc(f->pins.step, 1);
 
   sleep_ms(10);
 
@@ -264,28 +329,21 @@ static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
   mfm_init(&mfm);
   mfm_reset(&mfm);
 
-  uint16_t initial;
-  if (!flux_read_wait(f, &initial)) {
-    floppy_flux_read_stop(f);
-    return FLOPPY_ERR_TIMEOUT;
-  }
-  uint16_t prev = initial >> 1;
-  bool ix_prev = initial & 1;
+  bool ix_prev = false;
+  bool ix_primed = false;
   floppy_status_t res = FLOPPY_ERR_TIMEOUT;
 
   for (int ix_edges = 0; ix_edges < FLOPPY_READ_TRACK_ATTEMPTS * 2;) {
-    uint16_t value;
-    if (!flux_read_wait(f, &value)) {
+    uint16_t delta;
+    bool ix;
+    if (!floppy_flux_next(f, &delta, &ix)) {
       res = FLOPPY_ERR_TIMEOUT;
       break;
     }
-    uint8_t ix = value & 1;
-    uint16_t cnt = value >> 1;
-    int delta = prev - cnt;
-    if (delta < 0) delta += 0x8000;
 
-    if (ix != ix_prev) ix_edges++;
+    if (ix_primed && ix != ix_prev) ix_edges++;
     ix_prev = ix;
+    ix_primed = true;
 
     if (mfm_feed(&mfm, delta, &sector)) {
       if (sector.valid && sector.sector_n >= 1 && sector.sector_n <= SECTORS_PER_TRACK) {
@@ -305,7 +363,6 @@ static floppy_status_t floppy_read_flux(floppy_t *f, int track, int side,
         }
       }
     }
-    prev = cnt;
   }
 
   floppy_flux_read_stop(f);
@@ -421,6 +478,9 @@ void floppy_init(floppy_t *f) {
   f->write.half_valid = false;
   flux_write_program_init(f->write.pio, f->write.sm, f->write.offset, f->pins.write_data);
 
+  f->dma_ch = dma_claim_unused_channel(true);
+  f->ring_consumed = 0;
+
   f->track = 0;
   f->track0_confirmed = false;
   f->disk_change_flag = false;
@@ -434,21 +494,21 @@ void floppy_init(floppy_t *f) {
 
 void floppy_select(floppy_t *f, bool on) {
   if (f->selected == on) return;
-  gpio_put_oc(f->pins.drive_select, !on);
+  floppy_pin_oc(f->pins.drive_select, !on);
   f->selected = on;
   sleep_ms(10);
 }
 
 void floppy_motor_on(floppy_t *f) {
   if (f->motor_on) return;
-  gpio_put_oc(f->pins.motor_enable, 0);
+  floppy_pin_oc(f->pins.motor_enable, 0);
   f->motor_on = true;
   sleep_ms(750);
 }
 
 void floppy_motor_off(floppy_t *f) {
   if (!f->motor_on) return;
-  gpio_put_oc(f->pins.motor_enable, 1);
+  floppy_pin_oc(f->pins.motor_enable, 1);
   f->motor_on = false;
 }
 
@@ -577,12 +637,31 @@ floppy_status_t floppy_write_track(floppy_t *f, track_t *t) {
       return FLOPPY_ERR_TIMEOUT;
     }
     floppy_flux_write_start(f);
-    for (size_t i = 0; i < enc.pos; i++) {
-      pio_sm_put_blocking(f->write.pio, f->write.sm, f->flux_buf[i]);
+
+    dma_channel_config c = dma_channel_get_default_config(f->dma_ch);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+    channel_config_set_read_increment(&c, true);
+    channel_config_set_write_increment(&c, false);
+    channel_config_set_dreq(&c, pio_get_dreq(f->write.pio, f->write.sm, true));
+    dma_channel_configure(f->dma_ch, &c, &f->write.pio->txf[f->write.sm],
+                          f->flux_buf, enc.pos, true);
+
+    uint32_t start_ms = to_ms_since_boot(get_absolute_time());
+    bool fed = true;
+    while (dma_channel_is_busy(f->dma_ch)) {
+      if ((uint32_t)(to_ms_since_boot(get_absolute_time()) - start_ms) >= FLOPPY_WRITE_FLUX_TIMEOUT_MS) {
+        dma_channel_abort(f->dma_ch);
+        fed = false;
+        break;
+      }
+      tight_loop_contents();
     }
-    if (!floppy_flux_write_stop(f)) {
+
+    bool drained = floppy_flux_write_stop(f);
+    if (!fed || !drained) {
       return FLOPPY_ERR_TIMEOUT;
     }
+    f->stats.dma_writes++;
 
     struct verify_ctx vctx = { .expected = t };
     for (int verify = 0; verify < 3; verify++) {

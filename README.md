@@ -12,7 +12,7 @@ Verified against 9 real floppy disks (System Shock, 1994) decoded from raw magne
 Application
     │
     ▼
-f12 API ──── open / read / write / seek / delete / readdir
+f12 API ──── open / read / write / seek / delete / rename / readdir
     │
     ▼
 LRU Cache ── 54 sectors (3 tracks)
@@ -80,13 +80,13 @@ READ_DATA needs an external 4.7kΩ pull-up because the internal pull-ups (50kΩ)
 Firmware (requires Pico SDK):
 ```sh
 mkdir build && cd build
-cmake .. && make        # builds for Pico 2 (RP2350) by default
+cmake .. && make        # builds for the original Pico (RP2040) by default
 ```
 
-To build for the original Pico (RP2040), change `PICO_BOARD` in `CMakeLists.txt`:
+To build for the Pico 2 (RP2350), change `PICO_BOARD` in `CMakeLists.txt`:
 ```cmake
-set(PICO_BOARD pico)    # RP2040
-set(PICO_BOARD pico2)   # RP2350 (default)
+set(PICO_BOARD pico)    # RP2040 (default)
+set(PICO_BOARD pico2)   # RP2350
 ```
 
 RP2040 differences (handled automatically via `#if PICO_RP2040`):
@@ -100,6 +100,8 @@ Tests (host-side, no hardware needed):
 
 ## Key Features
 
+**DMA flux transfer** — reads stream through a DMA ring buffer (~6ms of IRQ tolerance instead of the RX FIFO's ~50µs), writes are DMA-fed from the encode buffer. Interrupt latency (USB, timers) can no longer drop flux samples or underrun the write stream. Ring overruns are counted in drive stats.
+
 **Adaptive MFM timing** — the decoder measures preamble pulse widths before each sector and calibrates classification thresholds dynamically. Handles ±8% drive speed variation (professional controllers required ±5%).
 
 **Write precompensation** — on inner tracks (≥40), adjacent flux transitions are shifted ±125ns to counteract magnetic bit shift. Without this, inner track writes have 5-15% error rates.
@@ -112,20 +114,20 @@ Tests (host-side, no hardware needed):
 
 ## Testing
 
-145 unit tests, 12,001 fuzz iterations, 100 SCP roundtrip fuzz iterations. Tested against real 1994 floppy disks. Tests run for both RP2040 and RP2350 configurations.
+251 unit tests, 12,001 fuzz iterations, 100 SCP roundtrip fuzz iterations. Tested against real 1994 floppy disks. Tests run for both RP2040 and RP2350 configurations.
 
 ```
 tests/
-├── test_lru.c            21 tests: cache operations, eviction, edge cases
+├── test_lru.c            32 tests: cache operations, eviction, edge cases
 ├── test_mfm.c            15 tests: encode/decode roundtrip, all byte patterns
-├── test_fat12.c          20 tests: filesystem operations, format, cluster chains
-├── test_f12.c            15 tests: high-level API, directory listing, seek
-├── test_robustness.c     13 tests: corrupt BPB, invalid pulses, truncated sectors
+├── test_fat12.c          69 tests: filesystem operations, format, rename, cluster chains
+├── test_f12.c            51 tests: high-level API, directory listing, seek, rename
+├── test_robustness.c     29 tests: corrupt BPB, invalid pulses, truncated sectors
 ├── test_fuzz.c           12,001 iterations: random pulses, corrupt disks, FAT chaos
 ├── test_flux_sim.c        9 tests: synthetic flux + real SCP decode (all 9 disks)
 ├── test_scp_fat12.c       7 tests: mount SCP as FAT12, list files, read content
 ├── test_scp_roundtrip.c   8 tests: decode→modify→encode→decode→verify + fuzz
-├── test_pio_sim.c         4 tests: real floppy.c code with PIO hardware simulation
+├── test_pio_sim.c        11 tests: real floppy.c code with PIO hardware simulation
 ├── test_pio_emu.c         3 tests: cycle-accurate PIO instruction emulation
 ├── test_write_verify.c    7 tests: write-verify-retry through full firmware + PIO sim, cache-skip-flux-read
 ├── flux_sim.c/h          SCP file parser + synthetic flux with jitter/drift
@@ -147,6 +149,7 @@ SCP flux capture (73MB Greaseweazle capture of 1994 System Shock floppy)
       → modify README.SS ("System" → "Floppy")
       → delete LHA.DOC, SHOCKGUS.BAT
       → create HELLO.TXT, BIG.DAT (10KB), TINY.BIN (1 byte), EMPTY.TXT
+      → rename INSTALLE.DAT → RENAMED.OLD, HELLO.TXT → GREET.TXT
       → overwrite CYB.CFG
     → MFM encode → SCP file (22.1 MB)
       → MFM decode (2880/2880 sectors, zero mismatches)

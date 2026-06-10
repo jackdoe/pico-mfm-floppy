@@ -884,6 +884,48 @@ TEST(test_delete_not_found) {
   f12_unmount(&fs);
 }
 
+TEST(test_rename) {
+  vdisk_init(&vdisk);
+  f12_t fs;
+  memset(&fs, 0, sizeof(fs));
+  fs.io = vdisk_f12_io();
+  f12_format(&fs, "T", false);
+  f12_mount(&fs, vdisk_f12_io());
+
+  const char data[] = "rename me";
+  f12_file_t *f = f12_open(&fs, "SRC.TXT", "w");
+  ASSERT(f != NULL);
+  ASSERT_EQ(f12_write(f, data, sizeof(data)), (int)sizeof(data));
+  ASSERT_EQ(f12_close(f), F12_OK);
+
+  ASSERT_EQ(f12_rename(&fs, "SRC.TXT", "DST.TXT"), F12_OK);
+
+  f12_stat_t st;
+  ASSERT_EQ(f12_stat(&fs, "SRC.TXT", &st), F12_ERR_NOT_FOUND);
+  ASSERT_EQ(f12_stat(&fs, "DST.TXT", &st), F12_OK);
+  ASSERT_EQ(st.size, sizeof(data));
+
+  char buf[sizeof(data)];
+  f = f12_open(&fs, "DST.TXT", "r");
+  ASSERT(f != NULL);
+  ASSERT_EQ(f12_read(f, buf, sizeof(buf)), (int)sizeof(buf));
+  ASSERT(memcmp(buf, data, sizeof(data)) == 0);
+  f12_close(f);
+
+  ASSERT_EQ(f12_rename(&fs, "GHOST.TXT", "X.TXT"), F12_ERR_NOT_FOUND);
+
+  f = f12_open(&fs, "OTHER.TXT", "w");
+  ASSERT(f != NULL);
+  f12_close(f);
+  ASSERT_EQ(f12_rename(&fs, "OTHER.TXT", "DST.TXT"), F12_ERR_EXISTS);
+
+  vdisk.write_protected = true;
+  ASSERT_EQ(f12_rename(&fs, "DST.TXT", "Y.TXT"), F12_ERR_WRITE_PROTECTED);
+  vdisk.write_protected = false;
+
+  f12_unmount(&fs);
+}
+
 TEST(test_opendir_non_root) {
   vdisk_init(&vdisk);
   f12_t fs;
@@ -1293,6 +1335,7 @@ int main(void) {
   RUN_TEST(test_seek_in_write_mode_fails);
   RUN_TEST(test_tell_on_write_file);
   RUN_TEST(test_delete_not_found);
+  RUN_TEST(test_rename);
   RUN_TEST(test_opendir_non_root);
   RUN_TEST(test_strerror_all_codes);
   RUN_TEST(test_unmount_closes_open_files);

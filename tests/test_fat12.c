@@ -1599,7 +1599,7 @@ TEST(test_seek_clamps_past_eof_in_fat12) {
   ASSERT_EQ(fat12_read(&file, buf, sizeof(buf)), 0);
 }
 
-TEST(test_create_existing_returns_invalid) {
+TEST(test_create_existing_returns_exists) {
   vdisk_t disk;
   vdisk_format_valid(&disk);
 
@@ -1609,7 +1609,208 @@ TEST(test_create_existing_returns_invalid) {
 
   fat12_dirent_t e;
   ASSERT_EQ(fat12_create(&fat, "DUP.TXT", &e), FAT12_OK);
-  ASSERT_EQ(fat12_create(&fat, "DUP.TXT", &e), FAT12_ERR_INVALID);
+  ASSERT_EQ(fat12_create(&fat, "DUP.TXT", &e), FAT12_ERR_EXISTS);
+}
+
+static void write_file(fat12_t *fat, const char *name, const uint8_t *data, size_t len) {
+  fat12_writer_t w;
+  ASSERT_EQ(fat12_open_write(fat, name, &w), FAT12_OK);
+  ASSERT_EQ(fat12_write(&w, data, len), (int)len);
+  ASSERT_EQ(fat12_close_write(&w), FAT12_OK);
+}
+
+TEST(test_rename_basic) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  uint8_t data[1234];
+  for (size_t i = 0; i < sizeof(data); i++) data[i] = (uint8_t)(i * 7);
+  write_file(&fat, "OLD.TXT", data, sizeof(data));
+
+  fat12_dirent_t before;
+  ASSERT_EQ(fat12_find(&fat, "OLD.TXT", &before), FAT12_OK);
+
+  ASSERT_EQ(fat12_rename(&fat, "OLD.TXT", "NEW.TXT"), FAT12_OK);
+
+  fat12_dirent_t e;
+  ASSERT_EQ(fat12_find(&fat, "OLD.TXT", &e), FAT12_ERR_NOT_FOUND);
+  ASSERT_EQ(fat12_find(&fat, "NEW.TXT", &e), FAT12_OK);
+  ASSERT_EQ(e.start_cluster, before.start_cluster);
+  ASSERT_EQ(e.size, sizeof(data));
+
+  fat12_file_t file;
+  fat12_open(&fat, &e, &file);
+  uint8_t buf[sizeof(data)];
+  ASSERT_EQ(fat12_read(&file, buf, sizeof(buf)), (int)sizeof(buf));
+  ASSERT(memcmp(buf, data, sizeof(data)) == 0);
+}
+
+TEST(test_rename_missing_source) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  ASSERT_EQ(fat12_rename(&fat, "NOPE.TXT", "NEW.TXT"), FAT12_ERR_NOT_FOUND);
+}
+
+TEST(test_rename_to_existing_returns_exists) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  uint8_t data[64] = {1};
+  write_file(&fat, "A.TXT", data, sizeof(data));
+  write_file(&fat, "B.TXT", data, sizeof(data));
+
+  ASSERT_EQ(fat12_rename(&fat, "A.TXT", "B.TXT"), FAT12_ERR_EXISTS);
+
+  fat12_dirent_t e;
+  ASSERT_EQ(fat12_find(&fat, "A.TXT", &e), FAT12_OK);
+  ASSERT_EQ(fat12_find(&fat, "B.TXT", &e), FAT12_OK);
+}
+
+TEST(test_rename_invalid_names) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  ASSERT_EQ(fat12_rename(&fat, "TOOLONGNAME.TXT", "B.TXT"), FAT12_ERR_INVALID);
+  ASSERT_EQ(fat12_rename(&fat, "A.TXT", "TOOLONGNAME.TXT"), FAT12_ERR_INVALID);
+}
+
+TEST(test_rename_survives_remount) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  uint8_t data[700] = {0x5A};
+  write_file(&fat, "KEEP.BIN", data, sizeof(data));
+  ASSERT_EQ(fat12_rename(&fat, "KEEP.BIN", "HELD.BIN"), FAT12_OK);
+
+  fat12_t fat2;
+  ASSERT_EQ(fat12_init(&fat2, io), FAT12_OK);
+  fat12_dirent_t e;
+  ASSERT_EQ(fat12_find(&fat2, "HELD.BIN", &e), FAT12_OK);
+  ASSERT_EQ(e.size, sizeof(data));
+  ASSERT_EQ(fat12_find(&fat2, "KEEP.BIN", &e), FAT12_ERR_NOT_FOUND);
+}
+
+TEST(test_free_count_matches_entry_walk) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  uint16_t free0 = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free0), FAT12_OK);
+  ASSERT_EQ(free0, count_free_clusters(&fat));
+  ASSERT_EQ(free0, fat.total_clusters);
+
+  uint8_t data[3000];
+  memset(data, 0xCC, sizeof(data));
+  write_file(&fat, "F1.BIN", data, sizeof(data));
+  write_file(&fat, "F2.BIN", data, 999);
+
+  uint16_t free1 = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free1), FAT12_OK);
+  ASSERT_EQ(free1, count_free_clusters(&fat));
+  ASSERT_EQ(free1, free0 - 6 - 2);
+
+  ASSERT_EQ(fat12_delete(&fat, "F1.BIN"), FAT12_OK);
+  uint16_t free2 = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free2), FAT12_OK);
+  ASSERT_EQ(free2, free1 + 6);
+}
+
+TEST(test_failed_write_reclaims_clusters) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  uint16_t free_before = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free_before), FAT12_OK);
+
+  static uint8_t data[40000];
+  memset(data, 0xEE, sizeof(data));
+
+  fat12_writer_t w;
+  ASSERT_EQ(fat12_open_write(&fat, "LEAK.BIN", &w), FAT12_OK);
+  disk.fail_after_track_writes = 2;
+  ASSERT(fat12_write(&w, data, sizeof(data)) < 0);
+  disk.fail_after_track_writes = -1;
+  ASSERT(fat12_close_write(&w) != FAT12_OK);
+  ASSERT(!fat.batch.active);
+
+  fat12_dirent_t e;
+  ASSERT_EQ(fat12_find(&fat, "LEAK.BIN", &e), FAT12_ERR_NOT_FOUND);
+
+  uint16_t free_after = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free_after), FAT12_OK);
+  ASSERT_EQ(free_after, free_before);
+}
+
+TEST(test_volume_label_protected) {
+  vdisk_t disk;
+  vdisk_init(&disk);
+
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  ASSERT_EQ(fat12_format(io, "MYVOL", false), FAT12_OK);
+
+  fat12_t fat;
+  ASSERT_EQ(fat12_init(&fat, io), FAT12_OK);
+
+  fat12_dirent_t label;
+  ASSERT_EQ(fat12_read_root_entry(&fat, 0, &label), FAT12_OK);
+  ASSERT_EQ(label.attr, FAT12_ATTR_VOLUME_ID);
+
+  ASSERT_EQ(fat12_delete(&fat, "MYVOL"), FAT12_ERR_NOT_FOUND);
+  ASSERT_EQ(fat12_rename(&fat, "MYVOL", "OTHER"), FAT12_ERR_NOT_FOUND);
+
+  uint8_t data[100];
+  memset(data, 0x11, sizeof(data));
+  write_file(&fat, "MYVOL", data, sizeof(data));
+
+  ASSERT_EQ(fat12_read_root_entry(&fat, 0, &label), FAT12_OK);
+  ASSERT_EQ(label.attr, FAT12_ATTR_VOLUME_ID);
+  ASSERT_EQ(label.start_cluster, 0);
+  ASSERT_EQ(label.size, 0);
+
+  fat12_dirent_t e;
+  bool found_file = false;
+  for (uint16_t i = 1; i < fat.bpb.root_entries; i++) {
+    if (fat12_read_root_entry(&fat, i, &e) != FAT12_OK) break;
+    if (fat12_entry_is_end(&e)) break;
+    if (!fat12_entry_valid(&e)) continue;
+    if (memcmp(e.name, "MYVOL   ", 8) == 0 && e.attr == FAT12_ATTR_ARCHIVE) {
+      ASSERT_EQ(e.size, sizeof(data));
+      found_file = true;
+    }
+  }
+  ASSERT(found_file);
 }
 
 TEST(test_overwrite_existing_to_empty_in_place) {
@@ -1790,8 +1991,16 @@ int main(void) {
   RUN_TEST(test_overwrite_in_place_with_data_writes);
   RUN_TEST(test_seek_walks_multiple_clusters);
   RUN_TEST(test_seek_clamps_past_eof_in_fat12);
-  RUN_TEST(test_create_existing_returns_invalid);
+  RUN_TEST(test_create_existing_returns_exists);
   RUN_TEST(test_overwrite_existing_to_empty_in_place);
+  RUN_TEST(test_rename_basic);
+  RUN_TEST(test_rename_missing_source);
+  RUN_TEST(test_rename_to_existing_returns_exists);
+  RUN_TEST(test_rename_invalid_names);
+  RUN_TEST(test_rename_survives_remount);
+  RUN_TEST(test_free_count_matches_entry_walk);
+  RUN_TEST(test_failed_write_reclaims_clusters);
+  RUN_TEST(test_volume_label_protected);
   RUN_TEST(test_writer_unknown_filename_full_dir);
   RUN_TEST(test_invalid_filename_in_open_write);
   RUN_TEST(test_delete_invalid_filename);
