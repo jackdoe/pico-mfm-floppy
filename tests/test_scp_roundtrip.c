@@ -965,6 +965,181 @@ static void decode_image_from_scp_buf(uint8_t *scp_data, size_t scp_size,
     flux_sim_close(&sim);
 }
 
+TEST(test_fsck_flux_roundtrip) {
+    memcpy(disk_modified, disk_original, sizeof(disk_original));
+    image_to_vdisk(disk_modified, &shared_vdisk);
+
+    f12_t fs;
+    memset(&fs, 0, sizeof(fs));
+    ASSERT_EQ(f12_mount(&fs, make_vdisk_io(&shared_vdisk)), F12_OK);
+    printf("\n");
+
+    fat12_fsck_t report;
+    ASSERT_EQ(f12_fsck(&fs, &report, false), F12_OK);
+    printf("  original 1994 disk: files=%u dirs=%u lost=%u broken=%u cross=%u mismatch=%d\n",
+           report.files, report.directories, report.lost_clusters,
+           report.broken_chains, report.crosslinked, report.fat_mismatch);
+    ASSERT_EQ(report.lost_clusters, 0);
+    ASSERT_EQ(report.broken_chains, 0);
+    ASSERT_EQ(report.crosslinked, 0);
+    ASSERT(!report.fat_mismatch);
+    uint16_t orig_files = report.files;
+
+    uint8_t *rbuf = malloc(65536);
+    file_manifest_t manifest[MAX_MANIFEST];
+    int mc = 0;
+
+    f12_dir_t dir;
+    f12_stat_t stat;
+    f12_opendir(&fs, "/", &dir);
+    while (f12_readdir(&dir, &stat) == F12_OK && mc < MAX_MANIFEST) {
+        if (stat.is_dir) continue;
+        memset(manifest[mc].name, 0, 13);
+        strncpy(manifest[mc].name, stat.name, 12);
+        manifest[mc].size = stat.size;
+
+        f12_file_t *f = f12_open(&fs, stat.name, "r");
+        ASSERT(f != NULL);
+        uint32_t ck = 0;
+        int n;
+        while ((n = f12_read(f, rbuf, 65536)) > 0) {
+            for (int i = 0; i < n; i++) ck = (ck << 5) + ck + rbuf[i];
+        }
+        ASSERT_EQ(f12_close(f), F12_OK);
+        manifest[mc].checksum = ck;
+        mc++;
+    }
+    f12_closedir(&dir);
+    ASSERT(mc > 0);
+    printf("  %d root files in manifest (plus %u files in %u subdirectories)\n",
+           mc, (unsigned)(orig_files - mc), report.directories);
+
+    int del = -1;
+    for (int m = 0; m < mc; m++) {
+        if (manifest[m].size >= 35000 && strcmp(manifest[m].name, "LHA.DOC") != 0) {
+            del = m;
+            break;
+        }
+    }
+    ASSERT(del >= 0);
+    char deleted_name[13];
+    memcpy(deleted_name, manifest[del].name, 13);
+    ASSERT_EQ(f12_delete(&fs, deleted_name), F12_OK);
+    printf("  deleted %s (%u bytes) to make room for the ghost write\n",
+           deleted_name, manifest[del].size);
+    manifest[del] = manifest[mc - 1];
+    mc--;
+
+    uint16_t free_orig = 0;
+    ASSERT_EQ(fat12_free_count(&fs.fat, &free_orig), FAT12_OK);
+
+    fat12_dirent_t lha;
+    ASSERT_EQ(fat12_find(&fs.fat, "LHA.DOC", &lha), FAT12_OK);
+    uint16_t lha_second = 0;
+    ASSERT_EQ(fat12_get_entry(&fs.fat, lha.start_cluster, &lha_second), FAT12_OK);
+    ASSERT(lha_second >= 2);
+    uint16_t lha_clusters = (lha.size + 511) / 512;
+    ASSERT(lha_clusters > 2);
+
+    f12_file_t *ghost = f12_open(&fs, "GHOST.BIN", "w");
+    ASSERT(ghost != NULL);
+    memset(rbuf, 0xEE, 30000);
+    ASSERT_EQ(f12_write(ghost, rbuf, 30000), 30000);
+    fat12_abort_write(&fs.fat);
+    ghost->mode = F12_MODE_CLOSED;
+    printf("  damage: power cut mid-write of GHOST.BIN (30000 bytes, never closed)\n");
+
+    f12_unmount(&fs);
+
+    vdisk_set_fat_entry(&shared_vdisk, lha_second, 0);
+    shared_vdisk.data[VDISK_FAT2_START][7] ^= 0x5A;
+    printf("  damage: LHA.DOC chain broken at cluster %u, FAT2 byte flipped\n", lha_second);
+
+    memset(&fs, 0, sizeof(fs));
+    ASSERT_EQ(f12_mount(&fs, make_vdisk_io(&shared_vdisk)), F12_OK);
+    ASSERT(fs.fat.fat_mismatch);
+
+    ASSERT_EQ(f12_fsck(&fs, &report, false), F12_OK);
+    printf("  fsck check: %u lost, %u broken, %u crosslinked, mismatch=%d\n",
+           report.lost_clusters, report.broken_chains, report.crosslinked,
+           report.fat_mismatch);
+    ASSERT(report.lost_clusters >= (uint16_t)(lha_clusters - 2));
+    ASSERT_EQ(report.broken_chains, 1);
+    ASSERT_EQ(report.crosslinked, 0);
+    ASSERT(report.fat_mismatch);
+    ASSERT_EQ(report.freed, 0);
+
+    ASSERT_EQ(f12_fsck(&fs, &report, true), F12_OK);
+    ASSERT_EQ(report.freed, report.lost_clusters);
+    ASSERT(report.repaired_fat2);
+    printf("  fsck fix: freed %u clusters, terminated 1 chain, rewrote FAT2\n",
+           report.freed);
+
+    ASSERT_EQ(f12_fsck(&fs, &report, false), F12_OK);
+    ASSERT_EQ(report.lost_clusters, 0);
+    ASSERT_EQ(report.broken_chains, 0);
+    ASSERT(!report.fat_mismatch);
+
+    f12_unmount(&fs);
+
+    vdisk_to_image(&shared_vdisk, disk_modified);
+    size_t scp_size;
+    uint8_t *scp_data = scp_encode_disk(disk_modified, &scp_size);
+    ASSERT(scp_data != NULL);
+    decode_image_from_scp_buf(scp_data, scp_size, disk_roundtrip);
+    free(scp_data);
+
+    int match = 0;
+    for (int i = 0; i < 2880; i++) {
+        if (memcmp(disk_modified[i], disk_roundtrip[i], 512) == 0) match++;
+    }
+    ASSERT_EQ(match, 2880);
+    printf("  repaired disk: 2880/2880 sectors survive flux roundtrip\n");
+
+    image_to_vdisk(disk_roundtrip, &shared_vdisk);
+    memset(&fs, 0, sizeof(fs));
+    ASSERT_EQ(f12_mount(&fs, make_vdisk_io(&shared_vdisk)), F12_OK);
+    ASSERT(!fs.fat.fat_mismatch);
+
+    ASSERT_EQ(f12_fsck(&fs, &report, false), F12_OK);
+    ASSERT_EQ(report.lost_clusters, 0);
+    ASSERT_EQ(report.broken_chains, 0);
+    ASSERT_EQ(report.crosslinked, 0);
+    ASSERT(!report.fat_mismatch);
+    ASSERT_EQ(report.files, (uint16_t)(orig_files - 1));
+
+    uint16_t free_now = 0;
+    ASSERT_EQ(fat12_free_count(&fs.fat, &free_now), FAT12_OK);
+    ASSERT_EQ(free_now, (uint16_t)(free_orig + lha_clusters - 2));
+
+    for (int m = 0; m < mc; m++) {
+        f12_file_t *f = f12_open(&fs, manifest[m].name, "r");
+        ASSERT(f != NULL);
+        uint32_t total = 0;
+        uint32_t ck = 0;
+        int n;
+        while ((n = f12_read(f, rbuf, 65536)) > 0) {
+            for (int i = 0; i < n; i++) ck = (ck << 5) + ck + rbuf[i];
+            total += (uint32_t)n;
+        }
+        ASSERT_EQ(f12_close(f), F12_OK);
+
+        if (strcmp(manifest[m].name, "LHA.DOC") == 0) {
+            ASSERT_EQ(total, 1024);
+        } else {
+            ASSERT_EQ(total, manifest[m].size);
+            ASSERT_EQ(ck, manifest[m].checksum);
+        }
+    }
+    printf("  %d files verified after repair + flux roundtrip (LHA.DOC truncated to 1024 as repaired)\n", mc);
+
+    f12_stat_t ghost_stat;
+    ASSERT_EQ(f12_stat(&fs, "GHOST.BIN", &ghost_stat), F12_ERR_NOT_FOUND);
+
+    free(rbuf);
+    f12_unmount(&fs);
+}
+
 TEST(test_fuzz_roundtrip) {
     int iterations = 100;
     uint8_t *wbuf = malloc(65536);
@@ -1194,6 +1369,8 @@ int main(int argc, char *argv[]) {
 
     printf("\n--- Phase 7: Format + Fill + Delete + Refill ---\n");
     RUN_TEST(test_format_fill_delete_refill_roundtrip);
+
+    RUN_TEST(test_fsck_flux_roundtrip);
 
     printf("\n--- Phase 8: Fuzz Roundtrip (100 iterations) ---\n");
     RUN_TEST(test_fuzz_roundtrip);

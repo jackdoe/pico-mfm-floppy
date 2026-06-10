@@ -27,6 +27,7 @@ static bool fat12_layout_valid(fat12_t *fat) {
   if (per_cyl == 0) return false;
   if (fat->bpb.total_sectors % per_cyl != 0) return false;
   if (fat->bpb.total_sectors > (uint64_t)FLOPPY_TRACKS * per_cyl) return false;
+  if ((uint32_t)fat->total_clusters + 2 > 0xFF0) return false;
   return fat->total_clusters > 0;
 }
 
@@ -1141,6 +1142,214 @@ fat12_err_t fat12_rename(fat12_t *fat, const char *from, const char *to) {
   }
 
   return FAT12_ERR_NOT_FOUND;
+}
+
+#define FSCK_MAX_DIRS 16
+
+typedef struct {
+  fat12_t *fat;
+  fat12_fsck_t *out;
+  uint8_t *reachable;
+  bool repair;
+  uint16_t dirs[FSCK_MAX_DIRS];
+  uint8_t dir_count;
+} fsck_ctx_t;
+
+static inline bool fsck_reached(const uint8_t *map, uint16_t cluster) {
+  return map[cluster >> 3] & (1u << (cluster & 7));
+}
+
+static inline void fsck_reach(uint8_t *map, uint16_t cluster) {
+  map[cluster >> 3] |= 1u << (cluster & 7);
+}
+
+static fat12_err_t fsck_chain_step(fsck_ctx_t *c, uint16_t cluster, uint16_t *next) {
+  fat12_err_t err = fat12_get_entry_batched(c->fat, cluster, next);
+  if (err != FAT12_OK) return err;
+
+  if (fat12_is_eof(*next)) {
+    *next = 0;
+    return FAT12_OK;
+  }
+
+  uint16_t max_cluster = c->fat->total_clusters + 2;
+  if (*next < 2 || *next >= max_cluster || fat12_is_bad(*next)) {
+    c->out->broken_chains++;
+    *next = 0;
+    if (c->repair) {
+      return fat12_set_entry(c->fat, cluster, 0xFFF);
+    }
+  }
+  return FAT12_OK;
+}
+
+static fat12_err_t fsck_walk_file(fsck_ctx_t *c, uint16_t start) {
+  uint16_t cluster = start;
+  uint16_t max_cluster = c->fat->total_clusters + 2;
+  uint16_t limit = c->fat->total_clusters;
+
+  while (cluster >= 2 && cluster < max_cluster && limit-- > 0) {
+    if (fsck_reached(c->reachable, cluster)) {
+      c->out->crosslinked++;
+      return FAT12_OK;
+    }
+    fsck_reach(c->reachable, cluster);
+
+    uint16_t next = 0;
+    fat12_err_t err = fsck_chain_step(c, cluster, &next);
+    if (err != FAT12_OK) return err;
+    cluster = next;
+  }
+  return FAT12_OK;
+}
+
+static fat12_err_t fsck_scan_dirent(fsck_ctx_t *c, const fat12_dirent_t *e, bool *end) {
+  fat12_dirent_t entry = *e;
+
+  if (fat12_entry_is_end(&entry)) {
+    *end = true;
+    return FAT12_OK;
+  }
+  if (!fat12_entry_valid(&entry)) return FAT12_OK;
+  if (entry.attr & FAT12_ATTR_VOLUME_ID) return FAT12_OK;
+  if (entry.name[0] == '.') return FAT12_OK;
+
+  if (entry.attr & FAT12_ATTR_DIRECTORY) {
+    c->out->directories++;
+    if (entry.start_cluster >= 2) {
+      if (c->dir_count >= FSCK_MAX_DIRS) {
+        c->out->incomplete = true;
+      } else {
+        c->dirs[c->dir_count++] = entry.start_cluster;
+      }
+    }
+    return FAT12_OK;
+  }
+
+  c->out->files++;
+  return fsck_walk_file(c, entry.start_cluster);
+}
+
+static fat12_err_t fsck_walk_dir(fsck_ctx_t *c, uint16_t start) {
+  uint16_t cluster = start;
+  uint16_t max_cluster = c->fat->total_clusters + 2;
+  uint16_t limit = c->fat->total_clusters;
+  bool end = false;
+
+  while (cluster >= 2 && cluster < max_cluster && limit-- > 0) {
+    if (fsck_reached(c->reachable, cluster)) {
+      c->out->crosslinked++;
+      return FAT12_OK;
+    }
+    fsck_reach(c->reachable, cluster);
+
+    if (!end) {
+      uint16_t lba = fat12_cluster_to_lba(c->fat, cluster);
+      for (uint8_t s = 0; s < c->fat->bpb.sectors_per_cluster && !end; s++) {
+        sector_t sec;
+        if (!fat12_read_sector_batched(c->fat, lba + s, &sec)) {
+          return FAT12_ERR_READ;
+        }
+        for (uint16_t off = 0; off < SECTOR_SIZE && !end; off += FAT12_DIR_ENTRY_SIZE) {
+          fat12_err_t err = fsck_scan_dirent(c, (const fat12_dirent_t *)&sec.data[off], &end);
+          if (err != FAT12_OK) return err;
+        }
+      }
+    }
+
+    uint16_t next = 0;
+    fat12_err_t err = fsck_chain_step(c, cluster, &next);
+    if (err != FAT12_OK) return err;
+    cluster = next;
+  }
+  return FAT12_OK;
+}
+
+fat12_err_t fat12_fsck(fat12_t *fat, fat12_fsck_t *out, bool repair) {
+  static uint8_t reachable[0xFF0 / 8];
+
+  memset(out, 0, sizeof(*out));
+  memset(reachable, 0, sizeof(reachable));
+
+  if (repair) {
+    if (fat->batch.active) return FAT12_ERR_INVALID;
+    if (!fat12_batch_begin(fat)) return FAT12_ERR_READ;
+  }
+
+  fsck_ctx_t ctx = {
+    .fat = fat,
+    .out = out,
+    .reachable = reachable,
+    .repair = repair,
+  };
+
+  fat12_err_t err = FAT12_OK;
+  bool end = false;
+
+  for (uint16_t i = 0; i < fat->bpb.root_entries && !end; i++) {
+    fat12_dirent_t entry;
+    err = fat12_read_root_entry(fat, i, &entry);
+    if (err != FAT12_OK) goto out;
+    err = fsck_scan_dirent(&ctx, &entry, &end);
+    if (err != FAT12_OK) goto out;
+  }
+
+  for (uint8_t d = 0; d < ctx.dir_count; d++) {
+    err = fsck_walk_dir(&ctx, ctx.dirs[d]);
+    if (err != FAT12_OK) goto out;
+  }
+
+  {
+    fat12_scan_t scan;
+    fat12_scan_init(&scan, fat, 2);
+
+    uint16_t cluster, entry;
+    while ((err = fat12_scan_next(&scan, &cluster, &entry)) == FAT12_OK) {
+      if (fat12_is_free(entry) || fat12_is_bad(entry)) continue;
+      if (fsck_reached(reachable, cluster)) continue;
+
+      out->lost_clusters++;
+      if (repair && !out->incomplete) {
+        err = fat12_set_entry(fat, cluster, 0);
+        if (err != FAT12_OK) goto out;
+        out->freed++;
+        if (cluster < fat->next_free_hint) {
+          fat->next_free_hint = cluster;
+        }
+      }
+    }
+    if (err != FAT12_ERR_EOF) goto out;
+    err = FAT12_OK;
+  }
+
+  out->fat_mismatch = fat->fat_mismatch;
+  if (repair && fat->fat_mismatch) {
+    for (uint8_t f = 1; f < fat->bpb.num_fats; f++) {
+      for (uint16_t s = 0; s < fat->bpb.sectors_per_fat; s++) {
+        sector_t sec;
+        if (!fat12_read_sector_batched(fat, fat->fat_start_sector + s, &sec)) {
+          err = FAT12_ERR_READ;
+          goto out;
+        }
+        err = fat12_write_sector_batched(
+            fat, fat->fat_start_sector + f * fat->bpb.sectors_per_fat + s, sec.data);
+        if (err != FAT12_OK) goto out;
+      }
+    }
+    out->repaired_fat2 = true;
+  }
+
+out:
+  if (repair) {
+    if (err == FAT12_OK) {
+      err = fat12_write_batch_flush(fat);
+    }
+    fat12_abort_write(fat);
+    if (err == FAT12_OK && out->repaired_fat2) {
+      fat->fat_mismatch = false;
+    }
+  }
+  return err;
 }
 
 static void fat12_build_boot_sector(uint8_t *boot, const fat12_bpb_t *bpb,

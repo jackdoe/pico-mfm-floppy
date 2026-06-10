@@ -262,6 +262,20 @@ f12_err_t f12_format(f12_t *fs, const char *label, bool full) {
   return F12_OK;
 }
 
+f12_err_t f12_fsck(f12_t *fs, fat12_fsck_t *report, bool repair) {
+  if (!fs || !report) return F12_ERR_INVALID;
+
+  f12_err_t err = repair ? f12_check_writable(fs) : f12_check_disk(fs);
+  if (err != F12_OK) return err;
+
+  fat12_err_t ferr = fat12_fsck(&fs->fat, report, repair);
+  if (ferr != FAT12_OK) {
+    return f12_set_error(fs, fat12_to_f12_err(ferr));
+  }
+
+  return F12_OK;
+}
+
 f12_file_t *f12_open(f12_t *fs, const char *path, const char *mode) {
   if (!fs || !path || !mode) {
     f12_set_error(fs, F12_ERR_INVALID);

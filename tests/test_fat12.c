@@ -1773,6 +1773,277 @@ TEST(test_failed_write_reclaims_clusters) {
   ASSERT_EQ(free_after, free_before);
 }
 
+TEST(test_fsck_clean) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  uint8_t data[2000];
+  memset(data, 0x42, sizeof(data));
+  write_file(&fat, "A.BIN", data, sizeof(data));
+
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT_EQ(report.files, 1);
+  ASSERT_EQ(report.lost_clusters, 0);
+  ASSERT_EQ(report.broken_chains, 0);
+  ASSERT_EQ(report.crosslinked, 0);
+  ASSERT(!report.fat_mismatch);
+}
+
+TEST(test_fsck_lost_clusters) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  uint8_t data[2000];
+  memset(data, 0x42, sizeof(data));
+  write_file(&fat, "A.BIN", data, sizeof(data));
+
+  uint16_t free_before = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free_before), FAT12_OK);
+
+  vdisk_set_fat_entry(&disk, 100, 0xFFF);
+  vdisk_set_fat_entry(&disk, 200, 201);
+  vdisk_set_fat_entry(&disk, 201, 0xFFF);
+
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT_EQ(report.lost_clusters, 3);
+  ASSERT_EQ(report.freed, 0);
+
+  ASSERT_EQ(fat12_fsck(&fat, &report, true), FAT12_OK);
+  ASSERT_EQ(report.lost_clusters, 3);
+  ASSERT_EQ(report.freed, 3);
+
+  uint16_t free_after = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free_after), FAT12_OK);
+  ASSERT_EQ(free_after, free_before);
+
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT_EQ(report.lost_clusters, 0);
+
+  fat12_dirent_t e;
+  ASSERT_EQ(fat12_find(&fat, "A.BIN", &e), FAT12_OK);
+  fat12_file_t file;
+  fat12_open(&fat, &e, &file);
+  uint8_t buf[sizeof(data)];
+  ASSERT_EQ(fat12_read(&file, buf, sizeof(buf)), (int)sizeof(buf));
+  ASSERT(memcmp(buf, data, sizeof(data)) == 0);
+}
+
+TEST(test_fsck_broken_chain) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  uint8_t data[2048];
+  memset(data, 0x42, sizeof(data));
+  write_file(&fat, "A.BIN", data, sizeof(data));
+
+  fat12_dirent_t e;
+  ASSERT_EQ(fat12_find(&fat, "A.BIN", &e), FAT12_OK);
+  uint16_t second = 0;
+  ASSERT_EQ(fat12_get_entry(&fat, e.start_cluster, &second), FAT12_OK);
+  ASSERT(second >= 2);
+
+  vdisk_set_fat_entry(&disk, second, 0);
+
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT_EQ(report.broken_chains, 1);
+  ASSERT_EQ(report.lost_clusters, 2);
+
+  ASSERT_EQ(fat12_fsck(&fat, &report, true), FAT12_OK);
+  ASSERT_EQ(report.broken_chains, 1);
+  ASSERT_EQ(report.freed, 2);
+
+  uint16_t next = 0;
+  ASSERT_EQ(fat12_get_entry(&fat, second, &next), FAT12_OK);
+  ASSERT(fat12_is_eof(next));
+
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT_EQ(report.broken_chains, 0);
+  ASSERT_EQ(report.lost_clusters, 0);
+}
+
+TEST(test_fsck_crosslink_reported_not_freed) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  uint8_t data[2000];
+  memset(data, 0x42, sizeof(data));
+  write_file(&fat, "A.BIN", data, sizeof(data));
+
+  fat12_dirent_t e;
+  ASSERT_EQ(fat12_find(&fat, "A.BIN", &e), FAT12_OK);
+
+  fat12_dirent_t fake;
+  memset(&fake, 0, sizeof(fake));
+  memcpy(fake.name, "CROSS   ", 8);
+  memcpy(fake.ext, "BIN", 3);
+  fake.attr = FAT12_ATTR_ARCHIVE;
+  fake.start_cluster = e.start_cluster;
+  fake.size = e.size;
+  memcpy(&disk.data[fat.root_dir_start_sector][FAT12_DIR_ENTRY_SIZE], &fake, sizeof(fake));
+
+  uint16_t free_before = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free_before), FAT12_OK);
+
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, true), FAT12_OK);
+  ASSERT_EQ(report.files, 2);
+  ASSERT_EQ(report.crosslinked, 1);
+  ASSERT_EQ(report.freed, 0);
+
+  uint16_t free_after = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free_after), FAT12_OK);
+  ASSERT_EQ(free_after, free_before);
+
+  fat12_file_t file;
+  fat12_open(&fat, &e, &file);
+  uint8_t buf[sizeof(data)];
+  ASSERT_EQ(fat12_read(&file, buf, sizeof(buf)), (int)sizeof(buf));
+  ASSERT(memcmp(buf, data, sizeof(data)) == 0);
+}
+
+TEST(test_fsck_repairs_fat2) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  disk.data[VDISK_FAT2_START][5] ^= 0xFF;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  ASSERT_EQ(fat12_init(&fat, io), FAT12_OK);
+  ASSERT(fat.fat_mismatch);
+
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, true), FAT12_OK);
+  ASSERT(report.fat_mismatch);
+  ASSERT(report.repaired_fat2);
+  ASSERT(!fat.fat_mismatch);
+
+  fat12_t fat2;
+  ASSERT_EQ(fat12_init(&fat2, io), FAT12_OK);
+  ASSERT(!fat2.fat_mismatch);
+}
+
+TEST(test_fsck_reclaims_abandoned_write) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  uint16_t free_before = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free_before), FAT12_OK);
+
+  static uint8_t data[30000];
+  memset(data, 0xEE, sizeof(data));
+
+  fat12_writer_t w;
+  ASSERT_EQ(fat12_open_write(&fat, "GHOST.BIN", &w), FAT12_OK);
+  ASSERT_EQ(fat12_write(&w, data, sizeof(data)), (int)sizeof(data));
+  fat12_abort_write(&fat);
+
+  uint16_t free_leaked = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free_leaked), FAT12_OK);
+  ASSERT(free_leaked < free_before);
+
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT(report.lost_clusters > 0);
+
+  ASSERT_EQ(fat12_fsck(&fat, &report, true), FAT12_OK);
+  ASSERT_EQ(report.freed, report.lost_clusters);
+
+  uint16_t free_after = 0;
+  ASSERT_EQ(fat12_free_count(&fat, &free_after), FAT12_OK);
+  ASSERT_EQ(free_after, free_before);
+
+  fat12_dirent_t e;
+  ASSERT_EQ(fat12_find(&fat, "GHOST.BIN", &e), FAT12_ERR_NOT_FOUND);
+}
+
+TEST(test_fsck_walks_subdirectories) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  vdisk_set_fat_entry(&disk, 2, 0xFFF);
+  vdisk_set_fat_entry(&disk, 3, 4);
+  vdisk_set_fat_entry(&disk, 4, 0xFFF);
+
+  fat12_dirent_t d;
+  memset(&d, 0, sizeof(d));
+  memcpy(d.name, "SUBDIR  ", 8);
+  memcpy(d.ext, "   ", 3);
+  d.attr = FAT12_ATTR_DIRECTORY;
+  d.start_cluster = 2;
+  memcpy(&disk.data[fat.root_dir_start_sector][0], &d, sizeof(d));
+
+  uint16_t sub_lba = fat.data_start_sector;
+  memset(disk.data[sub_lba], 0, SECTOR_SIZE);
+
+  fat12_dirent_t dot;
+  memset(&dot, 0, sizeof(dot));
+  memcpy(dot.name, ".       ", 8);
+  memcpy(dot.ext, "   ", 3);
+  dot.attr = FAT12_ATTR_DIRECTORY;
+  dot.start_cluster = 2;
+  memcpy(&disk.data[sub_lba][0], &dot, sizeof(dot));
+
+  memcpy(dot.name, "..      ", 8);
+  dot.start_cluster = 0;
+  memcpy(&disk.data[sub_lba][32], &dot, sizeof(dot));
+
+  fat12_dirent_t inner;
+  memset(&inner, 0, sizeof(inner));
+  memcpy(inner.name, "INNER   ", 8);
+  memcpy(inner.ext, "BIN", 3);
+  inner.attr = FAT12_ATTR_ARCHIVE;
+  inner.start_cluster = 3;
+  inner.size = 600;
+  memcpy(&disk.data[sub_lba][64], &inner, sizeof(inner));
+
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT_EQ(report.directories, 1);
+  ASSERT_EQ(report.files, 1);
+  ASSERT_EQ(report.lost_clusters, 0);
+  ASSERT_EQ(report.crosslinked, 0);
+  ASSERT(!report.incomplete);
+
+  vdisk_set_fat_entry(&disk, 50, 0xFFF);
+
+  ASSERT_EQ(fat12_fsck(&fat, &report, true), FAT12_OK);
+  ASSERT_EQ(report.lost_clusters, 1);
+  ASSERT_EQ(report.freed, 1);
+
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT_EQ(report.lost_clusters, 0);
+  ASSERT_EQ(report.directories, 1);
+  ASSERT_EQ(report.files, 1);
+}
+
 TEST(test_volume_label_protected) {
   vdisk_t disk;
   vdisk_init(&disk);
@@ -2000,6 +2271,13 @@ int main(void) {
   RUN_TEST(test_rename_survives_remount);
   RUN_TEST(test_free_count_matches_entry_walk);
   RUN_TEST(test_failed_write_reclaims_clusters);
+  RUN_TEST(test_fsck_clean);
+  RUN_TEST(test_fsck_lost_clusters);
+  RUN_TEST(test_fsck_broken_chain);
+  RUN_TEST(test_fsck_crosslink_reported_not_freed);
+  RUN_TEST(test_fsck_repairs_fat2);
+  RUN_TEST(test_fsck_reclaims_abandoned_write);
+  RUN_TEST(test_fsck_walks_subdirectories);
   RUN_TEST(test_volume_label_protected);
   RUN_TEST(test_writer_unknown_filename_full_dir);
   RUN_TEST(test_invalid_filename_in_open_write);

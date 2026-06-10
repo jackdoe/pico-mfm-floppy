@@ -12,7 +12,7 @@ Verified against 9 real floppy disks (System Shock, 1994) decoded from raw magne
 Application
     │
     ▼
-f12 API ──── open / read / write / seek / delete / rename / readdir
+f12 API ──── open / read / write / seek / delete / rename / readdir / fsck
     │
     ▼
 LRU Cache ── 54 sectors (3 tracks)
@@ -108,25 +108,27 @@ Tests (host-side, no hardware needed):
 
 **Write-verify-retry** — every track write is verified by reading back and comparing all 18 sectors byte-for-byte. Each write attempt retries the verify read up to 3 times (with head jog between each) before re-writing. Three write attempts with escalating recovery: write+verify, write+verify, recalibrate+write+verify. Reports exactly which sectors failed.
 
+**Explicit fsck, read-only mount** — mounting never modifies the disk. `fsck` detects lost clusters, broken chains, cross-linked files, and FAT copy mismatches; `fsck fix` frees lost chains, terminates broken ones, and rewrites FAT2 from FAT1. The CLI warns after mount if the filesystem is dirty.
+
 **Batch-aware FAT writes** — the write batch system coalesces sector writes by track and deduplicates FAT sector updates in-place, minimizing physical I/O. The free cluster search reads through the batch to see pending FAT updates, avoiding unnecessary flushes.
 
 **Shared write batch** — a single 18KB write batch in `fat12_t` is shared across all writers, eliminating 166KB of wasted memory from per-file-handle batch storage.
 
 ## Testing
 
-251 unit tests, 12,001 fuzz iterations, 100 SCP roundtrip fuzz iterations. Tested against real 1994 floppy disks. Tests run for both RP2040 and RP2350 configurations.
+259 unit tests, 12,001 fuzz iterations, 100 SCP roundtrip fuzz iterations. Tested against real 1994 floppy disks. Tests run for both RP2040 and RP2350 configurations.
 
 ```
 tests/
 ├── test_lru.c            32 tests: cache operations, eviction, edge cases
 ├── test_mfm.c            15 tests: encode/decode roundtrip, all byte patterns
-├── test_fat12.c          69 tests: filesystem operations, format, rename, cluster chains
+├── test_fat12.c          76 tests: filesystem operations, format, rename, fsck, cluster chains
 ├── test_f12.c            51 tests: high-level API, directory listing, seek, rename
 ├── test_robustness.c     29 tests: corrupt BPB, invalid pulses, truncated sectors
 ├── test_fuzz.c           12,001 iterations: random pulses, corrupt disks, FAT chaos
 ├── test_flux_sim.c        9 tests: synthetic flux + real SCP decode (all 9 disks)
 ├── test_scp_fat12.c       7 tests: mount SCP as FAT12, list files, read content
-├── test_scp_roundtrip.c   8 tests: decode→modify→encode→decode→verify + fuzz
+├── test_scp_roundtrip.c   9 tests: decode→modify→encode→decode→verify, fsck repair, fuzz
 ├── test_pio_sim.c        11 tests: real floppy.c code with PIO hardware simulation
 ├── test_pio_emu.c         3 tests: cycle-accurate PIO instruction emulation
 ├── test_write_verify.c    7 tests: write-verify-retry through full firmware + PIO sim, cache-skip-flux-read

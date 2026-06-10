@@ -54,6 +54,7 @@ static void cmd_cp(int argc, char **argv);
 static void cmd_mv(int argc, char **argv);
 static void cmd_stat(int argc, char **argv);
 static void cmd_format(int argc, char **argv);
+static void cmd_fsck(int argc, char **argv);
 static void cmd_mount(int argc, char **argv);
 static void cmd_unmount(int argc, char **argv);
 static void cmd_status(int argc, char **argv);
@@ -91,6 +92,7 @@ static const cmd_entry_t commands[] = {
   {"mv",      NULL,    cmd_mv,      true,  "mv <src> <dst>",      "Move/rename file"},
   {"stat",    NULL,    cmd_stat,    true,  "stat <file>",         "File details and cluster chain"},
   {"format",  NULL,    cmd_format,  false, "format [label] [full]","Format disk"},
+  {"fsck",    NULL,    cmd_fsck,    true,  "fsck [fix]",          "Check filesystem, 'fix' repairs"},
   {"mount",   NULL,    cmd_mount,   false, "mount",               "Mount filesystem"},
   {"unmount", "umount",cmd_unmount, false, "unmount",             "Unmount filesystem"},
   {"status",  "info",  cmd_status,  false, "status",              "Drive status and disk info"},
@@ -1036,6 +1038,50 @@ static void cmd_format(int argc, char **argv) {
   }
 }
 
+static bool fsck_dirty(const fat12_fsck_t *r) {
+  return r->lost_clusters || r->broken_chains || r->crosslinked || r->fat_mismatch;
+}
+
+static void print_fsck_report(const fat12_fsck_t *r) {
+  printf("  Files:         %u\n", r->files);
+  if (r->directories) {
+    printf("  Directories:   %u\n", r->directories);
+  }
+  if (r->incomplete) {
+    printf("  WARNING: too many directories, scan incomplete; lost-cluster repair disabled\n");
+  }
+  printf("  Lost clusters: %u\n", r->lost_clusters);
+  printf("  Broken chains: %u\n", r->broken_chains);
+  printf("  Crosslinked:   %u\n", r->crosslinked);
+  if (r->fat_mismatch) {
+    printf("  FAT copies:    MISMATCH%s\n", r->repaired_fat2 ? " (FAT2 rewritten from FAT1)" : "");
+  }
+  if (r->freed) {
+    printf("  Freed:         %u clusters\n", r->freed);
+  }
+}
+
+static void cmd_fsck(int argc, char **argv) {
+  bool fix = (argc >= 2 && strcasecmp(argv[1], "fix") == 0);
+
+  fat12_fsck_t report;
+  f12_err_t err = f12_fsck(&fs, &report, fix);
+  if (err != F12_OK) {
+    printf("Error: %s\n", f12_strerror(err));
+    return;
+  }
+
+  print_fsck_report(&report);
+
+  if (fix) {
+    printf("  Result: %s\n", report.crosslinked ? "repaired (crosslinks need manual attention)" : "repaired");
+  } else if (fsck_dirty(&report)) {
+    printf("  Result: DIRTY -- run 'fsck fix' to repair\n");
+  } else {
+    printf("  Result: clean\n");
+  }
+}
+
 static void cmd_mount(int argc, char **argv) {
   (void)argc; (void)argv;
   if (mounted) {
@@ -1046,9 +1092,18 @@ static void cmd_mount(int argc, char **argv) {
   f12_err_t err = do_mount();
   if (err != F12_OK) {
     printf("Mount error: %s\n", f12_strerror(err));
-  } else {
-    printf("Mounted.\n");
-    mounted = true;
+    return;
+  }
+
+  printf("Mounted.\n");
+  mounted = true;
+
+  fat12_fsck_t report;
+  if (f12_fsck(&fs, &report, false) == F12_OK && fsck_dirty(&report)) {
+    printf("WARNING: filesystem dirty: %u lost clusters, %u broken chains, %u crosslinked%s\n",
+           report.lost_clusters, report.broken_chains, report.crosslinked,
+           report.fat_mismatch ? ", FAT copies disagree" : "");
+    printf("Nothing was modified. Run 'fsck fix' to repair.\n");
   }
 }
 

@@ -141,8 +141,21 @@ typedef struct {
   uint8_t cluster_buf[FAT12_MAX_CLUSTER_SECTORS * SECTOR_SIZE];
 } fat12_writer_t;
 
+typedef struct {
+  uint16_t files;
+  uint16_t directories;
+  uint16_t lost_clusters;
+  uint16_t crosslinked;
+  uint16_t broken_chains;
+  uint16_t freed;
+  bool fat_mismatch;
+  bool repaired_fat2;
+  bool incomplete;
+} fat12_fsck_t;
+
 fat12_err_t fat12_init(fat12_t *fat, fat12_io_t io);
 fat12_err_t fat12_format(fat12_io_t io, const char *volume_label, bool write_all_tracks);
+fat12_err_t fat12_fsck(fat12_t *fat, fat12_fsck_t *out, bool repair);
 void fat12_abort_write(fat12_t *fat);
 
 fat12_err_t fat12_get_entry(fat12_t *fat, uint16_t cluster, uint16_t *next);

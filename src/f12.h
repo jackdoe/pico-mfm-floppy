@@ -86,6 +86,7 @@ struct f12 {
 f12_err_t f12_mount(f12_t *fs, f12_io_t io);
 void f12_unmount(f12_t *fs);
 f12_err_t f12_format(f12_t *fs, const char *label, bool full);
+f12_err_t f12_fsck(f12_t *fs, fat12_fsck_t *report, bool repair);
 
 f12_file_t *f12_open(f12_t *fs, const char *path, const char *mode);
 f12_err_t f12_close(f12_file_t *file);
