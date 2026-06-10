@@ -72,6 +72,10 @@ static void cmd_selftest2(int argc, char **argv);
 static void cmd_selftest3(int argc, char **argv);
 static void cmd_selftest3_a(int argc, char **argv);
 static void cmd_selftest3_b(int argc, char **argv);
+static void cmd_selftest4(int argc, char **argv);
+static void cmd_crashtest(int argc, char **argv);
+static void cmd_crashcheck(int argc, char **argv);
+static void cmd_rpm(int argc, char **argv);
 static void cmd_test_full(int argc, char **argv);
 static void cmd_starwars(int argc, char **argv);
 static void cmd_diskdump(int argc, char **argv);
@@ -110,6 +114,10 @@ static const cmd_entry_t commands[] = {
   {"selftest3",NULL,   cmd_selftest3,false,"selftest3 [rounds]",  "Patch-specific full-disk overwrite test"},
   {"selftest3-a",NULL, cmd_selftest3_a,false,"selftest3-a [rounds]","Format + prepare reboot-resume overwrite test"},
   {"selftest3-b",NULL, cmd_selftest3_b,false,"selftest3-b [rounds]","Resume selftest3 after power cycle without format"},
+  {"selftest4",NULL,   cmd_selftest4,false, "selftest4",           "Simulated power-loss leak + fsck repair on real media"},
+  {"crashtest",NULL,   cmd_crashtest,false, "crashtest",           "Endless overwrite loop -- pull power mid-write"},
+  {"crashcheck",NULL,  cmd_crashcheck,false,"crashcheck",          "Verify filesystem after crashtest power cut"},
+  {"rpm",     NULL,    cmd_rpm,     false, "rpm",                  "Measure spindle speed from index pulses"},
   {"test-full",NULL,   cmd_test_full,false,"test-full [rounds]", "Full hardware test sequence, no selftest3"},
   {"starwars", NULL,   cmd_starwars, false,"starwars",            "Imperial March on the stepper motor"},
   {"diskdump",NULL,    cmd_diskdump,false, "diskdump [quiet]",    "Full disk sector scan + retry summary"},
@@ -552,6 +560,7 @@ static bool verify_pattern_windows(const char *name, int file_id, uint32_t file_
 #define SELFTEST3_STATE_VERSION 1u
 #define SELFTEST3_STAGE_A_READY 1u
 #define SELFTEST3_STAGE_B_DONE  2u
+#define SELFTEST3_STAGE_CRASH_READY 3u
 #define SELFTEST3_RANDOM_SEED   0x13579BDFu
 #define SELFTEST3_BYTE_FILE     "BYTEIO.BIN"
 #define SELFTEST3_TARGET_FILE   "TARGET.BIN"
@@ -1618,6 +1627,7 @@ static void cmd_test_full(int argc, char **argv) {
   check(dump.total_invalid == 0, "no unreadable sectors", &pass, &fail);
   check(dump.retries.failed == 0, "no final read failures", &pass, &fail);
   check(dump.retries.recovered <= 8, "recovered read retry threshold", &pass, &fail);
+  check(dump.retries.overruns == 0, "no flux ring overruns", &pass, &fail);
 
 done:
   if (mounted) {
@@ -2574,6 +2584,11 @@ static void cmd_selftest3_b(int argc, char **argv) {
   check(fs_cluster_size() == state.cluster_size, "cluster size matches saved state", &pass, &fail);
 
   printf("\n--- Phase B1: Verify Post-Reboot State ---\n");
+  {
+    fat12_fsck_t fsck_report;
+    check(f12_fsck(&fs, &fsck_report, false) == F12_OK && !fsck_dirty(&fsck_report),
+          "fsck clean after reboot", &pass, &fail);
+  }
   check(verify_pattern_file_chunked(SELFTEST3_BYTE_FILE, (int)state.byte_id, state.byte_size, 1, NULL),
         "BYTEIO.BIN survived reboot", &pass, &fail);
   check(verify_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)state.target_id, state.target_size, 113, NULL),
@@ -2724,6 +2739,346 @@ done_b:
   }
   floppy_motor_off(&floppy);
   floppy_select(&floppy, false);
+}
+
+static void cmd_rpm(int argc, char **argv) {
+  (void)argc; (void)argv;
+
+  touch_io_time();
+  floppy_select(&floppy, true);
+  floppy_motor_on(&floppy);
+
+  printf("  Measuring 5 index periods...\n");
+
+  uint32_t periods[5];
+  int got = 0;
+  bool prev = gpio_get(floppy.pins.index);
+  absolute_time_t last = {0};
+  bool have_last = false;
+  absolute_time_t deadline = make_timeout_time_ms(3000);
+
+  while (got < 5) {
+    if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
+      printf("  TIMEOUT: no index pulses. Disk inserted? Motor spinning?\n");
+      return;
+    }
+    bool now = gpio_get(floppy.pins.index);
+    if (now && !prev) {
+      absolute_time_t t = get_absolute_time();
+      if (have_last) {
+        periods[got++] = (uint32_t)absolute_time_diff_us(last, t);
+      }
+      last = t;
+      have_last = true;
+    }
+    prev = now;
+  }
+
+  uint32_t sum = 0, min = ~0u, max = 0;
+  for (int i = 0; i < 5; i++) {
+    sum += periods[i];
+    if (periods[i] < min) min = periods[i];
+    if (periods[i] > max) max = periods[i];
+  }
+  uint32_t avg = sum / 5;
+  uint32_t rpm_x10 = avg ? 600000000u / avg : 0;
+  int32_t dev_pm = avg ? (int32_t)(((int64_t)avg - 200000) * 1000 / 200000) : 0;
+  int32_t dev_abs = dev_pm < 0 ? -dev_pm : dev_pm;
+
+  printf("  Period:    avg %lu us (min %lu, max %lu, spread %lu)\n", avg, min, max, max - min);
+  printf("  Speed:     %lu.%lu RPM (nominal 300.0)\n", rpm_x10 / 10, rpm_x10 % 10);
+  printf("  Deviation: %s%ld.%ld%%\n", dev_pm < 0 ? "-" : "+", dev_abs / 10, dev_abs % 10);
+  if (dev_abs > 50) {
+    printf("  WARNING: more than 5%% off nominal -- writes may be unreliable\n");
+  } else if (dev_abs > 15) {
+    printf("  NOTE: more than 1.5%% off nominal, within decoder tolerance\n");
+  } else {
+    printf("  Spindle speed OK\n");
+  }
+}
+
+static void cmd_selftest4(int argc, char **argv) {
+  (void)argc; (void)argv;
+
+  printf("This will FORMAT the disk and test fsck against a simulated power-loss leak.\n");
+  printf("Continue? [y/N] ");
+
+  char line[CMD_BUF_SIZE];
+  cli_readline(line, sizeof(line));
+  if (line[0] != 'y' && line[0] != 'Y') {
+    printf("Cancelled.\n");
+    return;
+  }
+
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+
+  setup_io();
+  f12_err_t err = f12_format(&fs, "FSCKTEST", false);
+  if (err != F12_OK) {
+    printf("Format failed: %s\n", f12_strerror(err));
+    return;
+  }
+  err = do_mount();
+  if (err != F12_OK) {
+    printf("Mount failed: %s\n", f12_strerror(err));
+    return;
+  }
+  mounted = true;
+  floppy_stats_reset(&floppy);
+
+  int pass = 0;
+  int fail = 0;
+  struct { const char *name; uint32_t size; int id; } files[] = {
+    {"KEEP1.BIN", 3000, 8001},
+    {"KEEP2.BIN", 8000, 8002},
+    {"KEEP3.BIN", 20000, 8003},
+  };
+
+  printf("\n--- Phase 1: Baseline Files ---\n");
+  for (int i = 0; i < 3; i++) {
+    uint32_t written = 0;
+    f12_err_t close_err = F12_OK;
+    bool ok = write_pattern_file_chunked(files[i].name, files[i].id, files[i].size,
+                                         512, &written, &close_err);
+    char tag[64];
+    snprintf(tag, sizeof(tag), "write %s", files[i].name);
+    check(ok && written == files[i].size && close_err == F12_OK, tag, &pass, &fail);
+  }
+
+  uint16_t free_before = count_free_clusters();
+  printf("  Free before leak: %u clusters\n", free_before);
+
+  printf("\n--- Phase 2: Simulated Power Cut Mid-Write ---\n");
+  f12_file_t *ghost = f12_open(&fs, "GHOST.BIN", "w");
+  check(ghost != NULL, "open GHOST.BIN for write", &pass, &fail);
+  if (ghost) {
+    fill_pattern(self_buf, 8999, 30000);
+    int n = f12_write(ghost, self_buf, 30000);
+    check(n == 30000, "stream 30000 bytes to disk", &pass, &fail);
+    fat12_abort_write(&fs.fat);
+    ghost->mode = F12_MODE_CLOSED;
+    printf("  power cut simulated: writer abandoned, close never ran\n");
+  }
+
+  printf("\n--- Phase 3: Detect ---\n");
+  fat12_fsck_t report;
+  check(f12_fsck(&fs, &report, false) == F12_OK, "fsck check runs", &pass, &fail);
+  print_fsck_report(&report);
+  check(report.lost_clusters > 0, "leak detected on real media", &pass, &fail);
+  check(f12_stat(&fs, "GHOST.BIN", &(f12_stat_t){0}) == F12_ERR_NOT_FOUND,
+        "GHOST.BIN has no dirent", &pass, &fail);
+  uint16_t lost = report.lost_clusters;
+
+  printf("\n--- Phase 4: Repair ---\n");
+  check(f12_fsck(&fs, &report, true) == F12_OK && report.freed == lost,
+        "fsck fix frees the leak", &pass, &fail);
+  check(f12_fsck(&fs, &report, false) == F12_OK && !fsck_dirty(&report),
+        "fsck clean after fix", &pass, &fail);
+  check(count_free_clusters() == free_before, "free clusters fully restored", &pass, &fail);
+
+  printf("\n--- Phase 5: Survivors Intact After Remount ---\n");
+  f12_unmount(&fs);
+  mounted = false;
+  err = do_mount();
+  check(err == F12_OK, "remount", &pass, &fail);
+  if (err == F12_OK) {
+    mounted = true;
+    check(f12_fsck(&fs, &report, false) == F12_OK && !fsck_dirty(&report),
+          "fsck clean after remount", &pass, &fail);
+    for (int i = 0; i < 3; i++) {
+      char tag[64];
+      snprintf(tag, sizeof(tag), "verify %s", files[i].name);
+      check(verify_pattern_file_chunked(files[i].name, files[i].id, files[i].size, 512, NULL),
+            tag, &pass, &fail);
+    }
+  }
+
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+
+  floppy_stats_t drive_stats = floppy_stats(&floppy);
+  printf("\n--- Drive Stats ---\n");
+  print_drive_stats(&drive_stats);
+
+  printf("\n=== Selftest4 Complete ===\n");
+  printf("  Checks: %d passed, %d failed\n", pass, fail);
+  printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
+}
+
+static void cmd_crashtest(int argc, char **argv) {
+  (void)argc; (void)argv;
+
+  printf("This will FORMAT the disk, then overwrite TARGET.BIN forever.\n");
+  printf("PULL THE POWER mid-write whenever you like, then reboot and run 'crashcheck'.\n");
+  printf("Continue? [y/N] ");
+
+  char line[CMD_BUF_SIZE];
+  cli_readline(line, sizeof(line));
+  if (line[0] != 'y' && line[0] != 'Y') {
+    printf("Cancelled.\n");
+    return;
+  }
+
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+
+  setup_io();
+  f12_err_t err = f12_format(&fs, "CRASH", false);
+  if (err != F12_OK) {
+    printf("Format failed: %s\n", f12_strerror(err));
+    return;
+  }
+  err = do_mount();
+  if (err != F12_OK) {
+    printf("Mount failed: %s\n", f12_strerror(err));
+    return;
+  }
+  mounted = true;
+
+  selftest3_state_t state;
+  memset(&state, 0, sizeof(state));
+  memcpy(state.magic, SELFTEST3_STATE_MAGIC, sizeof(state.magic));
+  state.version = SELFTEST3_STATE_VERSION;
+  state.stage = SELFTEST3_STAGE_CRASH_READY;
+  state.byte_id = 9000;
+  state.byte_size = 4096;
+  state.target_id = 9200;
+  state.target_size = 16384;
+  state.filler_id = 9100;
+  state.cluster_size = fs_cluster_size();
+
+  uint32_t written = 0;
+  f12_err_t close_err = F12_OK;
+  if (!write_pattern_file_chunked(SELFTEST3_BYTE_FILE, (int)state.byte_id, state.byte_size,
+                                  512, &written, &close_err) ||
+      written != state.byte_size || close_err != F12_OK) {
+    printf("BYTEIO.BIN write failed\n");
+    goto out;
+  }
+
+  uint16_t free_cl = count_free_clusters();
+  if (free_cl <= 64) {
+    printf("Not enough free space\n");
+    goto out;
+  }
+  state.filler_size = (uint32_t)(free_cl - 64) * state.cluster_size;
+  if (!write_pattern_file_chunked(SELFTEST3_FILLER_FILE, (int)state.filler_id, state.filler_size,
+                                  4096, &written, &close_err) ||
+      written != state.filler_size || close_err != F12_OK) {
+    printf("FILLER.BIN write failed\n");
+    goto out;
+  }
+
+  if (!selftest3_store_state(&state)) {
+    printf("State file write failed\n");
+    goto out;
+  }
+
+  printf("  Prepared: BYTEIO.BIN (%lu), FILLER.BIN (%lu), 64 clusters free\n",
+         state.byte_size, state.filler_size);
+  printf("  Overwriting TARGET.BIN (%lu bytes) forever.\n", state.target_size);
+  printf("  PULL POWER ANYTIME. Any key aborts cleanly.\n\n");
+
+  for (uint32_t round = 1;; round++) {
+    bool ok = write_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)state.target_id,
+                                         state.target_size, 512, &written, &close_err);
+    if (!ok || written != state.target_size || close_err != F12_OK) {
+      printf("  round %lu: write failed (%s)\n", round, f12_strerror(close_err));
+      goto out;
+    }
+    printf("  round %lu done -- pull power now or any key to abort\n", round);
+
+    if (getchar_timeout_us(0) != PICO_ERROR_TIMEOUT) {
+      printf("  Aborted cleanly. Run 'crashcheck' anyway to confirm clean state.\n");
+      goto out;
+    }
+  }
+
+out:
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+  floppy_motor_off(&floppy);
+  floppy_select(&floppy, false);
+}
+
+static void cmd_crashcheck(int argc, char **argv) {
+  (void)argc; (void)argv;
+
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+
+  int pass = 0;
+  int fail = 0;
+
+  printf("\n--- Phase 1: Mount After Crash ---\n");
+  f12_err_t err = do_mount();
+  check(err == F12_OK, "disk mounts after power cut", &pass, &fail);
+  if (err != F12_OK) {
+    printf("Run 'crashtest' first.\n");
+    return;
+  }
+  mounted = true;
+
+  selftest3_state_t state;
+  if (!selftest3_load_state(&state) || state.stage != SELFTEST3_STAGE_CRASH_READY) {
+    printf("No crashtest state on this disk. Run 'crashtest' first.\n");
+    goto out;
+  }
+
+  printf("\n--- Phase 2: Damage Report ---\n");
+  fat12_fsck_t report;
+  check(f12_fsck(&fs, &report, false) == F12_OK, "fsck check runs", &pass, &fail);
+  print_fsck_report(&report);
+  if (fsck_dirty(&report)) {
+    printf("  Power cut landed mid-write: filesystem dirty (expected)\n");
+  } else {
+    printf("  Power cut landed between writes: filesystem already clean\n");
+  }
+
+  printf("\n--- Phase 3: Repair And Converge ---\n");
+  check(f12_fsck(&fs, &report, true) == F12_OK, "fsck fix runs", &pass, &fail);
+  check(f12_fsck(&fs, &report, false) == F12_OK && !fsck_dirty(&report),
+        "fsck clean after fix", &pass, &fail);
+
+  printf("\n--- Phase 4: Stable Files Survived ---\n");
+  check(verify_pattern_file_chunked(SELFTEST3_BYTE_FILE, (int)state.byte_id,
+                                    state.byte_size, 512, NULL),
+        "BYTEIO.BIN intact", &pass, &fail);
+  check(verify_pattern_file_chunked(SELFTEST3_FILLER_FILE, (int)state.filler_id,
+                                    state.filler_size, 4096, NULL),
+        "FILLER.BIN intact", &pass, &fail);
+
+  printf("\n--- Phase 5: Crash Victim ---\n");
+  if (verify_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)state.target_id,
+                                  state.target_size, 512, NULL)) {
+    check(true, "TARGET.BIN intact (old content preserved through crash)", &pass, &fail);
+  } else {
+    printf("  TARGET.BIN damaged: cut landed in the dirent commit window\n");
+    printf("  (rare and expected occasionally; stable files above are the real test)\n");
+  }
+
+out:
+  if (mounted) {
+    f12_unmount(&fs);
+    mounted = false;
+  }
+  floppy_motor_off(&floppy);
+  floppy_select(&floppy, false);
+
+  printf("\n=== Crashcheck Complete ===\n");
+  printf("  Checks: %d passed, %d failed\n", pass, fail);
+  printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
 }
 
 static void floppy_play_note(uint16_t freq, uint16_t ms) {

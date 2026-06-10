@@ -1,6 +1,7 @@
 build/
 build-*/
 tests/build/
+tests/build_asan/
 tests/build_cov/
 tests/_verify/
 tests/test_f12

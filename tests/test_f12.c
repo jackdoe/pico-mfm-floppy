@@ -926,6 +926,63 @@ TEST(test_rename) {
   f12_unmount(&fs);
 }
 
+TEST(test_fsck_through_f12) {
+  vdisk_init(&vdisk);
+  f12_t fs;
+  memset(&fs, 0, sizeof(fs));
+  fs.io = vdisk_f12_io();
+  f12_format(&fs, "T", false);
+  f12_mount(&fs, vdisk_f12_io());
+
+  static uint8_t data[30000];
+  memset(data, 0xEE, sizeof(data));
+  f12_file_t *ghost = f12_open(&fs, "GHOST.BIN", "w");
+  ASSERT(ghost != NULL);
+  ASSERT_EQ(f12_write(ghost, data, sizeof(data)), (int)sizeof(data));
+  fat12_abort_write(&fs.fat);
+  ghost->mode = F12_MODE_CLOSED;
+
+  fat12_fsck_t report;
+  ASSERT_EQ(f12_fsck(&fs, &report, false), F12_OK);
+  ASSERT(report.lost_clusters > 0);
+  ASSERT_EQ(report.freed, 0);
+
+  vdisk.write_protected = true;
+  ASSERT_EQ(f12_fsck(&fs, &report, true), F12_ERR_WRITE_PROTECTED);
+  vdisk.write_protected = false;
+
+  ASSERT_EQ(f12_fsck(&fs, &report, true), F12_OK);
+  ASSERT_EQ(report.freed, report.lost_clusters);
+
+  ASSERT_EQ(f12_fsck(&fs, &report, false), F12_OK);
+  ASSERT_EQ(report.lost_clusters, 0);
+
+  const char msg[] = "cache still coherent after repair";
+  f12_file_t *f = f12_open(&fs, "AFTER.TXT", "w");
+  ASSERT(f != NULL);
+  ASSERT_EQ(f12_write(f, msg, sizeof(msg)), (int)sizeof(msg));
+  ASSERT_EQ(f12_close(f), F12_OK);
+
+  char buf[sizeof(msg)];
+  f = f12_open(&fs, "AFTER.TXT", "r");
+  ASSERT(f != NULL);
+  ASSERT_EQ(f12_read(f, buf, sizeof(buf)), (int)sizeof(buf));
+  ASSERT(memcmp(buf, msg, sizeof(msg)) == 0);
+  f12_close(f);
+
+  f12_unmount(&fs);
+}
+
+TEST(test_fsck_requires_mount) {
+  f12_t fs;
+  memset(&fs, 0, sizeof(fs));
+
+  fat12_fsck_t report;
+  ASSERT_EQ(f12_fsck(&fs, &report, false), F12_ERR_NOT_MOUNTED);
+  ASSERT_EQ(f12_fsck(NULL, &report, false), F12_ERR_INVALID);
+  ASSERT_EQ(f12_fsck(&fs, NULL, false), F12_ERR_INVALID);
+}
+
 TEST(test_opendir_non_root) {
   vdisk_init(&vdisk);
   f12_t fs;
@@ -1336,6 +1393,8 @@ int main(void) {
   RUN_TEST(test_tell_on_write_file);
   RUN_TEST(test_delete_not_found);
   RUN_TEST(test_rename);
+  RUN_TEST(test_fsck_through_f12);
+  RUN_TEST(test_fsck_requires_mount);
   RUN_TEST(test_opendir_non_root);
   RUN_TEST(test_strerror_all_codes);
   RUN_TEST(test_unmount_closes_open_files);

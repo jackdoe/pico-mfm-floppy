@@ -116,14 +116,14 @@ Tests (host-side, no hardware needed):
 
 ## Testing
 
-259 unit tests, 12,001 fuzz iterations, 100 SCP roundtrip fuzz iterations. Tested against real 1994 floppy disks. Tests run for both RP2040 and RP2350 configurations.
+267 unit tests, 12,001 fuzz iterations, 100 SCP roundtrip fuzz iterations, 200 fsck convergence fuzz iterations. Tested against real 1994 floppy disks. Tests run for both RP2040 and RP2350 configurations. CI runs the full suite under AddressSanitizer/UBSan and builds firmware for both boards.
 
 ```
 tests/
 ├── test_lru.c            32 tests: cache operations, eviction, edge cases
 ├── test_mfm.c            15 tests: encode/decode roundtrip, all byte patterns
-├── test_fat12.c          76 tests: filesystem operations, format, rename, fsck, cluster chains
-├── test_f12.c            51 tests: high-level API, directory listing, seek, rename
+├── test_fat12.c          82 tests: filesystem operations, format, rename, fsck, cluster chains
+├── test_f12.c            53 tests: high-level API, directory listing, seek, rename, fsck
 ├── test_robustness.c     29 tests: corrupt BPB, invalid pulses, truncated sectors
 ├── test_fuzz.c           12,001 iterations: random pulses, corrupt disks, FAT chaos
 ├── test_flux_sim.c        9 tests: synthetic flux + real SCP decode (all 9 disks)

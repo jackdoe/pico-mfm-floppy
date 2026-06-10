@@ -2044,6 +2044,211 @@ TEST(test_fsck_walks_subdirectories) {
   ASSERT_EQ(report.files, 1);
 }
 
+TEST(test_fsck_nested_subdirectories) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  vdisk_set_fat_entry(&disk, 2, 0xFFF);
+  vdisk_set_fat_entry(&disk, 3, 0xFFF);
+  vdisk_set_fat_entry(&disk, 4, 5);
+  vdisk_set_fat_entry(&disk, 5, 0xFFF);
+
+  fat12_dirent_t d;
+  memset(&d, 0, sizeof(d));
+  memcpy(d.name, "OUTER   ", 8);
+  memcpy(d.ext, "   ", 3);
+  d.attr = FAT12_ATTR_DIRECTORY;
+  d.start_cluster = 2;
+  memcpy(&disk.data[fat.root_dir_start_sector][0], &d, sizeof(d));
+
+  uint16_t outer_lba = fat.data_start_sector;
+  memset(disk.data[outer_lba], 0, SECTOR_SIZE);
+  memcpy(d.name, "INNER   ", 8);
+  d.start_cluster = 3;
+  memcpy(&disk.data[outer_lba][0], &d, sizeof(d));
+
+  uint16_t inner_lba = fat.data_start_sector + 1;
+  memset(disk.data[inner_lba], 0, SECTOR_SIZE);
+  fat12_dirent_t f;
+  memset(&f, 0, sizeof(f));
+  memcpy(f.name, "DEEP    ", 8);
+  memcpy(f.ext, "BIN", 3);
+  f.attr = FAT12_ATTR_ARCHIVE;
+  f.start_cluster = 4;
+  f.size = 700;
+  memcpy(&disk.data[inner_lba][0], &f, sizeof(f));
+
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT_EQ(report.directories, 2);
+  ASSERT_EQ(report.files, 1);
+  ASSERT_EQ(report.lost_clusters, 0);
+  ASSERT_EQ(report.crosslinked, 0);
+  ASSERT(!report.incomplete);
+}
+
+TEST(test_fsck_incomplete_disables_freeing) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  for (uint16_t i = 0; i < 17; i++) {
+    uint16_t cluster = 2 + i;
+    vdisk_set_fat_entry(&disk, cluster, 0xFFF);
+    memset(disk.data[fat.data_start_sector + i], 0, SECTOR_SIZE);
+
+    fat12_dirent_t d;
+    memset(&d, 0, sizeof(d));
+    char name[9];
+    snprintf(name, sizeof(name), "DIR%05u", i);
+    memcpy(d.name, name, 8);
+    memcpy(d.ext, "   ", 3);
+    d.attr = FAT12_ATTR_DIRECTORY;
+    d.start_cluster = cluster;
+
+    uint16_t lba = fat.root_dir_start_sector + (i * FAT12_DIR_ENTRY_SIZE) / SECTOR_SIZE;
+    uint16_t off = (i * FAT12_DIR_ENTRY_SIZE) % SECTOR_SIZE;
+    memcpy(&disk.data[lba][off], &d, sizeof(d));
+  }
+
+  vdisk_set_fat_entry(&disk, 100, 0xFFF);
+
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, true), FAT12_OK);
+  ASSERT_EQ(report.directories, 17);
+  ASSERT(report.incomplete);
+  ASSERT(report.lost_clusters >= 1);
+  ASSERT_EQ(report.freed, 0);
+}
+
+TEST(test_fsck_read_error_propagates) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  uint8_t data[600];
+  memset(data, 0x42, sizeof(data));
+  write_file(&fat, "A.BIN", data, sizeof(data));
+
+  disk.fail_after_reads = 0;
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_ERR_READ);
+  disk.fail_after_reads = -1;
+}
+
+TEST(test_fsck_repair_write_error) {
+  fault_vdisk_t disk;
+  memset(&disk, 0, sizeof(disk));
+  vdisk_format_valid(&disk.disk);
+  disk.fail_after_reads = -1;
+  disk.fail_after_track_writes = -1;
+
+  fat12_t fat;
+  fat12_io_t io = { .read = fault_vdisk_read, .write = fault_vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  vdisk_set_fat_entry(&disk.disk, 50, 0xFFF);
+
+  disk.fail_after_track_writes = 0;
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, true), FAT12_ERR_WRITE);
+  ASSERT(!fat.batch.active);
+  disk.fail_after_track_writes = -1;
+
+  ASSERT_EQ(fat12_fsck(&fat, &report, true), FAT12_OK);
+  ASSERT_EQ(report.freed, 1);
+}
+
+TEST(test_rename_rejected_during_active_batch) {
+  vdisk_t disk;
+  vdisk_format_valid(&disk);
+
+  fat12_t fat;
+  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+  fat12_init(&fat, io);
+
+  uint8_t data[64] = {1};
+  write_file(&fat, "A.TXT", data, sizeof(data));
+
+  fat12_writer_t w;
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_open_write(&fat, "B.TXT", &w), FAT12_OK);
+  ASSERT_EQ(fat12_rename(&fat, "A.TXT", "C.TXT"), FAT12_ERR_INVALID);
+  ASSERT_EQ(fat12_fsck(&fat, &report, true), FAT12_ERR_INVALID);
+  fat12_abort_write(&fat);
+}
+
+static uint32_t conv_seed = 0xC0FFEE;
+
+static uint32_t conv_rand(void) {
+  conv_seed = conv_seed * 1103515245 + 12345;
+  return (conv_seed >> 16) & 0x7FFF;
+}
+
+TEST(test_fsck_convergence_fuzz) {
+  static uint8_t data[20000];
+  static uint8_t rbuf[20480];
+
+  for (int iter = 0; iter < 200; iter++) {
+    vdisk_t disk;
+    vdisk_format_valid(&disk);
+
+    fat12_t fat;
+    fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
+    fat12_init(&fat, io);
+
+    int nfiles = 1 + conv_rand() % 6;
+    for (int i = 0; i < nfiles; i++) {
+      char name[13];
+      snprintf(name, sizeof(name), "F%d.BIN", i);
+      uint32_t size = 1 + conv_rand() % 20000;
+      memset(data, (uint8_t)(iter + i), size);
+      write_file(&fat, name, data, size);
+    }
+
+    int hits = 1 + conv_rand() % 8;
+    for (int h = 0; h < hits; h++) {
+      uint16_t cluster = 2 + conv_rand() % fat.total_clusters;
+      uint16_t value = conv_rand() % 0x1000;
+      vdisk_set_fat_entry(&disk, cluster, value);
+    }
+
+    fat12_fsck_t report;
+    ASSERT_EQ(fat12_fsck(&fat, &report, true), FAT12_OK);
+
+    ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+    ASSERT_EQ(report.lost_clusters, 0);
+    ASSERT_EQ(report.broken_chains, 0);
+    ASSERT(!report.incomplete);
+
+    for (int i = 0; i < nfiles; i++) {
+      char name[13];
+      snprintf(name, sizeof(name), "F%d.BIN", i);
+      fat12_dirent_t e;
+      ASSERT_EQ(fat12_find(&fat, name, &e), FAT12_OK);
+
+      fat12_file_t file;
+      fat12_open(&fat, &e, &file);
+      int n = fat12_read(&file, rbuf, sizeof(rbuf));
+      ASSERT(n >= 0);
+    }
+  }
+  printf("\n  200 random-corruption iterations: fsck fix always converges to clean\n  ");
+}
+
 TEST(test_volume_label_protected) {
   vdisk_t disk;
   vdisk_init(&disk);
@@ -2278,6 +2483,12 @@ int main(void) {
   RUN_TEST(test_fsck_repairs_fat2);
   RUN_TEST(test_fsck_reclaims_abandoned_write);
   RUN_TEST(test_fsck_walks_subdirectories);
+  RUN_TEST(test_fsck_nested_subdirectories);
+  RUN_TEST(test_fsck_incomplete_disables_freeing);
+  RUN_TEST(test_fsck_read_error_propagates);
+  RUN_TEST(test_fsck_repair_write_error);
+  RUN_TEST(test_rename_rejected_during_active_batch);
+  RUN_TEST(test_fsck_convergence_fuzz);
   RUN_TEST(test_volume_label_protected);
   RUN_TEST(test_writer_unknown_filename_full_dir);
   RUN_TEST(test_invalid_filename_in_open_write);
