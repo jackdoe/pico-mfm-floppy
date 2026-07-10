@@ -5,8 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int tests_run = 0;
-static int tests_passed = 0;
+static int tests_run __attribute__((unused)) = 0;
+static int tests_passed __attribute__((unused)) = 0;
 
 #define TEST(name) void name(void); \
   void name##_runner(void) { \

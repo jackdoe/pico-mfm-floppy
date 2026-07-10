@@ -54,7 +54,7 @@ static void format_disk(void) {
 static void set_fat_entry(uint16_t cluster, uint16_t value) {
   uint32_t offset = cluster + cluster / 2u;
   for (uint8_t copy = 0; copy < FAT12_NUM_FATS; copy++) {
-    uint16_t start = FAT12_RESERVED_SECTORS + copy * FAT12_SECTORS_PER_FAT;
+    uint16_t start = (uint16_t)(FAT12_RESERVED_SECTORS + copy * FAT12_SECTORS_PER_FAT);
     uint8_t *bytes = &disk.data[start][0];
     if (cluster & 1u) {
       bytes[offset] = (uint8_t)((bytes[offset] & 0x0Fu) |
@@ -128,7 +128,7 @@ TEST(test_fat12_rejects_cluster_underflow) {
 
 TEST(test_fat12_detects_fat_copy_mismatch_on_init_and_fsck) {
   format_disk();
-  uint16_t copy = FAT12_RESERVED_SECTORS + FAT12_SECTORS_PER_FAT;
+  uint16_t copy = (uint16_t)(FAT12_RESERVED_SECTORS + FAT12_SECTORS_PER_FAT);
   disk.data[copy][3] ^= 0xFFu;
   ASSERT_EQ(fat12_init(&fat, disk_io()), FAT12_OK);
   ASSERT(fat.fat_mismatch);
@@ -169,7 +169,7 @@ static void encode_address(mfm_encode_t *encoder, uint8_t cylinder, uint8_t head
   uint8_t address[] = {MFM_ADDR_MARK, cylinder, head, sector, size_code};
   uint16_t crc = crc16_mfm(address, sizeof(address));
   if (corrupt) crc ^= 1u;
-  uint8_t crc_bytes[] = {crc >> 8, crc & 0xFF};
+  uint8_t crc_bytes[] = {(uint8_t)(crc >> 8), (uint8_t)(crc & 0xFF)};
   mfm_encode_sync(encoder);
   mfm_encode_bytes(encoder, address, sizeof(address));
   mfm_encode_bytes(encoder, crc_bytes, sizeof(crc_bytes));
@@ -212,7 +212,7 @@ TEST(test_mfm_arbitrary_timing_never_escapes_state_bounds) {
   uint32_t seed = 0xD1CEB00Cu;
   for (uint32_t i = 0; i < 200000u; i++) {
     seed = seed * 1664525u + 1013904223u;
-    mfm_feed(&decoder, seed >> 16, &sector);
+    mfm_feed(&decoder, (uint16_t)(seed >> 16), &sector);
     ASSERT(decoder.state >= MFM_HUNT && decoder.state <= MFM_CLOCK);
     ASSERT(decoder.record_state >= MFM_EXPECT_ID &&
            decoder.record_state <= MFM_READING_DATA);

@@ -35,7 +35,7 @@ static bool pio_emu_rx_push(pio_emu_t *emu, uint32_t value) {
 static bool pio_emu_tx_pop(pio_emu_t *emu, uint32_t *value) {
     if (emu->tx_count == 0) return false;
     *value = emu->tx_fifo[emu->tx_head];
-    emu->tx_head = (emu->tx_head + 1) % PIO_EMU_FIFO_DEPTH;
+    emu->tx_head = (uint8_t)((emu->tx_head + 1) % PIO_EMU_FIFO_DEPTH);
     emu->tx_count--;
     return true;
 }
@@ -247,7 +247,7 @@ bool pio_emu_rx_empty(pio_emu_t *emu) {
 uint32_t pio_emu_rx_get(pio_emu_t *emu) {
     if (!emu || emu->rx_count == 0) return 0;
     uint32_t val = emu->rx_fifo[emu->rx_head];
-    emu->rx_head = (emu->rx_head + 1) % PIO_EMU_FIFO_DEPTH;
+    emu->rx_head = (uint8_t)((emu->rx_head + 1) % PIO_EMU_FIFO_DEPTH);
     emu->rx_count--;
     return val;
 }

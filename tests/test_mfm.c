@@ -13,7 +13,7 @@ static void encode_address(mfm_encode_t *encoder, uint8_t cylinder, uint8_t head
   uint8_t address[] = {MFM_ADDR_MARK, cylinder, head, sector, size_code};
   uint16_t crc = crc16_mfm(address, sizeof(address));
   if (bad_crc) crc ^= 1u;
-  uint8_t crc_bytes[] = {crc >> 8, crc & 0xFF};
+  uint8_t crc_bytes[] = {(uint8_t)(crc >> 8), (uint8_t)(crc & 0xFF)};
   mfm_encode_sync(encoder);
   mfm_encode_bytes(encoder, address, sizeof(address));
   mfm_encode_bytes(encoder, crc_bytes, sizeof(crc_bytes));
@@ -23,7 +23,7 @@ static void encode_data(mfm_encode_t *encoder, uint8_t mark, const uint8_t *data
                         size_t size, bool bad_crc) {
   uint16_t crc = crc16(data, size, crc16_mfm(&mark, 1));
   if (bad_crc) crc ^= 1u;
-  uint8_t crc_bytes[] = {crc >> 8, crc & 0xFF};
+  uint8_t crc_bytes[] = {(uint8_t)(crc >> 8), (uint8_t)(crc & 0xFF)};
   mfm_encode_sync(encoder);
   mfm_encode_bytes(encoder, &mark, 1);
   mfm_encode_bytes(encoder, data, size);
@@ -47,7 +47,7 @@ static void fill_track(track_t *track, uint8_t cylinder, uint8_t head, uint32_t 
   for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
     for (size_t byte = 0; byte < DISK_SECTOR_SIZE; byte++) {
       seed = seed * 1664525u + 1013904223u;
-      track->data[sector][byte] = seed >> 24;
+      track->data[sector][byte] = (uint8_t)(seed >> 24);
     }
   }
 }
@@ -404,13 +404,13 @@ TEST(test_encoder_rejects_invalid_inputs) {
 }
 
 static void reference_precomp(uint8_t *pulses, size_t count, uint8_t cylinder) {
-  int shift = MFM_PRECOMP_SHIFT + (cylinder - MFM_PRECOMP_START_TRACK) / 13;
+  int shift = MFM_PRECOMP_SHIFT + ((int)cylinder - (int)MFM_PRECOMP_START_TRACK) / 13;
   for (size_t i = 1; i + 1 < count; i++) {
     if (pulses[i] != MFM_PULSE_SHORT) continue;
     bool previous_long = pulses[i - 1] == MFM_PULSE_LONG;
     bool next_long = pulses[i + 1] == MFM_PULSE_LONG;
     if (previous_long == next_long) continue;
-    pulses[i] += previous_long ? -shift : shift;
+    pulses[i] = (uint8_t)(pulses[i] + (previous_long ? -shift : shift));
   }
 }
 

@@ -269,6 +269,28 @@ TEST(test_track_cache_is_atomic_lru) {
   ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
+TEST(test_track_cache_touch_protects_recent_entry) {
+  prepare();
+  fs.cache_clock = 0;
+  memset(fs.cache, 0, sizeof(fs.cache));
+  uint8_t sector[DISK_SECTOR_SIZE];
+  for (uint8_t track = 0; track < F12_CACHE_TRACKS; track++) {
+    ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx,
+                             (uint16_t)(track * DISK_SECTORS_PER_TRACK), sector),
+              BLOCK_OK);
+  }
+  disk.reads = 0;
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, 0, sector), BLOCK_OK);
+  ASSERT_EQ(disk.reads, 0u);
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx,
+                           (uint16_t)(F12_CACHE_TRACKS * DISK_SECTORS_PER_TRACK),
+                           sector), BLOCK_OK);
+  ASSERT(cache_has(0, 0));
+  ASSERT(!cache_has(0, 1));
+  ASSERT(cache_has(F12_CACHE_TRACKS / DISK_HEADS, F12_CACHE_TRACKS % DISK_HEADS));
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
 TEST(test_partial_crc_track_serves_valid_sector) {
   prepare();
   memset(fs.cache, 0, sizeof(fs.cache));
@@ -371,6 +393,35 @@ TEST(test_conflicting_partial_reads_never_form_a_track) {
   ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, data), BLOCK_ERR_CORRUPT);
   disk.read_status = BLOCK_OK;
   disk.error_valid = 0;
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_authoritative_read_clears_conflicted_track) {
+  prepare();
+  memset(fs.cache, 0, sizeof(fs.cache));
+  fs.cache_clock = 0;
+  disk.read_status = BLOCK_ERR_CRC;
+  uint16_t lba = checked_lba(9, 0, 3);
+  memset(disk.data[lba], 0x31, DISK_SECTOR_SIZE);
+  disk.error_valid = 1u << 3;
+  uint8_t data[DISK_SECTOR_SIZE];
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, data), BLOCK_OK);
+  memset(disk.data[lba], 0x32, DISK_SECTOR_SIZE);
+  disk.error_valid = (1u << 3) | (1u << 17);
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba + 14u, data), BLOCK_OK);
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, data), BLOCK_ERR_CORRUPT);
+  disk.read_status = BLOCK_OK;
+  disk.error_valid = 0;
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, data), BLOCK_OK);
+  ASSERT_EQ(data[0], 0x32);
+  ASSERT(cache_has(9, 0));
+  for (size_t i = 0; i < F12_CACHE_TRACKS; i++) {
+    if (fs.cache[i].occupied && fs.cache[i].track.cylinder == 9 &&
+        fs.cache[i].track.head == 0) {
+      ASSERT_EQ(fs.cache[i].conflicted, 0u);
+      ASSERT_EQ(fs.cache[i].track.valid, DISK_TRACK_VALID);
+    }
+  }
   ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
@@ -914,12 +965,14 @@ int main(void) {
   RUN_TEST(test_read_only_device_mounts);
   RUN_TEST(test_block_adapter_rejects_null_context_and_output);
   RUN_TEST(test_track_cache_is_atomic_lru);
+  RUN_TEST(test_track_cache_touch_protects_recent_entry);
   RUN_TEST(test_partial_crc_track_serves_valid_sector);
   RUN_TEST(test_corrupt_full_track_rejected);
   RUN_TEST(test_partial_write_materializes_full_track);
   RUN_TEST(test_failed_write_does_not_poison_cache);
   RUN_TEST(test_failed_mutating_write_evicts_cache);
   RUN_TEST(test_conflicting_partial_reads_never_form_a_track);
+  RUN_TEST(test_authoritative_read_clears_conflicted_track);
   RUN_TEST(test_file_roundtrip_and_end);
   RUN_TEST(test_seek_tell_and_read_at);
   RUN_TEST(test_mode_errors_are_typed);

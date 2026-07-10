@@ -175,8 +175,8 @@ TEST(test_generated_read_program_captures_flux) {
   ASSERT_EQ(words[0], 0xFF17FFA7u);
   ASSERT_EQ(words[1], 0xFDF4FEB4u);
   uint16_t packed[] = {
-      words[0] & 0xFFFFu, words[0] >> 16,
-      words[1] & 0xFFFFu, words[1] >> 16,
+      (uint16_t)(words[0] & 0xFFFFu), (uint16_t)(words[0] >> 16),
+      (uint16_t)(words[1] & 0xFFFFu), (uint16_t)(words[1] >> 16),
   };
   ASSERT_EQ(packed[0] & 1u, 1);
   ASSERT_EQ(packed[1] & 1u, 1);

@@ -3,6 +3,7 @@
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
 #include "hardware/pio.h"
+#include "hardware/vreg.h"
 #include "hardware/watchdog.h"
 #include "mfm_decode.h"
 #include "pico/stdlib.h"
@@ -29,6 +30,21 @@ static f12_t fs;
 static f12_file_t owned_writer;
 static bool writer_owned;
 static const floppy_pins_t drive_pins = {
+#ifdef FLOPPY_ALT_PINS
+    .index = 16,
+    .track0 = 22,
+    .write_protect = 13,
+    .read_data = 26,
+    .disk_change = 28,
+    .drive_select = 14,
+    .motor_enable = 17,
+    .direction = 18,
+    .step = 19,
+    .write_data = 20,
+    .write_gate = 21,
+    .side_select = 27,
+    .density = 15,
+#else
     .index = 14,
     .track0 = 5,
     .write_protect = 4,
@@ -42,6 +58,7 @@ static const floppy_pins_t drive_pins = {
     .write_gate = 6,
     .side_select = 2,
     .density = 15,
+#endif
 };
 
 static char cmd_buf[CMD_BUF_SIZE];
@@ -84,6 +101,7 @@ static void cmd_fsck(int argc, char **argv);
 static void cmd_mount(int argc, char **argv);
 static void cmd_unmount(int argc, char **argv);
 static void cmd_status(int argc, char **argv);
+static void cmd_dma(int argc, char **argv);
 static void cmd_motor(int argc, char **argv);
 static void cmd_select(int argc, char **argv);
 static void cmd_home(int argc, char **argv);
@@ -119,6 +137,8 @@ static const cmd_entry_t commands[] = {
     {"mount", cmd_mount, false, 1, 1, "", "Mount filesystem"},
     {"unmount", cmd_unmount, false, 1, 1, "", "Unmount filesystem"},
     {"status", cmd_status, false, 1, 1, "", "Show drive and disk status"},
+    {"dma", cmd_dma, false, 1, 3, "[cylinder] [head]",
+     "Read a track and report DMA and overrun statistics"},
     {"motor", cmd_motor, false, 2, 2, "<on|off>", "Control motor"},
     {"select", cmd_select, false, 2, 2, "<on|off>", "Control drive select"},
     {"home", cmd_home, false, 1, 1, "", "Seek to cylinder zero"},
@@ -276,6 +296,12 @@ static bool canonical_name(const char *input, char output[13]) {
   }
   output[pos] = '\0';
   return text_equal_case(input, output);
+}
+
+static bool resolve_name(const char *input, char output[13]) {
+  if (canonical_name(input, output)) return true;
+  printf("Invalid 8.3 filename: %s\n", input);
+  return false;
 }
 
 static void print_prompt(void) {
@@ -531,6 +557,40 @@ static void print_drive_stats(const floppy_stats_t *s) {
          FLOPPY_FLUX_RING_WORDS);
 }
 
+static void cmd_dma(int argc, char **argv) {
+  uint32_t cylinder = 0;
+  uint32_t head = 0;
+  if (argc >= 2 && !parse_u32(argv[1], 0, DISK_CYLINDERS - 1u, &cylinder)) {
+    printf("Cylinder must be 0 through %u.\n", DISK_CYLINDERS - 1u);
+    return;
+  }
+  if (argc >= 3 && !parse_u32(argv[2], 0, DISK_HEADS - 1u, &head)) {
+    printf("Head must be 0 through %u.\n", DISK_HEADS - 1u);
+    return;
+  }
+  if (!drive_status("Statistics reset", floppy_stats_reset(&floppy)))
+    return;
+  uint32_t generation;
+  if (!drive_generation(&generation))
+    return;
+  track_t track = {.cylinder = (uint8_t)cylinder, .head = (uint8_t)head};
+  block_status_t status = floppy_read_track(&floppy, generation, &track);
+  printf("  Track C%luH%lu read: %s\n", (unsigned long)cylinder,
+         (unsigned long)head, block_status_text(status));
+  if (status == BLOCK_OK) {
+    unsigned recovered = 0;
+    for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++)
+      if (track_has(&track, sector))
+        recovered++;
+    printf("  Sectors:       %u/%u recovered\n", recovered,
+           DISK_SECTORS_PER_TRACK);
+  }
+  floppy_stats_t stats;
+  if (drive_status("Statistics", floppy_stats(&floppy, &stats)))
+    print_drive_stats(&stats);
+  drive_idle();
+}
+
 static void read_track_stats(int track, int side, track_stats_t *stats) {
   memset(stats, 0, sizeof(*stats));
 
@@ -546,7 +606,6 @@ static void read_track_stats(int track, int side, track_stats_t *stats) {
 
   mfm_t mfm;
   mfm_init(&mfm);
-  mfm_reset(&mfm);
 
   bool ix_prev = false;
   bool ix_primed = false;
@@ -1005,10 +1064,7 @@ static void cmd_ls(int argc, char **argv) {
 static void cmd_cat(int argc, char **argv) {
   (void)argc;
   char name[13];
-  if (!canonical_name(argv[1], name)) {
-    printf("Invalid 8.3 filename: %s\n", argv[1]);
-    return;
-  }
+  if (!resolve_name(argv[1], name)) return;
 
   f12_file_t file;
   f12_err_t error = f12_open(&fs, name, F12_OPEN_READ, &file);
@@ -1044,10 +1100,7 @@ static void cmd_cat(int argc, char **argv) {
 static void cmd_hexdump(int argc, char **argv) {
   (void)argc;
   char name[13];
-  if (!canonical_name(argv[1], name)) {
-    printf("Invalid 8.3 filename: %s\n", argv[1]);
-    return;
-  }
+  if (!resolve_name(argv[1], name)) return;
 
   f12_file_t file;
   f12_err_t error = f12_open(&fs, name, F12_OPEN_READ, &file);
@@ -1097,10 +1150,7 @@ static void cmd_hexdump(int argc, char **argv) {
 static void cmd_write(int argc, char **argv) {
   (void)argc;
   char name[13];
-  if (!canonical_name(argv[1], name)) {
-    printf("Invalid 8.3 filename: %s\n", argv[1]);
-    return;
-  }
+  if (!resolve_name(argv[1], name)) return;
 
   f12_err_t error = writer_open(name);
   if (error != F12_OK) {
@@ -1176,10 +1226,7 @@ static void cmd_commit(int argc, char **argv) {
 static void cmd_rm(int argc, char **argv) {
   (void)argc;
   char name[13];
-  if (!canonical_name(argv[1], name)) {
-    printf("Invalid 8.3 filename: %s\n", argv[1]);
-    return;
-  }
+  if (!resolve_name(argv[1], name)) return;
 
   f12_err_t err = f12_delete(&fs, name);
   if (err != F12_OK)
@@ -1274,10 +1321,7 @@ static void cmd_mv(int argc, char **argv) {
 static void cmd_stat(int argc, char **argv) {
   (void)argc;
   char name[13];
-  if (!canonical_name(argv[1], name)) {
-    printf("Invalid 8.3 filename: %s\n", argv[1]);
-    return;
-  }
+  if (!resolve_name(argv[1], name)) return;
 
   f12_stat_t st;
   f12_err_t err = f12_stat(&fs, name, &st);
@@ -2822,10 +2866,11 @@ static void cmd_reboot(int argc, char **argv) {
 }
 
 int main(void) {
-#if defined(PICO_RP2040) && PICO_RP2040
-  const uint32_t target_clock_khz = 72000u;
-#elif defined(PICO_RP2350) && PICO_RP2350
   const uint32_t target_clock_khz = 144000u;
+#if defined(PICO_RP2040) && PICO_RP2040
+  vreg_set_voltage(VREG_VOLTAGE_1_20);
+  sleep_ms(2);
+#elif defined(PICO_RP2350) && PICO_RP2350
 #else
 #error unsupported Raspberry Pi silicon
 #endif

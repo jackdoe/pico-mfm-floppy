@@ -130,14 +130,13 @@ static void floppy_operation_end(floppy_t *f, floppy_operation_t operation) {
   floppy_unlock(f, lock_state);
 }
 
+#define FLOPPY_PIN_LIST(p) \
+  {(p).index, (p).track0, (p).write_protect, (p).read_data, (p).disk_change, \
+   (p).drive_select, (p).motor_enable, (p).direction, (p).step, \
+   (p).write_data, (p).write_gate, (p).side_select, (p).density}
+
 static bool floppy_pins_valid(const floppy_pins_t *pins) {
-  const uint8_t values[] = {
-      pins->index,         pins->track0,       pins->write_protect,
-      pins->read_data,     pins->disk_change,  pins->drive_select,
-      pins->motor_enable,  pins->direction,    pins->step,
-      pins->write_data,    pins->write_gate,   pins->side_select,
-      pins->density,
-  };
+  const uint8_t values[] = FLOPPY_PIN_LIST(*pins);
   for (size_t i = 0; i < sizeof(values); i++) {
     if (values[i] >= NUM_BANK0_GPIOS) return false;
     for (size_t j = 0; j < i; j++) {
@@ -157,6 +156,7 @@ static void floppy_pin_oc(uint pin, bool high) {
 }
 
 static void floppy_update_media(floppy_t *f) {
+  if (!f->selected) return;
   bool active = !gpio_get(f->pins.disk_change);
   uint32_t lock_state = floppy_lock(f);
   if (active && !f->disk_change_active) {
@@ -567,7 +567,9 @@ static block_status_t floppy_clear_media_latch(floppy_t *f,
                                                 uint32_t generation) {
   floppy_update_media(f);
   if (!floppy_change_active(f)) return BLOCK_OK;
-  block_status_t status = floppy_step_internal(f, DIR_OUTWARD, deadline, generation);
+  block_status_t status = floppy_step_internal(f, DIR_INWARD, deadline, generation);
+  if (status != BLOCK_OK) return status;
+  status = floppy_step_internal(f, DIR_OUTWARD, deadline, generation);
   if (status != BLOCK_OK) return status;
   sleep_ms(FLOPPY_HEAD_SETTLE_MS);
   if (deadline_elapsed(deadline)) return BLOCK_ERR_TIMEOUT;
@@ -1206,7 +1208,6 @@ static bool flux_tx_preload(flux_tx_t *tx) {
 
 static bool flux_tx_wait_dma(flux_tx_t *tx) {
   while (dma_channel_is_busy(floppy_dma_channel(tx->floppy))) {
-    dma_channel_hw_addr(floppy_dma_channel(tx->floppy));
     if (!flux_tx_poll(tx)) return false;
     tight_loop_contents();
   }
@@ -1406,13 +1407,7 @@ static block_status_t floppy_release(floppy_t *f) {
     f->dma_ch = -1;
   }
   if (f->gpio_configured) {
-    uint pins[] = {
-        f->pins.index,         f->pins.track0,       f->pins.write_protect,
-        f->pins.read_data,     f->pins.disk_change,  f->pins.drive_select,
-        f->pins.motor_enable,  f->pins.direction,    f->pins.step,
-        f->pins.write_data,    f->pins.write_gate,   f->pins.side_select,
-        f->pins.density,
-    };
+    uint8_t pins[] = FLOPPY_PIN_LIST(f->pins);
     for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
       gpio_deinit(pins[i]);
     }

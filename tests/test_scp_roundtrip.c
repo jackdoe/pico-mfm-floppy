@@ -393,8 +393,8 @@ TEST(test_deterministic_fuzz_roundtrips) {
     size_t manifest_count = 2u + random_next() % 7u;
     for (size_t index = 0; index < manifest_count; index++) {
       manifest_t *entry = &manifest[index];
-      snprintf(entry->name, sizeof(entry->name), "I%03uF%02zu.BIN",
-               (unsigned)(iteration % 1000u), index);
+      snprintf(entry->name, sizeof(entry->name), "I%03uF%02u.BIN",
+               (unsigned)(iteration % 1000u), (unsigned)(index % 100u));
       entry->size = 1u + random_next() % sizeof(buffer);
       entry->pattern = random_next();
       for (uint32_t offset = 0; offset < entry->size; offset++) {

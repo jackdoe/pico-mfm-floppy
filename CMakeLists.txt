@@ -73,3 +73,9 @@ endfunction()
 
 add_floppy_example(floppy_cli examples/cli.c)
 target_link_libraries(floppy_cli PRIVATE hardware_watchdog)
+pico_set_binary_type(floppy_cli copy_to_ram)
+
+option(FLOPPY_ALT_PINS "Use the alternate GPIO pin mapping in the CLI example" OFF)
+if(FLOPPY_ALT_PINS)
+    target_compile_definitions(floppy_cli PRIVATE FLOPPY_ALT_PINS)
+endif()

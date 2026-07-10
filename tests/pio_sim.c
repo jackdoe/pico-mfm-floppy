@@ -137,7 +137,7 @@ bool pio_sim_load_scp(pio_sim_drive_t *drive, uint8_t *data, size_t size) {
   }
   for (uint8_t cylinder = 0; cylinder < DISK_CYLINDERS; cylinder++) {
     for (uint8_t head = 0; head < DISK_HEADS; head++) {
-      uint16_t scp_track = cylinder * DISK_HEADS + head;
+      uint16_t scp_track = (uint16_t)(cylinder * DISK_HEADS + head);
       uint32_t table = 0x10u + scp_track * 4u;
       uint32_t header = read_le32(data + table);
       if (header == 0) goto fail;
@@ -350,10 +350,11 @@ void gpio_set_dir(uint pin, bool output) {
   } else if (pin == f->pins.step && output) {
     if (g_drive->step_direction_inward && g_drive->head_track + 1u < DISK_CYLINDERS) {
       g_drive->head_track++;
+      g_drive->disk_changed = false;
     } else if (!g_drive->step_direction_inward && g_drive->head_track > 0) {
       g_drive->head_track--;
+      g_drive->disk_changed = false;
     }
-    g_drive->disk_changed = false;
     pio_sim_load_track();
   } else if (pin == f->pins.side_select) {
     uint8_t head = output ? 1u : 0u;
@@ -418,7 +419,7 @@ bool gpio_get(uint pin) {
   } else {
     g_drive->index_poll_count++;
     uint32_t period = g_drive->index_period_us ? g_drive->index_period_us : 200000u;
-    uint32_t phase = pico_test_time_us % period;
+    uint32_t phase = (uint32_t)(pico_test_time_us % period);
     value = phase >= g_drive->index_low_us;
   }
   g_drive->last_index_value = value;

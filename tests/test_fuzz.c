@@ -40,7 +40,7 @@ void fuzz_mfm_decoder_random_pulses(int iterations) {
     mfm_sector_t out;
     memset(&out, 0, sizeof(out));
 
-    int pulse_count = 100 + (fuzz_rand() % 10000);
+    int pulse_count = 100 + (int)(fuzz_rand() % 10000);
     for (int i = 0; i < pulse_count; i++) {
       uint16_t pulse = fuzz_rand16();
       mfm_feed(&m, pulse, &out);
@@ -93,7 +93,7 @@ void fuzz_mfm_decoder_state_transitions(int iterations) {
     }
 
     for (int i = 0; i < 50; i++) {
-      uint16_t pulse = 47 + (fuzz_rand() % 60);
+      uint16_t pulse = (uint16_t)(47 + (fuzz_rand() % 60));
       mfm_feed(&m, pulse, &out);
     }
 
@@ -266,7 +266,7 @@ void fuzz_fat12_corrupt_bpb_values(int iterations) {
   for (int iter = 0; iter < iterations; iter++) {
     vdisk_format_valid(fuzz_disk);
 
-    int field = fuzz_rand() % 10;
+    int field = (int)(fuzz_rand() % 10);
     switch (field) {
       case 0:
         fuzz_disk->data[0][11] = fuzz_rand8();
@@ -398,10 +398,10 @@ void fuzz_fat12_file_operations(int iterations) {
   for (int iter = 0; iter < iterations; iter++) {
     vdisk_format_valid(fuzz_disk);
 
-    int corrupt_count = fuzz_rand() % 20;
+    int corrupt_count = (int)(fuzz_rand() % 20);
     for (int c = 0; c < corrupt_count; c++) {
-      int sector = fuzz_rand() % DISK_SECTOR_COUNT;
-      int offset = fuzz_rand() % DISK_SECTOR_SIZE;
+      int sector = (int)(fuzz_rand() % DISK_SECTOR_COUNT);
+      int offset = (int)(fuzz_rand() % DISK_SECTOR_SIZE);
       fuzz_disk->data[sector][offset] = fuzz_rand8();
     }
 

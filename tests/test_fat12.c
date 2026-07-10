@@ -185,10 +185,10 @@ static void raw_dirent_at(vdisk_t *target, uint16_t lba, uint16_t offset,
 static void raw_dirent(vdisk_t *target, uint16_t index,
                        const char name[static 8], const char ext[static 3],
                        uint8_t attr, uint16_t start, uint32_t size) {
-  uint16_t lba = FAT12_RESERVED_SECTORS +
+  uint16_t lba = (uint16_t)(FAT12_RESERVED_SECTORS +
       FAT12_NUM_FATS * FAT12_SECTORS_PER_FAT +
-      index * FAT12_DIR_ENTRY_SIZE / DISK_SECTOR_SIZE;
-  uint16_t offset = index * FAT12_DIR_ENTRY_SIZE % DISK_SECTOR_SIZE;
+      index * FAT12_DIR_ENTRY_SIZE / DISK_SECTOR_SIZE);
+  uint16_t offset = (uint16_t)(index * FAT12_DIR_ENTRY_SIZE % DISK_SECTOR_SIZE);
   raw_dirent_at(target, lba, offset, name, ext, attr, start, size);
 }
 
@@ -204,9 +204,11 @@ static uint16_t free_clusters(fat12_t *filesystem) {
   return count;
 }
 
+#define FSCK_MAX_REPAIR_PASSES 4u
+
 static fat12_fsck_t repair_to_convergence(fat12_t *filesystem) {
   fat12_fsck_t report;
-  for (uint16_t pass = 0; pass < FAT12_ROOT_ENTRIES; pass++) {
+  for (uint16_t pass = 0; pass < FSCK_MAX_REPAIR_PASSES; pass++) {
     ASSERT_EQ(fat12_fsck(filesystem, &report, true), FAT12_OK);
     ASSERT(!report.incomplete);
     if (!report.repair_pending) return report;
@@ -403,6 +405,36 @@ TEST(test_close_retries_each_commit_phase) {
     ASSERT(!fat12_busy(&fat));
     ASSERT_EQ(read_file(&fat, "PHASE.BIN", read_buffer, sizeof(read_buffer)), 900);
     ASSERT_MEM_EQ(read_buffer, data_a, 900);
+  }
+}
+
+TEST(test_close_retries_reclaim_phase_when_replacing) {
+  for (int failure = 0; failure < 16; failure++) {
+    fault_disk_t fault;
+    fault_init(&fault);
+    ASSERT_EQ(fat12_init(&fat, fault_io(&fault)), FAT12_OK);
+    fat12_writer_t writer;
+    ASSERT_EQ(fat12_open_write(&fat, "REPL.BIN", &writer), FAT12_OK);
+    fill_pattern(data_a, 2000, 1u);
+    ASSERT_EQ(fat12_write(&writer, data_a, 2000).error, FAT12_OK);
+    ASSERT_EQ(fat12_close_write(&writer), FAT12_OK);
+
+    ASSERT_EQ(fat12_open_write(&fat, "REPL.BIN", &writer), FAT12_OK);
+    fill_pattern(data_b, 1000, 2u);
+    ASSERT_EQ(fat12_write(&writer, data_b, 1000).error, FAT12_OK);
+    fault.writes_before_failure = failure;
+    fat12_err_t result = fat12_close_write(&writer);
+    if (result != FAT12_OK) {
+      ASSERT_EQ(result, FAT12_ERR_WRITE);
+      ASSERT(fat12_busy(&fat));
+      ASSERT_EQ(fat12_abort_write(&writer), FAT12_ERR_BUSY);
+      fault.writes_before_failure = -1;
+      ASSERT_EQ(fat12_close_write(&writer), FAT12_OK);
+    }
+    ASSERT(!fat12_busy(&fat));
+    ASSERT_EQ(read_file(&fat, "REPL.BIN", read_buffer, sizeof(read_buffer)), 1000);
+    ASSERT_MEM_EQ(read_buffer, data_b, 1000);
+    ASSERT_EQ(free_clusters(&fat), (uint16_t)(FAT12_DATA_CLUSTERS - 2u));
   }
 }
 
@@ -1211,6 +1243,7 @@ int main(void) {
   RUN_TEST(test_read_rejects_cycles_without_replaying_data);
   RUN_TEST(test_typed_write_preserves_partial_progress_and_retries);
   RUN_TEST(test_close_retries_each_commit_phase);
+  RUN_TEST(test_close_retries_reclaim_phase_when_replacing);
   RUN_TEST(test_abort_is_safe_only_before_commit);
   RUN_TEST(test_full_disk_abort_never_publishes_fat_metadata);
   RUN_TEST(test_copy_on_write_full_disk_preserves_old_file);

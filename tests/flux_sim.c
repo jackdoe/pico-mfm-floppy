@@ -59,7 +59,7 @@ bool flux_sim_seek(flux_sim_t *sim, uint8_t track, uint8_t side, uint8_t rev) {
     if (rev >= sim->num_revolutions) return false;
     if (!disk_ch_valid(track, side)) return false;
 
-    uint16_t scp_idx = track * 2 + side;
+    uint16_t scp_idx = (uint16_t)(track * 2 + side);
     if (scp_idx < sim->start_track || scp_idx > sim->end_track) return false;
     uint64_t table_off = 0x10 + (uint64_t)scp_idx * 4;
     if (table_off + 4 > sim->file_size) return false;
@@ -137,15 +137,15 @@ bool flux_sim_from_track(flux_sim_t *sim, const uint8_t *pulse_buf, size_t pulse
 }
 
 static void write_le32(uint8_t *p, uint32_t v) {
-    p[0] = v & 0xFF;
-    p[1] = (v >> 8) & 0xFF;
-    p[2] = (v >> 16) & 0xFF;
-    p[3] = (v >> 24) & 0xFF;
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
 }
 
 static void write_be16(uint8_t *p, uint16_t v) {
-    p[0] = (v >> 8) & 0xFF;
-    p[1] = v & 0xFF;
+    p[0] = (uint8_t)(v >> 8);
+    p[1] = (uint8_t)v;
 }
 
 uint8_t *scp_encode_disk(

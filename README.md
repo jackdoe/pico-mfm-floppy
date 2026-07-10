@@ -102,10 +102,12 @@ The CLI selects clocks that make the PIO dividers integral:
 
 | Board | System clock | Read PIO | Read divider | Write PIO | Write divider |
 |---|---:|---:|---:|---:|---:|
-| Pico / RP2040 | 72 MHz | 72 MHz | 1 | 24 MHz | 3 |
+| Pico / RP2040 | 144 MHz | 72 MHz | 2 | 24 MHz | 6 |
 | Pico 2 / RP2350 | 144 MHz | 72 MHz | 2 | 24 MHz | 6 |
 
-`floppy_init` rejects clocks that are not an exact nonzero multiple of 72 MHz.
+`floppy_init` rejects clocks that are not an exact nonzero multiple of 72 MHz, so the read and write PIO dividers stay integral. 72 MHz is the only in-spec RP2040 multiple, and it is too slow to drain the flux DMA ring in real time, so the CLI runs the RP2040 at 144 MHz (above its 133 MHz datasheet rating) with the core voltage raised to 1.20 V. 133 MHz is not a multiple of 72 MHz and would need a jittery fractional divider.
+
+The CLI also links with `copy_to_ram`, so the whole program runs from SRAM rather than executing in place from QSPI flash, removing XIP cache-miss stalls from the real-time flux read loop.
 
 ## Hardware validation
 

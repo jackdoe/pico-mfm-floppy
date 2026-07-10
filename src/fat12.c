@@ -42,6 +42,8 @@ typedef struct {
   bool valid[FAT12_NUM_FATS];
 } fat12_mirrors_t;
 
+static fat12_err_t fsck_compare_fats(fat12_t *fat, fat12_mirrors_t *mirrors);
+
 static fat12_err_t fsck_select_fat(fat12_t *fat,
                                    const fat12_mirrors_t *mirrors,
                                    fat12_fsck_t *out,
@@ -171,37 +173,9 @@ fat12_err_t fat12_init(fat12_t *fat, fat12_io_t io) {
 
   if (!fat12_bpb_valid(boot)) return FAT12_ERR_INVALID;
 
-  uint8_t primary[DISK_SECTOR_SIZE];
-  uint8_t copy[DISK_SECTOR_SIZE];
   fat12_mirrors_t mirrors;
-  memset(&mirrors, 0, sizeof(mirrors));
-  for (uint16_t sector = 0; sector < FAT12_SECTORS_PER_FAT; sector++) {
-    err = fat12_read_sector(
-        fat, (uint16_t)(FAT12_RESERVED_SECTORS + sector), primary);
-    if (err != FAT12_OK) return err;
-    if (sector == 0) {
-      mirrors.valid[0] = primary[0] == FAT12_MEDIA_DESCRIPTOR &&
-          primary[1] == 0xFF && primary[2] == 0xFF;
-    }
-    for (uint8_t index = 1; index < FAT12_NUM_FATS; index++) {
-      uint16_t lba = (uint16_t)(FAT12_RESERVED_SECTORS +
-          (uint16_t)index * FAT12_SECTORS_PER_FAT + sector);
-      err = fat12_read_sector(fat, lba, copy);
-      if (err != FAT12_OK) return err;
-      if (sector == 0) {
-        mirrors.valid[index] = copy[0] == FAT12_MEDIA_DESCRIPTOR &&
-            copy[1] == 0xFF && copy[2] == 0xFF;
-      }
-      if (memcmp(primary, copy, DISK_SECTOR_SIZE) != 0) {
-        mirrors.mismatch = true;
-      }
-    }
-  }
-  fat->fat_mismatch = mirrors.mismatch;
-  fat->fat_markers_invalid = false;
-  for (uint8_t index = 0; index < FAT12_NUM_FATS; index++) {
-    fat->fat_markers_invalid |= !mirrors.valid[index];
-  }
+  err = fsck_compare_fats(fat, &mirrors);
+  if (err != FAT12_OK) return err;
   if (mirrors.mismatch) {
     fat12_fsck_t selection;
     err = fsck_select_fat(fat, &mirrors, &selection, &fat->fat_start);
@@ -227,6 +201,21 @@ static void fat12_entry_pack(uint16_t cluster, uint16_t value,
     *lo = (uint8_t)value;
     *hi = (uint8_t)((*hi & 0xF0u) | ((value >> 8) & 0x0Fu));
   }
+}
+
+typedef struct {
+  uint16_t sector;
+  uint16_t offset;
+  bool split;
+} fat12_entry_loc_t;
+
+static fat12_entry_loc_t fat12_entry_locate(uint16_t cluster) {
+  uint32_t fat_offset = (uint32_t)cluster + cluster / 2u;
+  return (fat12_entry_loc_t){
+      .sector = (uint16_t)(fat_offset / DISK_SECTOR_SIZE),
+      .offset = (uint16_t)(fat_offset % DISK_SECTOR_SIZE),
+      .split = (fat_offset % DISK_SECTOR_SIZE) == DISK_SECTOR_SIZE - 1u,
+  };
 }
 
 bool fat12_is_eof(uint16_t cluster) {
@@ -290,15 +279,14 @@ static fat12_err_t fat12_resolve_entry(fat12_t *fat, uint16_t fat_start,
     return FAT12_ERR_INVALID;
   }
 
-  uint32_t offset = (uint32_t)cluster + cluster / 2u;
-  uint32_t fat_bytes = FAT12_SECTORS_PER_FAT * DISK_SECTOR_SIZE;
-  if (offset + 1u >= fat_bytes) {
+  fat12_entry_loc_t loc = fat12_entry_locate(cluster);
+  if (loc.sector >= FAT12_SECTORS_PER_FAT ||
+      (loc.split && loc.sector + 1u >= FAT12_SECTORS_PER_FAT)) {
     *next = 0;
     return FAT12_ERR_INVALID;
   }
 
-  uint16_t lba = (uint16_t)(fat_start + offset / DISK_SECTOR_SIZE);
-  uint16_t in_sector = offset % DISK_SECTOR_SIZE;
+  uint16_t lba = (uint16_t)(fat_start + loc.sector);
   uint8_t sector[DISK_SECTOR_SIZE];
   fat12_err_t err = batched
       ? fat12_read_sector_batched(fat, lba, sector)
@@ -306,7 +294,7 @@ static fat12_err_t fat12_resolve_entry(fat12_t *fat, uint16_t fat_start,
   if (err != FAT12_OK) return err;
 
   uint8_t hi;
-  if (in_sector == DISK_SECTOR_SIZE - 1u) {
+  if (loc.split) {
     uint8_t next_sector[DISK_SECTOR_SIZE];
     err = batched
         ? fat12_read_sector_batched(fat, lba + 1u, next_sector)
@@ -314,9 +302,9 @@ static fat12_err_t fat12_resolve_entry(fat12_t *fat, uint16_t fat_start,
     if (err != FAT12_OK) return err;
     hi = next_sector[0];
   } else {
-    hi = sector[in_sector + 1u];
+    hi = sector[loc.offset + 1u];
   }
-  *next = fat12_entry_unpack(cluster, sector[in_sector], hi);
+  *next = fat12_entry_unpack(cluster, sector[loc.offset], hi);
   return FAT12_OK;
 }
 
@@ -334,7 +322,7 @@ fat12_err_t fat12_read_root_entry(fat12_t *fat, uint16_t index,
                                   fat12_dirent_t *entry) {
   if (fat == NULL || entry == NULL) return FAT12_ERR_INVALID;
   if (index >= FAT12_ROOT_ENTRIES) return FAT12_ERR_EOF;
-  uint16_t lba = FAT12_RESERVED_SECTORS + FAT12_NUM_FATS * FAT12_SECTORS_PER_FAT +
+  uint16_t lba = FAT12_ROOT_START +
       (uint16_t)(((uint32_t)index * FAT12_DIR_ENTRY_SIZE) / DISK_SECTOR_SIZE);
   uint16_t offset = ((uint32_t)index * FAT12_DIR_ENTRY_SIZE) % DISK_SECTOR_SIZE;
   uint8_t sector[DISK_SECTOR_SIZE];
@@ -742,30 +730,27 @@ static fat12_err_t fat12_set_entry(fat12_t *fat, uint16_t cluster,
   if (!fat12_cluster_valid(cluster) || value > 0x0FFFu) {
     return FAT12_ERR_INVALID;
   }
-  uint32_t fat_offset = (uint32_t)cluster + cluster / 2u;
-  uint16_t sector_index = (uint16_t)(fat_offset / DISK_SECTOR_SIZE);
-  uint16_t offset = fat_offset % DISK_SECTOR_SIZE;
-  bool split = offset == DISK_SECTOR_SIZE - 1u;
+  fat12_entry_loc_t loc = fat12_entry_locate(cluster);
   uint8_t sector[DISK_SECTOR_SIZE];
   uint8_t sector2[DISK_SECTOR_SIZE];
   fat12_err_t err = fat12_read_sector_batched(
-      fat, (uint16_t)(FAT12_RESERVED_SECTORS + sector_index), sector);
+      fat, (uint16_t)(FAT12_RESERVED_SECTORS + loc.sector), sector);
   if (err != FAT12_OK) return err;
-  if (split) {
+  if (loc.split) {
     err = fat12_read_sector_batched(
-        fat, (uint16_t)(FAT12_RESERVED_SECTORS + sector_index + 1u),
+        fat, (uint16_t)(FAT12_RESERVED_SECTORS + loc.sector + 1u),
         sector2);
     if (err != FAT12_OK) return err;
   }
-  uint8_t *hi = split ? &sector2[0] : &sector[offset + 1u];
-  fat12_entry_pack(cluster, value, &sector[offset], hi);
+  uint8_t *hi = loc.split ? &sector2[0] : &sector[loc.offset + 1u];
+  fat12_entry_pack(cluster, value, &sector[loc.offset], hi);
 
   for (uint8_t copy = 0; copy < FAT12_NUM_FATS; copy++) {
     uint16_t lba = (uint16_t)(FAT12_RESERVED_SECTORS +
-        (uint16_t)copy * FAT12_SECTORS_PER_FAT + sector_index);
+        (uint16_t)copy * FAT12_SECTORS_PER_FAT + loc.sector);
     err = fat12_write_sector_batched(fat, lba, sector);
     if (err != FAT12_OK) return err;
-    if (split) {
+    if (loc.split) {
       err = fat12_write_sector_batched(fat, (uint16_t)(lba + 1u), sector2);
       if (err != FAT12_OK) return err;
     }
@@ -788,10 +773,9 @@ static void fat12_scan_init(fat12_scan_t *scan, fat12_t *fat,
 static fat12_err_t fat12_scan_next(fat12_scan_t *scan, uint16_t end,
                                    uint16_t *cluster, uint16_t *entry) {
   if (scan->cluster >= end) return FAT12_ERR_EOF;
-  uint32_t fat_offset = (uint32_t)scan->cluster + scan->cluster / 2u;
-  uint16_t lba = (uint16_t)(scan->fat_start +
-                            fat_offset / DISK_SECTOR_SIZE);
-  uint16_t offset = fat_offset % DISK_SECTOR_SIZE;
+  fat12_entry_loc_t loc = fat12_entry_locate(scan->cluster);
+  uint16_t lba = (uint16_t)(scan->fat_start + loc.sector);
+  uint16_t offset = loc.offset;
   if (lba != scan->cached_lba) {
     fat12_err_t err = scan->batched
         ? fat12_read_sector_batched(scan->fat, lba, scan->sector)
@@ -801,7 +785,7 @@ static fat12_err_t fat12_scan_next(fat12_scan_t *scan, uint16_t end,
     scan->cached_lba2 = UINT16_MAX;
   }
   uint8_t hi;
-  if (offset == DISK_SECTOR_SIZE - 1u) {
+  if (loc.split) {
     if (scan->cached_lba2 != lba + 1u) {
       fat12_err_t err = scan->batched
           ? fat12_read_sector_batched(scan->fat, lba + 1u, scan->sector2)
@@ -871,7 +855,7 @@ static fat12_err_t fat12_write_cluster(fat12_t *fat, uint16_t cluster,
 static fat12_err_t fat12_write_root_entry(fat12_t *fat, uint16_t index,
                                           const fat12_dirent_t *entry) {
   if (index >= FAT12_ROOT_ENTRIES) return FAT12_ERR_EOF;
-  uint16_t lba = FAT12_RESERVED_SECTORS + FAT12_NUM_FATS * FAT12_SECTORS_PER_FAT +
+  uint16_t lba = FAT12_ROOT_START +
       (uint16_t)(((uint32_t)index * FAT12_DIR_ENTRY_SIZE) / DISK_SECTOR_SIZE);
   uint16_t offset = ((uint32_t)index * FAT12_DIR_ENTRY_SIZE) % DISK_SECTOR_SIZE;
   uint8_t sector[DISK_SECTOR_SIZE];
@@ -1569,7 +1553,7 @@ static fat12_err_t fsck_name_duplicate(
   if (directory_start == 0) {
     for (uint16_t sector = 0;
          sector < FAT12_ROOT_DIR_SECTORS && !reached && !*duplicate; sector++) {
-      uint16_t lba = FAT12_FAT2_START + FAT12_SECTORS_PER_FAT + sector;
+      uint16_t lba = FAT12_ROOT_START + sector;
       fat12_err_t err = fsck_duplicate_in_sector(
           ctx, lba, current_lba, current_offset, entry, duplicate, &reached);
       if (err != FAT12_OK) return err;
@@ -1750,8 +1734,7 @@ static fat12_err_t fsck_scan(fsck_ctx_t *ctx) {
   bool end = false;
   for (uint16_t sector_index = 0;
        sector_index < FAT12_ROOT_DIR_SECTORS && !end; sector_index++) {
-    uint16_t lba = FAT12_RESERVED_SECTORS +
-        FAT12_NUM_FATS * FAT12_SECTORS_PER_FAT + sector_index;
+    uint16_t lba = FAT12_ROOT_START + sector_index;
     uint8_t sector[DISK_SECTOR_SIZE];
     err = ctx->fat->batch.active
         ? fat12_read_sector_batched(ctx->fat, lba, sector)
@@ -1797,7 +1780,7 @@ static void fsck_capture_reachable(fat12_t *fat) {
   memset(fat->fsck_reachable, 0, sizeof(fat->fsck_reachable));
   for (uint16_t cluster = 2; cluster < FAT12_CLUSTER_LIMIT; cluster++) {
     if (fat->fsck_owner[cluster] != 0) {
-      fat->fsck_reachable[cluster / 8u] |= 1u << (cluster % 8u);
+      fat->fsck_reachable[cluster / 8u] |= (uint8_t)(1u << (cluster % 8u));
     }
   }
 }
