@@ -1,1460 +1,954 @@
 #include "test.h"
-#include "vdisk.h"
 #include "../src/f12.h"
 
-static vdisk_t vdisk;
+typedef struct {
+  uint8_t data[DISK_SECTOR_COUNT][DISK_SECTOR_SIZE];
+  track_t last_write;
+  block_status_t read_status;
+  block_status_t write_status;
+  block_status_t generation_status;
+  block_status_t write_protected_status;
+  uint32_t generation;
+  uint32_t reads;
+  uint32_t writes;
+  uint32_t last_expected_generation;
+  uint32_t generation_calls;
+  uint32_t change_generation_on_call;
+  bool write_protected;
+  bool corrupt_track;
+  bool apply_failed_write;
+  uint32_t error_valid;
+} test_disk_t;
 
-static f12_io_t vdisk_f12_io(void) {
-  return (f12_io_t){
-    .read = vdisk_read,
-    .write = vdisk_write,
-    .disk_changed = vdisk_disk_changed,
-    .write_protected = vdisk_write_protected,
-    .ctx = &vdisk,
+typedef struct {
+  void *expected;
+  uint32_t calls;
+} progress_state_t;
+
+static test_disk_t disk;
+static f12_t fs;
+
+static uint16_t checked_lba(uint8_t cylinder, uint8_t head, uint8_t sector) {
+  uint16_t lba;
+  ASSERT(disk_chs_to_lba(cylinder, head, sector, &lba));
+  return lba;
+}
+
+static bool filesystem_mounted(void) {
+  bool mounted = false;
+  ASSERT_EQ(f12_is_mounted(&fs, &mounted), F12_OK);
+  return mounted;
+}
+
+static block_status_t disk_read_track(void *ctx, uint32_t expected_generation,
+                                      uint8_t cylinder, uint8_t head,
+                                      track_t *out) {
+  test_disk_t *device = (test_disk_t *)ctx;
+  if (!out || !disk_ch_valid(cylinder, head)) return BLOCK_ERR_INVALID;
+  if (expected_generation != device->generation) return BLOCK_ERR_MEDIA_CHANGED;
+  memset(out, 0, sizeof(*out));
+  out->cylinder = cylinder;
+  out->head = head;
+  out->valid = device->read_status == BLOCK_OK
+      ? (device->corrupt_track ? DISK_TRACK_VALID ^ 1u : DISK_TRACK_VALID)
+      : device->error_valid;
+  uint16_t first = checked_lba(cylinder, head, 0);
+  for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
+    memcpy(out->data[sector], device->data[first + sector], DISK_SECTOR_SIZE);
+  }
+  device->reads++;
+  return device->read_status;
+}
+
+static block_status_t disk_write_track(void *ctx, uint32_t expected_generation,
+                                       const track_t *track) {
+  test_disk_t *device = (test_disk_t *)ctx;
+  if (!track || !disk_ch_valid(track->cylinder, track->head) ||
+      track->valid != DISK_TRACK_VALID) {
+    return BLOCK_ERR_INVALID;
+  }
+  device->last_expected_generation = expected_generation;
+  if (expected_generation != device->generation) return BLOCK_ERR_MEDIA_CHANGED;
+  if (device->write_protected) return BLOCK_ERR_WRITE_PROTECTED;
+  uint16_t first = checked_lba(track->cylinder, track->head, 0);
+  if (device->write_status == BLOCK_OK || device->apply_failed_write) {
+    for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
+      memcpy(device->data[first + sector], track->data[sector], DISK_SECTOR_SIZE);
+    }
+  }
+  if (device->write_status != BLOCK_OK) return device->write_status;
+  device->last_write = *track;
+  device->writes++;
+  return BLOCK_OK;
+}
+
+static block_status_t disk_generation(void *ctx, uint32_t *generation) {
+  test_disk_t *device = ctx;
+  if (!device || !generation) return BLOCK_ERR_INVALID;
+  device->generation_calls++;
+  if (device->generation_status != BLOCK_OK) {
+    return device->generation_status;
+  }
+  if (device->change_generation_on_call == device->generation_calls) {
+    device->generation++;
+  }
+  *generation = device->generation;
+  return BLOCK_OK;
+}
+
+static block_status_t disk_write_protected(void *ctx, bool *write_protected) {
+  test_disk_t *device = ctx;
+  if (!device || !write_protected) return BLOCK_ERR_INVALID;
+  if (device->write_protected_status != BLOCK_OK) {
+    return device->write_protected_status;
+  }
+  *write_protected = device->write_protected;
+  return BLOCK_OK;
+}
+
+static block_device_t disk_device(bool writable) {
+  return (block_device_t){
+      .read_track = disk_read_track,
+      .write_track = writable ? disk_write_track : NULL,
+      .media_generation = disk_generation,
+      .write_protected = disk_write_protected,
+      .ctx = &disk,
   };
 }
 
-typedef struct {
-  vdisk_t *disk;
-  int track_reads;
-} failing_track_io_t;
-
-static bool failing_track_read(void *ctx, sector_t *sector) {
-  failing_track_io_t *io = (failing_track_io_t *)ctx;
-  return vdisk_read(io->disk, sector);
+static void progress(void *ctx, uint8_t cylinder, uint8_t head,
+                     uint16_t done, uint16_t total) {
+  progress_state_t *state = (progress_state_t *)ctx;
+  ASSERT(state == state->expected);
+  ASSERT(cylinder < DISK_CYLINDERS);
+  ASSERT(head < DISK_HEADS);
+  ASSERT(done <= total);
+  state->calls++;
 }
 
-static bool failing_track_read_track(void *ctx, track_t *track) {
-  failing_track_io_t *io = (failing_track_io_t *)ctx;
-  io->track_reads++;
-  for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-    track->sectors[i].valid = true;
-    memset(track->sectors[i].data, 0xEE, SECTOR_SIZE);
+static void disk_reset(void) {
+  memset(&disk, 0, sizeof(disk));
+  disk.generation = 1;
+}
+
+static f12_format_options_t format_options(const char *label,
+                                           f12_format_mode_t mode) {
+  return (f12_format_options_t){.label = label, .mode = mode};
+}
+
+static void prepare(void) {
+  disk_reset();
+  ASSERT_EQ(f12_init(&fs, disk_device(true)), F12_OK);
+  ASSERT_EQ(f12_format(&fs, format_options("TEST", F12_FORMAT_QUICK)), F12_OK);
+  ASSERT_EQ(f12_mount(&fs), F12_OK);
+}
+
+static void write_file(const char *name, const void *data, size_t size) {
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, name, F12_OPEN_WRITE, &file), F12_OK);
+  if (size != 0) {
+    f12_result_t result = f12_write(&file, data, size);
+    ASSERT_EQ(result.error, F12_OK);
+    ASSERT_EQ(result.count, size);
+  }
+  ASSERT_EQ(f12_close(&file), F12_OK);
+}
+
+static size_t read_file(const char *name, void *data, size_t capacity) {
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, name, F12_OPEN_READ, &file), F12_OK);
+  f12_result_t result = f12_read(&file, data, capacity);
+  ASSERT(result.error == F12_OK || result.error == F12_END);
+  ASSERT_EQ(f12_close(&file), F12_OK);
+  return result.count;
+}
+
+static bool cache_has(uint8_t cylinder, uint8_t head) {
+  for (size_t i = 0; i < F12_CACHE_TRACKS; i++) {
+    if (fs.cache[i].occupied &&
+        fs.cache[i].track.cylinder == cylinder &&
+        fs.cache[i].track.head == head) {
+      return true;
+    }
   }
   return false;
 }
 
-static bool failing_track_write(void *ctx, track_t *track) {
-  failing_track_io_t *io = (failing_track_io_t *)ctx;
-  return vdisk_write(io->disk, track);
+TEST(test_init_contract) {
+  disk_reset();
+  f12_t automatic;
+  ASSERT_EQ(f12_init(&automatic, disk_device(true)), F12_OK);
+  bool mounted = true;
+  ASSERT_EQ(f12_is_mounted(&automatic, &mounted), F12_OK);
+  ASSERT(!mounted);
+  block_device_t device = disk_device(true);
+  ASSERT_EQ(f12_init(NULL, device), F12_ERR_INVALID);
+  device.read_track = NULL;
+  ASSERT_EQ(f12_init(&fs, device), F12_ERR_INVALID);
+  device = disk_device(true);
+  device.media_generation = NULL;
+  ASSERT_EQ(f12_init(&fs, device), F12_ERR_INVALID);
+  device = disk_device(true);
+  device.write_protected = NULL;
+  ASSERT_EQ(f12_init(&fs, device), F12_ERR_INVALID);
+  ASSERT_EQ(f12_init(&fs, disk_device(false)), F12_OK);
 }
 
-TEST(test_mount_unmount) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-
-  f12_err_t err = f12_format(&fs, "TEST", false);
-  ASSERT_EQ(err, F12_OK);
-
-  err = f12_mount(&fs, vdisk_f12_io());
-  ASSERT_EQ(err, F12_OK);
-  ASSERT(fs.mounted);
-
-  f12_unmount(&fs);
-  ASSERT(!fs.mounted);
+TEST(test_format_mount_unmount) {
+  prepare();
+  ASSERT(filesystem_mounted());
+  ASSERT_EQ(f12_mount(&fs), F12_ERR_ALREADY_MOUNTED);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+  ASSERT(!filesystem_mounted());
+  ASSERT_EQ(f12_unmount(&fs), F12_ERR_NOT_MOUNTED);
+  ASSERT_EQ(f12_mount(&fs), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_mount_clears_uninitialized_state) {
-  vdisk_format_valid(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0xA5, sizeof(fs));
-
-  f12_err_t err = f12_mount(&fs, vdisk_f12_io());
-  ASSERT_EQ(err, F12_OK);
-  ASSERT(fs.mounted);
-  ASSERT_NOT_NULL(fs.cache);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_failed_track_read_falls_back_to_sector_read) {
-  vdisk_format_valid(&vdisk);
-
-  failing_track_io_t fio = { .disk = &vdisk };
-  f12_io_t io = {
-    .read = failing_track_read,
-    .read_track = failing_track_read_track,
-    .write = failing_track_write,
-    .disk_changed = NULL,
-    .write_protected = NULL,
-    .ctx = &fio,
+TEST(test_format_options_and_progress_context) {
+  disk_reset();
+  ASSERT_EQ(f12_init(&fs, disk_device(true)), F12_OK);
+  progress_state_t state = {.expected = &state};
+  f12_format_options_t options = {
+      .label = "FULL",
+      .mode = F12_FORMAT_FULL,
+      .progress = progress,
+      .progress_ctx = &state,
   };
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  f12_err_t err = f12_mount(&fs, io);
-  ASSERT_EQ(err, F12_OK);
-  ASSERT(fio.track_reads > 0);
-  ASSERT(vdisk.read_count > 0);
-
-  f12_unmount(&fs);
+  ASSERT_EQ(f12_format(&fs, options), F12_OK);
+  ASSERT_EQ(state.calls, DISK_TRACK_COUNT);
+  options.mode = (f12_format_mode_t)99;
+  ASSERT_EQ(f12_format(&fs, options), F12_ERR_INVALID);
+  options.mode = F12_FORMAT_QUICK;
+  options.label = NULL;
+  ASSERT_EQ(f12_format(&fs, options), F12_ERR_INVALID);
 }
 
-TEST(test_format_and_mount) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-
-  f12_err_t err = f12_format(&fs, "TESTDISK", false);
-  ASSERT_EQ(err, F12_OK);
-
-  err = f12_mount(&fs, vdisk_f12_io());
-  ASSERT_EQ(err, F12_OK);
-
-  f12_unmount(&fs);
+TEST(test_read_only_device_mounts) {
+  prepare();
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+  ASSERT_EQ(f12_init(&fs, disk_device(false)), F12_OK);
+  ASSERT_EQ(f12_mount(&fs), F12_OK);
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "NEW.TXT", F12_OPEN_WRITE, &file),
+            F12_ERR_WRITE_PROTECTED);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_create_write_read_file) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "HELLO.TXT", "w");
-  ASSERT(f != NULL);
-
-  const char *msg = "Hello, World!";
-  int n = f12_write(f, msg, strlen(msg));
-  ASSERT_EQ(n, (int)strlen(msg));
-
-  f12_err_t err = f12_close(f);
-  ASSERT_EQ(err, F12_OK);
-
-  f = f12_open(&fs, "HELLO.TXT", "r");
-  ASSERT(f != NULL);
-
-  char buf[64];
-  n = f12_read(f, buf, sizeof(buf));
-  ASSERT_EQ(n, (int)strlen(msg));
-  buf[n] = '\0';
-  ASSERT_STR_EQ(buf, msg);
-
-  f12_close(f);
-  f12_unmount(&fs);
+TEST(test_block_adapter_rejects_null_context_and_output) {
+  prepare();
+  uint8_t sector[DISK_SECTOR_SIZE];
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, 0, NULL), BLOCK_ERR_INVALID);
+  ASSERT_EQ(fs.fat.io.read(NULL, 0, sector), BLOCK_ERR_INVALID);
+  ASSERT(filesystem_mounted());
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_file_stat) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "DATA.BIN", "w");
-  ASSERT(f != NULL);
-
-  uint8_t data[256];
-  for (int i = 0; i < 256; i++) data[i] = i;
-  f12_write(f, data, sizeof(data));
-  f12_close(f);
-
-  f12_stat_t stat;
-  f12_err_t err = f12_stat(&fs, "DATA.BIN", &stat);
-  ASSERT_EQ(err, F12_OK);
-  ASSERT_STR_EQ(stat.name, "DATA.BIN");
-  ASSERT_EQ(stat.size, 256);
-  ASSERT(!stat.is_dir);
-
-  f12_unmount(&fs);
+TEST(test_track_cache_is_atomic_lru) {
+  prepare();
+  fs.cache_clock = 0;
+  memset(fs.cache, 0, sizeof(fs.cache));
+  disk.reads = 0;
+  uint8_t sector[DISK_SECTOR_SIZE];
+  for (uint8_t track = 0; track < F12_CACHE_TRACKS + 1u; track++) {
+    uint16_t lba = (uint16_t)track * DISK_SECTORS_PER_TRACK;
+    ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, sector), BLOCK_OK);
+  }
+  ASSERT_EQ(disk.reads, F12_CACHE_TRACKS + 1u);
+  ASSERT(!cache_has(0, 0));
+  for (uint8_t track = 1; track < F12_CACHE_TRACKS + 1u; track++) {
+    ASSERT(cache_has(track / DISK_HEADS, track % DISK_HEADS));
+  }
+  for (size_t i = 0; i < F12_CACHE_TRACKS; i++) {
+    ASSERT_EQ(fs.cache[i].track.valid, DISK_TRACK_VALID);
+  }
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx,
+                           F12_CACHE_TRACKS * DISK_SECTORS_PER_TRACK + 7u,
+                           sector), BLOCK_OK);
+  ASSERT_EQ(disk.reads, F12_CACHE_TRACKS + 1u);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_file_delete) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "TODEL.TXT", "w");
-  ASSERT(f != NULL);
-  f12_write(f, "delete me", 9);
-  f12_close(f);
-
-  f12_stat_t stat;
-  f12_err_t err = f12_stat(&fs, "TODEL.TXT", &stat);
-  ASSERT_EQ(err, F12_OK);
-
-  err = f12_delete(&fs, "TODEL.TXT");
-  ASSERT_EQ(err, F12_OK);
-
-  err = f12_stat(&fs, "TODEL.TXT", &stat);
-  ASSERT_EQ(err, F12_ERR_NOT_FOUND);
-
-  f12_unmount(&fs);
+TEST(test_partial_crc_track_serves_valid_sector) {
+  prepare();
+  memset(fs.cache, 0, sizeof(fs.cache));
+  fs.cache_clock = 0;
+  disk.reads = 0;
+  disk.read_status = BLOCK_ERR_CRC;
+  disk.error_valid = DISK_TRACK_VALID ^ (1u << 17);
+  uint16_t lba = checked_lba(0, 0, 3);
+  uint8_t sector[DISK_SECTOR_SIZE];
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, sector), BLOCK_OK);
+  ASSERT_EQ(disk.reads, 1);
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba + 1u, sector), BLOCK_OK);
+  ASSERT_EQ(disk.reads, 1);
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba + 14u, sector), BLOCK_ERR_CRC);
+  ASSERT_EQ(disk.reads, 2);
+  disk.read_status = BLOCK_OK;
+  disk.error_valid = 0;
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_directory_listing) {
-  vdisk_init(&vdisk);
+TEST(test_corrupt_full_track_rejected) {
+  disk_reset();
+  ASSERT_EQ(f12_init(&fs, disk_device(true)), F12_OK);
+  disk.corrupt_track = true;
+  ASSERT_EQ(f12_mount(&fs), F12_ERR_CORRUPT);
+}
 
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
+TEST(test_partial_write_materializes_full_track) {
+  prepare();
+  uint8_t cylinder = 12;
+  uint8_t head = 1;
+  uint16_t first = checked_lba(cylinder, head, 0);
+  for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
+    memset(disk.data[first + sector], sector, DISK_SECTOR_SIZE);
+  }
+  track_t partial = {.cylinder = cylinder, .head = head, .valid = 1u << 4};
+  memset(partial.data[4], 0xA5, DISK_SECTOR_SIZE);
+  ASSERT_EQ(fs.fat.io.write(fs.fat.io.ctx, &partial), BLOCK_OK);
+  ASSERT_EQ(disk.last_write.valid, DISK_TRACK_VALID);
+  ASSERT_EQ(disk.last_expected_generation, disk.generation);
+  ASSERT_EQ(disk.data[first + 4][0], 0xA5);
+  ASSERT_EQ(disk.data[first + 3][0], 3);
+  ASSERT(cache_has(cylinder, head));
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
 
-  f12_file_t *f;
+TEST(test_failed_write_does_not_poison_cache) {
+  prepare();
+  uint8_t data[DISK_SECTOR_SIZE];
+  uint8_t cylinder = 8;
+  uint8_t head = 0;
+  uint16_t lba = checked_lba(cylinder, head, 0);
+  memset(disk.data[lba], 0x11, DISK_SECTOR_SIZE);
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, data), BLOCK_OK);
+  track_t partial = {.cylinder = cylinder, .head = head, .valid = 1u};
+  memset(partial.data[0], 0x22, DISK_SECTOR_SIZE);
+  disk.write_status = BLOCK_ERR_VERIFY;
+  ASSERT_EQ(fs.fat.io.write(fs.fat.io.ctx, &partial), BLOCK_ERR_VERIFY);
+  disk.write_status = BLOCK_OK;
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, data), BLOCK_OK);
+  ASSERT_EQ(data[0], 0x11);
+  ASSERT_EQ(disk.data[lba][0], 0x11);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
 
-  f = f12_open(&fs, "FILE1.TXT", "w");
-  f12_write(f, "one", 3);
-  f12_close(f);
+TEST(test_failed_mutating_write_evicts_cache) {
+  prepare();
+  uint8_t data[DISK_SECTOR_SIZE];
+  uint8_t cylinder = 8;
+  uint8_t head = 1;
+  uint16_t lba = checked_lba(cylinder, head, 0);
+  memset(disk.data[lba], 0x11, DISK_SECTOR_SIZE);
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, data), BLOCK_OK);
+  track_t partial = {.cylinder = cylinder, .head = head, .valid = 1u};
+  memset(partial.data[0], 0x22, DISK_SECTOR_SIZE);
+  disk.apply_failed_write = true;
+  disk.write_status = BLOCK_ERR_VERIFY;
+  ASSERT_EQ(fs.fat.io.write(fs.fat.io.ctx, &partial), BLOCK_ERR_VERIFY);
+  uint32_t reads = disk.reads;
+  disk.write_status = BLOCK_OK;
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, data), BLOCK_OK);
+  ASSERT_EQ(disk.reads, reads + 1u);
+  ASSERT_EQ(data[0], 0x22);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
 
-  f = f12_open(&fs, "FILE2.TXT", "w");
-  f12_write(f, "two", 3);
-  f12_close(f);
+TEST(test_conflicting_partial_reads_never_form_a_track) {
+  prepare();
+  memset(fs.cache, 0, sizeof(fs.cache));
+  fs.cache_clock = 0;
+  disk.read_status = BLOCK_ERR_CRC;
+  uint16_t lba = checked_lba(9, 0, 3);
+  memset(disk.data[lba], 0x31, DISK_SECTOR_SIZE);
+  disk.error_valid = 1u << 3;
+  uint8_t data[DISK_SECTOR_SIZE];
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, data), BLOCK_OK);
+  memset(disk.data[lba], 0x32, DISK_SECTOR_SIZE);
+  disk.error_valid = (1u << 3) | (1u << 17);
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba + 14u, data), BLOCK_OK);
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, data), BLOCK_ERR_CORRUPT);
+  disk.read_status = BLOCK_OK;
+  disk.error_valid = 0;
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
 
-  f = f12_open(&fs, "FILE3.TXT", "w");
-  f12_write(f, "three", 5);
-  f12_close(f);
+TEST(test_file_roundtrip_and_end) {
+  prepare();
+  uint8_t source[1500];
+  uint8_t target[1500];
+  for (size_t i = 0; i < sizeof(source); i++) source[i] = (uint8_t)(i * 13u);
+  write_file("ROUND.BIN", source, sizeof(source));
+  ASSERT_EQ(read_file("ROUND.BIN", target, sizeof(target)), sizeof(target));
+  ASSERT_MEM_EQ(source, target, sizeof(source));
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "ROUND.BIN", F12_OPEN_READ, &file), F12_OK);
+  f12_result_t result = f12_read(&file, target, sizeof(target));
+  ASSERT_EQ(result.error, F12_OK);
+  ASSERT_EQ(result.count, sizeof(target));
+  result = f12_read(&file, target, 1);
+  ASSERT_EQ(result.error, F12_END);
+  ASSERT_EQ(result.count, 0);
+  ASSERT_EQ(f12_close(&file), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
 
+TEST(test_seek_tell_and_read_at) {
+  prepare();
+  uint8_t source[1024];
+  for (size_t i = 0; i < sizeof(source); i++) source[i] = (uint8_t)i;
+  write_file("SEEK.BIN", source, sizeof(source));
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "SEEK.BIN", F12_OPEN_READ, &file), F12_OK);
+  ASSERT_EQ(f12_seek(&file, 700), F12_OK);
+  uint32_t offset;
+  ASSERT_EQ(f12_tell(&file, &offset), F12_OK);
+  ASSERT_EQ(offset, 700);
+  uint8_t data[20];
+  f12_result_t result = f12_read_at(&file, 100, data, sizeof(data));
+  ASSERT_EQ(result.error, F12_OK);
+  ASSERT_EQ(result.count, sizeof(data));
+  ASSERT_MEM_EQ(data, source + 100, sizeof(data));
+  ASSERT_EQ(f12_tell(&file, &offset), F12_OK);
+  ASSERT_EQ(offset, 700);
+  memset(fs.cache, 0, sizeof(fs.cache));
+  fs.cache_clock = 0;
+  disk.read_status = BLOCK_ERR_TIMEOUT;
+  result = f12_read_at(&file, 600, data, sizeof(data));
+  ASSERT_EQ(result.error, F12_ERR_TIMEOUT);
+  ASSERT_EQ(result.count, 0);
+  ASSERT_EQ(f12_tell(&file, &offset), F12_OK);
+  ASSERT_EQ(offset, 700);
+  disk.read_status = BLOCK_OK;
+  ASSERT_EQ(f12_close(&file), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_mode_errors_are_typed) {
+  prepare();
+  write_file("MODE.BIN", "x", 1);
+  f12_file_t reader;
+  ASSERT_EQ(f12_open(&fs, "MODE.BIN", F12_OPEN_READ, &reader), F12_OK);
+  ASSERT_EQ(f12_write(&reader, "x", 1).error, F12_ERR_CONFLICT);
+  ASSERT_EQ(f12_close(&reader), F12_OK);
+  f12_file_t writer;
+  ASSERT_EQ(f12_open(&fs, "MODE.BIN", F12_OPEN_WRITE, &writer), F12_OK);
+  uint8_t byte;
+  ASSERT_EQ(f12_read(&writer, &byte, 1).error, F12_ERR_CONFLICT);
+  ASSERT_EQ(f12_seek(&writer, 0), F12_ERR_CONFLICT);
+  ASSERT_EQ(f12_abort(&writer), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_stale_file_handle_generation) {
+  prepare();
+  write_file("ONE.BIN", "1", 1);
+  write_file("TWO.BIN", "2", 1);
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "ONE.BIN", F12_OPEN_READ, &file), F12_OK);
+  f12_file_t stale = file;
+  ASSERT_EQ(f12_close(&file), F12_OK);
+  ASSERT_EQ(f12_open(&fs, "TWO.BIN", F12_OPEN_READ, &file), F12_OK);
+  uint8_t byte;
+  ASSERT_EQ(f12_read(&stale, &byte, 1).error, F12_ERR_BAD_HANDLE);
+  ASSERT_EQ(f12_close(&stale), F12_ERR_BAD_HANDLE);
+  ASSERT_EQ(f12_close(&file), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_stale_mount_generation) {
+  prepare();
+  write_file("STALE.BIN", "x", 1);
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "STALE.BIN", F12_OPEN_READ, &file), F12_OK);
+  f12_file_t stale = file;
+  ASSERT_EQ(f12_unmount(&fs), F12_ERR_CONFLICT);
+  ASSERT_EQ(f12_close(&file), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+  ASSERT_EQ(f12_mount(&fs), F12_OK);
+  uint8_t byte;
+  ASSERT_EQ(f12_read(&stale, &byte, 1).error, F12_ERR_BAD_HANDLE);
+  ASSERT_EQ(f12_close(&stale), F12_ERR_BAD_HANDLE);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_media_generation_invalidates_mount) {
+  prepare();
+  write_file("MEDIA.BIN", "x", 1);
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "MEDIA.BIN", F12_OPEN_READ, &file), F12_OK);
+  disk.generation++;
+  uint8_t byte;
+  ASSERT_EQ(f12_read(&file, &byte, 1).error, F12_ERR_MEDIA_CHANGED);
+  ASSERT(!filesystem_mounted());
+  ASSERT_EQ(f12_close(&file), F12_ERR_BAD_HANDLE);
+  ASSERT_EQ(f12_mount(&fs), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_tell_observes_media_generation) {
+  prepare();
+  write_file("TELL.BIN", "x", 1);
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "TELL.BIN", F12_OPEN_READ, &file), F12_OK);
+  disk.generation++;
+  uint32_t offset;
+  ASSERT_EQ(f12_tell(&file, &offset), F12_ERR_MEDIA_CHANGED);
+  ASSERT(!filesystem_mounted());
+  ASSERT_EQ(f12_close(&file), F12_ERR_BAD_HANDLE);
+}
+
+TEST(test_cache_hit_generation_race_is_detected) {
+  prepare();
+  uint8_t data[DISK_SECTOR_SIZE];
+  uint16_t lba = checked_lba(7, 0, 0);
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, data), BLOCK_OK);
+  disk.generation_calls = 0;
+  disk.change_generation_on_call = 2;
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, lba, data), BLOCK_ERR_MEDIA_CHANGED);
+  disk.change_generation_on_call = 0;
+  ASSERT_EQ(f12_unmount(&fs), F12_ERR_MEDIA_CHANGED);
+}
+
+TEST(test_reinit_does_not_resurrect_handles) {
+  prepare();
+  write_file("ABA.BIN", "a", 1);
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "ABA.BIN", F12_OPEN_READ, &file), F12_OK);
+  f12_file_t stale = file;
+  ASSERT_EQ(f12_close(&file), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+  ASSERT_EQ(f12_init(&fs, disk_device(true)), F12_OK);
+  ASSERT_EQ(f12_mount(&fs), F12_OK);
+  ASSERT_EQ(f12_open(&fs, "ABA.BIN", F12_OPEN_READ, &file), F12_OK);
+  uint8_t value;
+  ASSERT_EQ(f12_read(&stale, &value, 1).error, F12_ERR_BAD_HANDLE);
+  ASSERT_EQ(f12_close(&file), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_live_reinit_resets_and_invalidates_handles) {
+  prepare();
+  write_file("LIVE.BIN", "x", 1);
+  f12_file_t file;
   f12_dir_t dir;
-  f12_err_t err = f12_opendir(&fs, "/", &dir);
-  ASSERT_EQ(err, F12_OK);
-
-  int count = 0;
+  ASSERT_EQ(f12_open(&fs, "LIVE.BIN", F12_OPEN_READ, &file), F12_OK);
+  ASSERT_EQ(f12_opendir(&fs, "/", &dir), F12_OK);
+  ASSERT_EQ(f12_init(&fs, disk_device(true)), F12_OK);
+  ASSERT(!filesystem_mounted());
+  uint8_t byte;
   f12_stat_t stat;
-  while (f12_readdir(&dir, &stat) == F12_OK) {
-    count++;
-    ASSERT(strlen(stat.name) > 0);
-  }
-
-  f12_closedir(&dir);
-  ASSERT_EQ(count, 3);
-
-  f12_unmount(&fs);
+  ASSERT_EQ(f12_read(&file, &byte, 1).error, F12_ERR_BAD_HANDLE);
+  ASSERT_EQ(f12_readdir(&dir, &stat), F12_ERR_BAD_HANDLE);
+  ASSERT_EQ(f12_mount(&fs), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_too_many_open_files) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  for (int i = 0; i < F12_MAX_OPEN_FILES + 2; i++) {
-    char name[16];
-    snprintf(name, sizeof(name), "FILE%d.TXT", i);
-    f12_file_t *f = f12_open(&fs, name, "w");
-    if (f) {
-      f12_write(f, "x", 1);
-      f12_close(f);
-    }
-  }
-
-  f12_file_t *files[F12_MAX_OPEN_FILES];
-  for (int i = 0; i < F12_MAX_OPEN_FILES; i++) {
-    char name[16];
-    snprintf(name, sizeof(name), "FILE%d.TXT", i);
-    files[i] = f12_open(&fs, name, "r");
-    ASSERT(files[i] != NULL);
-  }
-
-  f12_file_t *extra = f12_open(&fs, "FILE10.TXT", "r");
-  ASSERT(extra == NULL);
-  ASSERT_EQ(f12_errno(&fs), F12_ERR_TOO_MANY);
-
-  for (int i = 0; i < F12_MAX_OPEN_FILES; i++) {
-    f12_close(files[i]);
-  }
-
-  f12_unmount(&fs);
+TEST(test_invalid_reinit_preserves_live_context) {
+  prepare();
+  write_file("PRESERVE.BIN", "p", 1);
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "PRESERVE.BIN", F12_OPEN_READ, &file), F12_OK);
+  block_device_t invalid = disk_device(true);
+  invalid.media_generation = NULL;
+  ASSERT_EQ(f12_init(&fs, invalid), F12_ERR_INVALID);
+  ASSERT(filesystem_mounted());
+  uint8_t value = 0;
+  ASSERT_EQ(f12_read(&file, &value, 1).error, F12_OK);
+  ASSERT_EQ(value, 'p');
+  ASSERT_EQ(f12_close(&file), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_write_protected) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "TEST.TXT", "w");
-  ASSERT(f != NULL);
-  f12_write(f, "test", 4);
-  f12_close(f);
-
-  vdisk.write_protected = true;
-
-  f = f12_open(&fs, "TEST2.TXT", "w");
-  ASSERT(f == NULL);
-  ASSERT_EQ(f12_errno(&fs), F12_ERR_WRITE_PROTECTED);
-
-  f12_err_t err = f12_delete(&fs, "TEST.TXT");
-  ASSERT_EQ(err, F12_ERR_WRITE_PROTECTED);
-
-  f = f12_open(&fs, "TEST.TXT", "r");
-  ASSERT(f != NULL);
-  char buf[16];
-  int n = f12_read(f, buf, sizeof(buf));
-  ASSERT_EQ(n, 4);
-  f12_close(f);
-
-  f12_unmount(&fs);
+TEST(test_media_change_forgets_commit_phase_writer) {
+  prepare();
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "SWAP.BIN", F12_OPEN_WRITE, &file), F12_OK);
+  ASSERT_EQ(f12_write(&file, "swap", 4).error, F12_OK);
+  disk.write_status = BLOCK_ERR_VERIFY;
+  ASSERT_EQ(f12_close(&file), F12_ERR_VERIFY);
+  disk.write_status = BLOCK_OK;
+  disk.generation++;
+  ASSERT_EQ(f12_close(&file), F12_ERR_MEDIA_CHANGED);
+  ASSERT_EQ(f12_close(&file), F12_ERR_BAD_HANDLE);
+  ASSERT_EQ(f12_mount(&fs), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_disk_changed) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "TEST.TXT", "w");
-  ASSERT(f != NULL);
-  f12_write(f, "hello", 5);
-  f12_close(f);
-
-  vdisk.disk_changed = true;
-
-  f = f12_open(&fs, "TEST.TXT", "r");
-  ASSERT(f == NULL);
-  ASSERT_EQ(f12_errno(&fs), F12_ERR_DISK_CHANGED);
-
-  ASSERT(!fs.mounted);
-
-  vdisk_init(&vdisk);
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "NEW", false);
-  f12_err_t err = f12_mount(&fs, vdisk_f12_io());
-  ASSERT_EQ(err, F12_OK);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_disk_changed_aborts_pending_write) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "PEND.TXT", "w");
-  ASSERT(f != NULL);
-  ASSERT_EQ(f12_write(f, "hello", 5), 5);
-  ASSERT(fs.fat.batch.active);
-
-  vdisk.disk_changed = true;
-
-  ASSERT_EQ(f12_write(f, "!", 1), -1);
-  ASSERT_EQ(f12_errno(&fs), F12_ERR_DISK_CHANGED);
-  ASSERT(!fs.mounted);
-  ASSERT(!fs.fat.batch.active);
-  ASSERT_EQ(f->mode, F12_MODE_CLOSED);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_seek_and_tell) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "SEEK.TXT", "w");
-  ASSERT(f != NULL);
-  f12_write(f, "0123456789ABCDEF", 16);
-  f12_close(f);
-
-  f = f12_open(&fs, "SEEK.TXT", "r");
-  ASSERT(f != NULL);
-
-  ASSERT_EQ(f12_tell(f), 0);
-
-  f12_err_t err = f12_seek(f, 8);
-  ASSERT_EQ(err, F12_OK);
-  ASSERT_EQ(f12_tell(f), 8);
-
-  char buf[8];
-  int n = f12_read(f, buf, 4);
-  ASSERT_EQ(n, 4);
-  buf[4] = '\0';
-  ASSERT_STR_EQ(buf, "89AB");
-
-  f12_close(f);
-  f12_unmount(&fs);
-}
-
-TEST(test_read_at) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "RAND.TXT", "w");
-  f12_write(f, "AAAABBBBCCCCDDDD", 16);
-  f12_close(f);
-
-  f = f12_open(&fs, "RAND.TXT", "r");
-  ASSERT(f != NULL);
-
-  char buf[5];
-  ASSERT_EQ(f12_tell(f), 0);
-
-  int n = f12_read_at(f, 4, buf, 4);
-  ASSERT_EQ(n, 4);
-  buf[4] = '\0';
-  ASSERT_STR_EQ(buf, "BBBB");
-  ASSERT_EQ(f12_tell(f), 0);
-
-  n = f12_read_at(f, 12, buf, 4);
-  ASSERT_EQ(n, 4);
-  buf[4] = '\0';
-  ASSERT_STR_EQ(buf, "DDDD");
-  ASSERT_EQ(f12_tell(f), 0);
-
-  f12_close(f);
-  f12_unmount(&fs);
-}
-
-TEST(test_file_not_found) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "NOTHERE.TXT", "r");
-  ASSERT(f == NULL);
-  ASSERT_EQ(f12_errno(&fs), F12_ERR_NOT_FOUND);
-
-  f12_stat_t stat;
-  f12_err_t err = f12_stat(&fs, "NOTHERE.TXT", &stat);
-  ASSERT_EQ(err, F12_ERR_NOT_FOUND);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_large_file) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "LARGE.BIN", "w");
-  ASSERT(f != NULL);
-
-  uint8_t block[512];
-  uint32_t total = 0;
-  for (int i = 0; i < 20; i++) {
-    memset(block, i, sizeof(block));
-    int n = f12_write(f, block, sizeof(block));
-    ASSERT(n > 0);
-    total += n;
-  }
-  f12_close(f);
-
-  f12_stat_t stat;
-  f12_err_t err = f12_stat(&fs, "LARGE.BIN", &stat);
-  ASSERT_EQ(err, F12_OK);
-  ASSERT_EQ(stat.size, total);
-
-  f = f12_open(&fs, "LARGE.BIN", "r");
-  ASSERT(f != NULL);
-
-  for (int i = 0; i < 20; i++) {
-    uint8_t expected[512];
-    memset(expected, i, sizeof(expected));
-    int n = f12_read(f, block, sizeof(block));
-    ASSERT_EQ(n, 512);
-    ASSERT(memcmp(block, expected, sizeof(block)) == 0);
-  }
-
-  f12_close(f);
-  f12_unmount(&fs);
-}
-
-TEST(test_large_single_call_io) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  size_t size = 70000;
-  uint8_t *write_buf = malloc(size);
-  uint8_t *read_buf = malloc(size);
-  ASSERT_NOT_NULL(write_buf);
-  ASSERT_NOT_NULL(read_buf);
-
-  for (size_t i = 0; i < size; i++) {
-    write_buf[i] = (uint8_t)((i * 17u + 3u) & 0xFF);
-  }
-
-  f12_file_t *f = f12_open(&fs, "BIGCALL.BIN", "w");
-  ASSERT(f != NULL);
-  ASSERT_EQ(f12_write(f, write_buf, size), (int)size);
-  ASSERT_EQ(f12_close(f), F12_OK);
-
-  f12_stat_t stat;
-  ASSERT_EQ(f12_stat(&fs, "BIGCALL.BIN", &stat), F12_OK);
-  ASSERT_EQ(stat.size, size);
-
-  f = f12_open(&fs, "BIGCALL.BIN", "r");
-  ASSERT(f != NULL);
-  ASSERT_EQ(f12_read(f, read_buf, size), (int)size);
-  ASSERT_MEM_EQ(read_buf, write_buf, size);
-  ASSERT_EQ(f12_close(f), F12_OK);
-
-  free(read_buf);
-  free(write_buf);
-  f12_unmount(&fs);
-}
-
-TEST(test_multiple_small_writes) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "MULTI.TXT", "w");
-  ASSERT(f != NULL);
-
-  const char *lines[] = { "a\n", "b\n", "c\n", "d\n", "e\n", "f\n" };
-  for (int i = 0; i < 6; i++) {
-    int n = f12_write(f, lines[i], 2);
-    ASSERT_EQ(n, 2);
-  }
-
-  f12_err_t err = f12_close(f);
-  ASSERT_EQ(err, F12_OK);
-
-  f = f12_open(&fs, "MULTI.TXT", "r");
-  ASSERT(f != NULL);
-
-  char buf[64];
-  int n = f12_read(f, buf, sizeof(buf));
-  ASSERT_EQ(n, 12);
-  ASSERT_MEM_EQ(buf, "a\nb\nc\nd\ne\nf\n", 12);
-
-  f12_close(f);
-  f12_unmount(&fs);
-}
-
-TEST(test_single_byte_writes) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "BYTES.BIN", "w");
-  ASSERT(f != NULL);
-
-  for (int i = 0; i < 256; i++) {
-    uint8_t b = (uint8_t)i;
-    int n = f12_write(f, &b, 1);
-    ASSERT_EQ(n, 1);
-  }
-
-  f12_err_t err = f12_close(f);
-  ASSERT_EQ(err, F12_OK);
-
-  f = f12_open(&fs, "BYTES.BIN", "r");
-  ASSERT(f != NULL);
-
-  uint8_t buf[256];
-  int n = f12_read(f, buf, sizeof(buf));
-  ASSERT_EQ(n, 256);
-
-  for (int i = 0; i < 256; i++) {
-    if (buf[i] != (uint8_t)i) {
-      printf("FAIL\n  Byte %d: expected %02X, got %02X\n", i, (uint8_t)i, buf[i]);
-      exit(1);
-    }
-  }
-
-  f12_close(f);
-  f12_unmount(&fs);
-}
-
-TEST(test_rpc_chunk_writes) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "RPC.BIN", "w");
-  ASSERT(f != NULL);
-
-  uint32_t total = 10000;
-  uint32_t written = 0;
-  uint8_t chunk[121];
-  while (written < total) {
-    uint32_t len = total - written;
-    if (len > 121) len = 121;
-    for (uint32_t i = 0; i < len; i++)
-      chunk[i] = (uint8_t)(written + i);
-    int n = f12_write(f, chunk, len);
-    ASSERT_EQ(n, (int)len);
-    written += len;
-  }
-
-  f12_err_t err = f12_close(f);
-  ASSERT_EQ(err, F12_OK);
-
-  f12_stat_t stat;
-  err = f12_stat(&fs, "RPC.BIN", &stat);
-  ASSERT_EQ(err, F12_OK);
-  ASSERT_EQ(stat.size, total);
-
-  f = f12_open(&fs, "RPC.BIN", "r");
-  ASSERT(f != NULL);
-
-  uint8_t buf[512];
-  uint32_t verified = 0;
-  while (verified < total) {
-    uint32_t want = total - verified;
-    if (want > 512) want = 512;
-    int n = f12_read(f, buf, want);
-    ASSERT(n > 0);
-    for (int i = 0; i < n; i++) {
-      if (buf[i] != (uint8_t)(verified + i)) {
-        printf("FAIL\n  Byte %lu: expected %02X, got %02X\n",
-               (unsigned long)(verified + i), (uint8_t)(verified + i), buf[i]);
-        exit(1);
-      }
-    }
-    verified += n;
-  }
-
-  f12_close(f);
-  f12_unmount(&fs);
-}
-
-TEST(test_strerror) {
-  ASSERT_STR_EQ(f12_strerror(F12_OK), "Success");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_NOT_FOUND), "File not found");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_DISK_CHANGED), "Disk changed");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_WRITE_PROTECTED), "Write protected");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_TOO_MANY), "Too many open files");
-}
-
-static void list_counter(const f12_stat_t *stat, void *ctx) {
-  (void)stat;
-  int *count = (int *)ctx;
-  (*count)++;
-}
-
-TEST(test_list_callback_proper) {
-  vdisk_init(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  for (int i = 0; i < 5; i++) {
-    char name[16];
-    snprintf(name, sizeof(name), "F%d.TXT", i);
-    f12_file_t *f = f12_open(&fs, name, "w");
-    f12_write(f, "x", 1);
-    f12_close(f);
-  }
-
-  int count = 0;
-  f12_err_t err = f12_list(&fs, list_counter, &count);
-  ASSERT_EQ(err, F12_OK);
-  ASSERT_EQ(count, 5);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_open_null_args) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  ASSERT_NULL(f12_open(&fs, NULL, "r"));
-  ASSERT_EQ(f12_errno(&fs), F12_ERR_INVALID);
-  ASSERT_NULL(f12_open(&fs, "X.TXT", NULL));
-  ASSERT_EQ(f12_errno(&fs), F12_ERR_INVALID);
-  ASSERT_NULL(f12_open(NULL, "X.TXT", "r"));
-
-  f12_unmount(&fs);
-}
-
-TEST(test_open_invalid_mode) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  ASSERT_NULL(f12_open(&fs, "X.TXT", "z"));
-  ASSERT_EQ(f12_errno(&fs), F12_ERR_INVALID);
-  ASSERT_NULL(f12_open(&fs, "X.TXT", ""));
-
-  f12_unmount(&fs);
-}
-
-TEST(test_op_on_unmounted) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "TEST", false);
-  f12_mount(&fs, vdisk_f12_io());
-  f12_unmount(&fs);
-
-  ASSERT_NULL(f12_open(&fs, "ANY.TXT", "r"));
-  ASSERT_EQ(f12_errno(&fs), F12_ERR_NOT_MOUNTED);
-
-  f12_stat_t stat;
-  ASSERT_EQ(f12_stat(&fs, "ANY.TXT", &stat), F12_ERR_NOT_MOUNTED);
-  ASSERT_EQ(f12_delete(&fs, "ANY.TXT"), F12_ERR_NOT_MOUNTED);
-
+TEST(test_open_conflicts) {
+  prepare();
+  write_file("A.BIN", "a", 1);
+  write_file("B.BIN", "b", 1);
+  f12_file_t reader;
+  f12_file_t writer;
+  f12_file_t other;
+  ASSERT_EQ(f12_open(&fs, "A.BIN", F12_OPEN_READ, &reader), F12_OK);
+  ASSERT_EQ(f12_open(&fs, "A.BIN", F12_OPEN_WRITE, &writer), F12_ERR_CONFLICT);
+  ASSERT_EQ(f12_open(&fs, "B.BIN", F12_OPEN_WRITE, &writer), F12_OK);
+  ASSERT_EQ(f12_open(&fs, "B.BIN", F12_OPEN_READ, &other), F12_ERR_CONFLICT);
+  ASSERT_EQ(f12_open(&fs, "C.BIN", F12_OPEN_WRITE, &other), F12_ERR_CONFLICT);
   f12_dir_t dir;
-  ASSERT_EQ(f12_opendir(&fs, "/", &dir), F12_ERR_NOT_MOUNTED);
+  ASSERT_EQ(f12_opendir(&fs, "/", &dir), F12_ERR_CONFLICT);
+  ASSERT_EQ(f12_delete(&fs, "A.BIN"), F12_ERR_CONFLICT);
+  ASSERT_EQ(f12_rename(&fs, "A.BIN", "C.BIN"), F12_ERR_CONFLICT);
+  ASSERT_EQ(f12_close(&reader), F12_OK);
+  ASSERT_EQ(f12_close(&writer), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_format_with_null_write_callback) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = (f12_io_t){
-    .read = vdisk_read,
-    .write = NULL,
-    .disk_changed = NULL,
-    .write_protected = NULL,
-    .ctx = &vdisk,
-  };
-
-  f12_err_t err = f12_format(&fs, "X", false);
-  ASSERT_EQ(err, F12_ERR_INVALID);
-  ASSERT_EQ(f12_errno(&fs), F12_ERR_INVALID);
-}
-
-TEST(test_format_write_protected) {
-  vdisk_init(&vdisk);
-  vdisk.write_protected = true;
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-
-  f12_err_t err = f12_format(&fs, "X", false);
-  ASSERT_EQ(err, F12_ERR_WRITE_PROTECTED);
-}
-
-TEST(test_format_remounts_when_already_mounted) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "OLD", false);
-  f12_mount(&fs, vdisk_f12_io());
-  ASSERT(fs.mounted);
-
-  f12_err_t err = f12_format(&fs, "NEW", false);
-  ASSERT_EQ(err, F12_OK);
-  ASSERT(fs.mounted);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_read_in_write_mode_fails) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "WO.TXT", "w");
-  ASSERT_NOT_NULL(f);
-  char buf[8];
-  ASSERT_EQ(f12_read(f, buf, sizeof(buf)), -1);
-  ASSERT_EQ(f12_errno(&fs), F12_ERR_INVALID);
-  f12_close(f);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_write_in_read_mode_fails) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "RO.TXT", "w");
-  f12_write(f, "x", 1);
-  f12_close(f);
-
-  f = f12_open(&fs, "RO.TXT", "r");
-  ASSERT_NOT_NULL(f);
-  ASSERT_EQ(f12_write(f, "y", 1), -1);
-  ASSERT_EQ(f12_errno(&fs), F12_ERR_INVALID);
-  f12_close(f);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_seek_in_write_mode_fails) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "S.TXT", "w");
-  ASSERT_NOT_NULL(f);
-  ASSERT_EQ(f12_seek(f, 0), F12_ERR_INVALID);
-  f12_close(f);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_tell_on_write_file) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "TELL.TXT", "w");
-  ASSERT_EQ(f12_tell(f), 0);
-  f12_write(f, "abc", 3);
-  ASSERT_EQ(f12_tell(f), 3);
-  f12_close(f);
-
-  ASSERT_EQ(f12_tell(NULL), 0);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_delete_not_found) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  ASSERT_EQ(f12_delete(&fs, "GHOST.TXT"), F12_ERR_NOT_FOUND);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_rename) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  const char data[] = "rename me";
-  f12_file_t *f = f12_open(&fs, "SRC.TXT", "w");
-  ASSERT(f != NULL);
-  ASSERT_EQ(f12_write(f, data, sizeof(data)), (int)sizeof(data));
-  ASSERT_EQ(f12_close(f), F12_OK);
-
-  ASSERT_EQ(f12_rename(&fs, "SRC.TXT", "DST.TXT"), F12_OK);
-
-  f12_stat_t st;
-  ASSERT_EQ(f12_stat(&fs, "SRC.TXT", &st), F12_ERR_NOT_FOUND);
-  ASSERT_EQ(f12_stat(&fs, "DST.TXT", &st), F12_OK);
-  ASSERT_EQ(st.size, sizeof(data));
-
-  char buf[sizeof(data)];
-  f = f12_open(&fs, "DST.TXT", "r");
-  ASSERT(f != NULL);
-  ASSERT_EQ(f12_read(f, buf, sizeof(buf)), (int)sizeof(buf));
-  ASSERT(memcmp(buf, data, sizeof(data)) == 0);
-  f12_close(f);
-
-  ASSERT_EQ(f12_rename(&fs, "GHOST.TXT", "X.TXT"), F12_ERR_NOT_FOUND);
-
-  f = f12_open(&fs, "OTHER.TXT", "w");
-  ASSERT(f != NULL);
-  f12_close(f);
-  ASSERT_EQ(f12_rename(&fs, "OTHER.TXT", "DST.TXT"), F12_ERR_EXISTS);
-
-  vdisk.write_protected = true;
-  ASSERT_EQ(f12_rename(&fs, "DST.TXT", "Y.TXT"), F12_ERR_WRITE_PROTECTED);
-  vdisk.write_protected = false;
-
-  f12_unmount(&fs);
-}
-
-TEST(test_fsck_through_f12) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  vdisk_set_fat_entry(&vdisk, 5, 6);
-  vdisk_set_fat_entry(&vdisk, 6, 0xFFF);
-  f12_mount(&fs, vdisk_f12_io());
-
-  static uint8_t data[30000];
-  memset(data, 0xEE, sizeof(data));
-  f12_file_t *ghost = f12_open(&fs, "GHOST.BIN", "w");
-  ASSERT(ghost != NULL);
-  ASSERT_EQ(f12_write(ghost, data, sizeof(data)), (int)sizeof(data));
-  fat12_abort_write(&fs.fat);
-  ghost->mode = F12_MODE_CLOSED;
-
-  fat12_fsck_t report;
-  ASSERT_EQ(f12_fsck(&fs, &report, false), F12_OK);
-  ASSERT_EQ(report.lost_clusters, 2);
-  ASSERT_EQ(report.freed, 0);
-
-  vdisk.write_protected = true;
-  ASSERT_EQ(f12_fsck(&fs, &report, true), F12_ERR_WRITE_PROTECTED);
-  vdisk.write_protected = false;
-
-  ASSERT_EQ(f12_fsck(&fs, &report, true), F12_OK);
-  ASSERT_EQ(report.freed, report.lost_clusters);
-
-  ASSERT_EQ(f12_fsck(&fs, &report, false), F12_OK);
-  ASSERT_EQ(report.lost_clusters, 0);
-
-  const char msg[] = "cache still coherent after repair";
-  f12_file_t *f = f12_open(&fs, "AFTER.TXT", "w");
-  ASSERT(f != NULL);
-  ASSERT_EQ(f12_write(f, msg, sizeof(msg)), (int)sizeof(msg));
-  ASSERT_EQ(f12_close(f), F12_OK);
-
-  char buf[sizeof(msg)];
-  f = f12_open(&fs, "AFTER.TXT", "r");
-  ASSERT(f != NULL);
-  ASSERT_EQ(f12_read(f, buf, sizeof(buf)), (int)sizeof(buf));
-  ASSERT(memcmp(buf, msg, sizeof(msg)) == 0);
-  f12_close(f);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_fsck_requires_mount) {
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-
-  fat12_fsck_t report;
-  ASSERT_EQ(f12_fsck(&fs, &report, false), F12_ERR_NOT_MOUNTED);
-  ASSERT_EQ(f12_fsck(NULL, &report, false), F12_ERR_INVALID);
-  ASSERT_EQ(f12_fsck(&fs, NULL, false), F12_ERR_INVALID);
-}
-
-TEST(test_opendir_non_root) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_dir_t dir;
-  ASSERT_EQ(f12_opendir(&fs, "/sub", &dir), F12_ERR_NOT_FOUND);
-  ASSERT_EQ(f12_opendir(&fs, "subdir", &dir), F12_ERR_NOT_FOUND);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_strerror_all_codes) {
-  ASSERT_STR_EQ(f12_strerror(F12_OK), "Success");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_IO), "I/O error");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_NOT_FOUND), "File not found");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_EXISTS), "File exists");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_FULL), "Disk full");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_TOO_MANY), "Too many open files");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_INVALID), "Invalid argument");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_IS_DIR), "Is a directory");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_NOT_MOUNTED), "Not mounted");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_EOF), "End of file");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_DISK_CHANGED), "Disk changed");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_WRITE_PROTECTED), "Write protected");
-  ASSERT_STR_EQ(f12_strerror(F12_ERR_BAD_HANDLE), "Bad file handle");
-  ASSERT_STR_EQ(f12_strerror((f12_err_t)999), "Unknown error");
-}
-
-TEST(test_unmount_closes_open_files) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *fw = f12_open(&fs, "OPEN.W", "w");
-  f12_write(fw, "abc", 3);
-
-  f12_file_t *fr;
-  {
-    f12_file_t *tmp = f12_open(&fs, "OPEN.W", "w");
-    ASSERT_NULL(tmp);
+TEST(test_multiple_readers_and_limit) {
+  prepare();
+  write_file("READ.BIN", "x", 1);
+  f12_file_t files[F12_MAX_OPEN_FILES];
+  for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) {
+    ASSERT_EQ(f12_open(&fs, "READ.BIN", F12_OPEN_READ, &files[i]), F12_OK);
   }
-  f12_close(fw);
-
-  fw = f12_open(&fs, "READ.TXT", "w");
-  f12_write(fw, "data", 4);
-  f12_close(fw);
-
-  fr = f12_open(&fs, "READ.TXT", "r");
-  ASSERT_NOT_NULL(fr);
-  ASSERT_EQ(fr->mode, F12_MODE_READ);
-
-  f12_unmount(&fs);
-  ASSERT_EQ(fr->mode, F12_MODE_CLOSED);
+  f12_file_t extra;
+  ASSERT_EQ(f12_open(&fs, "READ.BIN", F12_OPEN_READ, &extra), F12_ERR_TOO_MANY);
+  for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) {
+    ASSERT_EQ(f12_close(&files[i]), F12_OK);
+  }
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_seek_clamped_past_eof) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "SK.TXT", "w");
-  f12_write(f, "0123456789", 10);
-  f12_close(f);
-
-  f = f12_open(&fs, "SK.TXT", "r");
-  ASSERT_NOT_NULL(f);
-
-  ASSERT_EQ(f12_seek(f, 9999), F12_OK);
-  ASSERT_EQ(f12_tell(f), 10);
-  char buf[8];
-  ASSERT_EQ(f12_read(f, buf, sizeof(buf)), 0);
-
-  f12_close(f);
-  f12_unmount(&fs);
-}
-
-TEST(test_close_invalid_handle) {
-  ASSERT_EQ(f12_close(NULL), F12_ERR_BAD_HANDLE);
-
-  f12_file_t orphan;
-  memset(&orphan, 0, sizeof(orphan));
-  ASSERT_EQ(f12_close(&orphan), F12_ERR_BAD_HANDLE);
-}
-
-TEST(test_seek_null_handle) {
-  ASSERT_EQ(f12_seek(NULL, 0), F12_ERR_BAD_HANDLE);
-}
-
-TEST(test_read_negative_args) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "X.TXT", "w");
-  f12_write(f, "z", 1);
-  f12_close(f);
-
-  f = f12_open(&fs, "X.TXT", "r");
-  ASSERT_NOT_NULL(f);
-
-  ASSERT_EQ(f12_read(NULL, NULL, 0), -1);
-  ASSERT_EQ(f12_read(f, NULL, 0), -1);
-
-  f12_close(f);
-
-  ASSERT_EQ(f12_write(NULL, NULL, 0), -1);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_readdir_eof_after_all) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
+TEST(test_directory_end_and_generation) {
+  prepare();
+  write_file("DIR.BIN", "x", 1);
   f12_dir_t dir;
   ASSERT_EQ(f12_opendir(&fs, "/", &dir), F12_OK);
-
+  f12_dir_t stale = dir;
   f12_stat_t stat;
-  while (f12_readdir(&dir, &stat) == F12_OK) {}
-
-  ASSERT_EQ(f12_readdir(&dir, &stat), F12_ERR_EOF);
+  ASSERT_EQ(f12_readdir(&dir, &stat), F12_OK);
+  ASSERT_STR_EQ(stat.name, "DIR.BIN");
+  ASSERT_EQ(f12_readdir(&dir, &stat), F12_END);
   ASSERT_EQ(f12_closedir(&dir), F12_OK);
-
-  f12_unmount(&fs);
+  ASSERT_EQ(f12_opendir(&fs, "/", &dir), F12_OK);
+  ASSERT_EQ(f12_readdir(&stale, &stat), F12_ERR_BAD_HANDLE);
+  ASSERT_EQ(f12_closedir(&stale), F12_ERR_BAD_HANDLE);
+  ASSERT_EQ(f12_closedir(&dir), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_errno_null_fs) {
-  ASSERT_EQ(f12_errno(NULL), F12_ERR_INVALID);
+TEST(test_readdir_preserves_io_error) {
+  prepare();
+  write_file("IO.BIN", "x", 1);
+  memset(fs.cache, 0, sizeof(fs.cache));
+  fs.cache_clock = 0;
+  f12_dir_t dir;
+  ASSERT_EQ(f12_opendir(&fs, "/", &dir), F12_OK);
+  disk.read_status = BLOCK_ERR_TIMEOUT;
+  f12_stat_t stat;
+  ASSERT_EQ(f12_readdir(&dir, &stat), F12_ERR_TIMEOUT);
+  disk.read_status = BLOCK_OK;
+  ASSERT_EQ(f12_closedir(&dir), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_io_callbacks_null_optional) {
-  vdisk_init(&vdisk);
+static f12_err_t list_fail(void *ctx, const f12_stat_t *stat) {
+  size_t *calls = (size_t *)ctx;
+  ASSERT(stat != NULL);
+  (*calls)++;
+  return F12_ERR_CONFLICT;
+}
 
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  f12_io_t io = {
-    .read = vdisk_read,
-    .write = vdisk_write,
-    .disk_changed = NULL,
-    .write_protected = NULL,
-    .ctx = &vdisk,
+TEST(test_list_propagates_callback_error) {
+  prepare();
+  write_file("LIST.BIN", "x", 1);
+  size_t calls = 0;
+  ASSERT_EQ(f12_list(&fs, list_fail, &calls), F12_ERR_CONFLICT);
+  ASSERT_EQ(calls, 1);
+  f12_dir_t dir;
+  ASSERT_EQ(f12_opendir(&fs, "/", &dir), F12_OK);
+  ASSERT_EQ(f12_closedir(&dir), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_delete_rename_and_stat) {
+  prepare();
+  write_file("OLD.BIN", "data", 4);
+  f12_stat_t stat;
+  ASSERT_EQ(f12_stat(&fs, "OLD.BIN", &stat), F12_OK);
+  ASSERT_EQ(stat.size, 4);
+  ASSERT_EQ(f12_rename(&fs, "OLD.BIN", "NEW.BIN"), F12_OK);
+  ASSERT_EQ(f12_stat(&fs, "OLD.BIN", &stat), F12_ERR_NOT_FOUND);
+  ASSERT_EQ(f12_stat(&fs, "NEW.BIN", &stat), F12_OK);
+  ASSERT_EQ(f12_delete(&fs, "NEW.BIN"), F12_OK);
+  ASSERT_EQ(f12_stat(&fs, "NEW.BIN", &stat), F12_ERR_NOT_FOUND);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_free_count_is_typed_and_transaction_safe) {
+  prepare();
+  uint16_t before;
+  ASSERT_EQ(f12_free_count(&fs, &before), F12_OK);
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "COUNT.BIN", F12_OPEN_WRITE, &file), F12_OK);
+  uint16_t count = UINT16_MAX;
+  ASSERT_EQ(f12_free_count(&fs, &count), F12_ERR_CONFLICT);
+  ASSERT_EQ(count, 0);
+  ASSERT_EQ(f12_abort(&file), F12_OK);
+  ASSERT_EQ(f12_free_count(&fs, &count), F12_OK);
+  ASSERT_EQ(count, before);
+  ASSERT_EQ(f12_free_count(&fs, NULL), F12_ERR_INVALID);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_write_protection) {
+  prepare();
+  disk.write_protected = true;
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "PROTECT.BIN", F12_OPEN_WRITE, &file),
+            F12_ERR_WRITE_PROTECTED);
+  ASSERT_EQ(f12_delete(&fs, "NONE.BIN"), F12_ERR_WRITE_PROTECTED);
+  disk.write_protected = false;
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_generation_observer_errors_are_exact) {
+  disk_reset();
+  ASSERT_EQ(f12_init(&fs, disk_device(true)), F12_OK);
+  disk.generation_status = BLOCK_ERR_TIMEOUT;
+  ASSERT_EQ(f12_mount(&fs), F12_ERR_TIMEOUT);
+  disk.generation_status = BLOCK_OK;
+  ASSERT_EQ(f12_format(&fs, format_options("OBSERVER", F12_FORMAT_QUICK)),
+            F12_OK);
+  ASSERT_EQ(f12_mount(&fs), F12_OK);
+  disk.generation_status = BLOCK_ERR_BUSY;
+  bool mounted = true;
+  ASSERT_EQ(f12_is_mounted(&fs, &mounted), F12_ERR_BUSY);
+  ASSERT(!mounted);
+  f12_stat_t stat;
+  ASSERT_EQ(f12_stat(&fs, "NONE.BIN", &stat), F12_ERR_BUSY);
+  ASSERT_EQ(stat.name[0], '\0');
+  disk.generation_status = BLOCK_OK;
+  ASSERT(filesystem_mounted());
+  disk.generation_status = BLOCK_ERR_MEDIA_CHANGED;
+  mounted = true;
+  ASSERT_EQ(f12_is_mounted(&fs, &mounted), F12_ERR_MEDIA_CHANGED);
+  ASSERT(!mounted);
+  disk.generation_status = BLOCK_OK;
+  ASSERT(!filesystem_mounted());
+}
+
+TEST(test_write_protection_observer_errors_are_exact) {
+  disk_reset();
+  ASSERT_EQ(f12_init(&fs, disk_device(true)), F12_OK);
+  disk.write_protected_status = BLOCK_ERR_IO;
+  ASSERT_EQ(f12_format(&fs, format_options("OBSERVER", F12_FORMAT_QUICK)),
+            F12_ERR_IO);
+  disk.write_protected_status = BLOCK_OK;
+  ASSERT_EQ(f12_format(&fs, format_options("OBSERVER", F12_FORMAT_QUICK)),
+            F12_OK);
+  ASSERT_EQ(f12_mount(&fs), F12_OK);
+  disk.write_protected_status = BLOCK_ERR_TIMEOUT;
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "FAIL.BIN", F12_OPEN_WRITE, &file), F12_ERR_TIMEOUT);
+  disk.write_protected_status = BLOCK_OK;
+  ASSERT(filesystem_mounted());
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_abort_discards_uncommitted_writer) {
+  prepare();
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "ABORT.BIN", F12_OPEN_WRITE, &file), F12_OK);
+  ASSERT_EQ(f12_write(&file, "discard", 7).error, F12_OK);
+  ASSERT_EQ(f12_abort(&file), F12_OK);
+  f12_stat_t stat;
+  ASSERT_EQ(f12_stat(&fs, "ABORT.BIN", &stat), F12_ERR_NOT_FOUND);
+  ASSERT_EQ(f12_close(&file), F12_ERR_BAD_HANDLE);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_failed_close_is_retryable_and_not_abortable) {
+  prepare();
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "RETRY.BIN", F12_OPEN_WRITE, &file), F12_OK);
+  ASSERT_EQ(f12_write(&file, "retry", 5).error, F12_OK);
+  disk.write_status = BLOCK_ERR_VERIFY;
+  ASSERT_EQ(f12_close(&file), F12_ERR_VERIFY);
+  ASSERT_EQ(f12_abort(&file), F12_ERR_BUSY);
+  disk.write_status = BLOCK_OK;
+  ASSERT_EQ(f12_close(&file), F12_OK);
+  char data[5];
+  ASSERT_EQ(read_file("RETRY.BIN", data, sizeof(data)), sizeof(data));
+  ASSERT_MEM_EQ(data, "retry", sizeof(data));
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_unmount_preserves_open_handle_ownership) {
+  prepare();
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "UMOUNT.BIN", F12_OPEN_WRITE, &file), F12_OK);
+  ASSERT_EQ(f12_write(&file, "x", 1).error, F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_ERR_CONFLICT);
+  disk.write_status = BLOCK_ERR_TIMEOUT;
+  ASSERT_EQ(f12_close(&file), F12_ERR_TIMEOUT);
+  ASSERT_EQ(f12_unmount(&fs), F12_ERR_CONFLICT);
+  ASSERT(filesystem_mounted());
+  disk.write_status = BLOCK_OK;
+  ASSERT_EQ(f12_close(&file), F12_OK);
+  f12_file_t reader;
+  ASSERT_EQ(f12_open(&fs, "UMOUNT.BIN", F12_OPEN_READ, &reader), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_ERR_CONFLICT);
+  char value;
+  ASSERT_EQ(f12_read(&reader, &value, 1).error, F12_OK);
+  ASSERT_EQ(value, 'x');
+  ASSERT_EQ(f12_close(&reader), F12_OK);
+  f12_dir_t dir;
+  ASSERT_EQ(f12_opendir(&fs, "/", &dir), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_ERR_CONFLICT);
+  f12_stat_t stat;
+  ASSERT_EQ(f12_readdir(&dir, &stat), F12_OK);
+  ASSERT_EQ(f12_closedir(&dir), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_fsck_conflict_and_clean) {
+  prepare();
+  fat12_fsck_t report;
+  ASSERT_EQ(f12_fsck(&fs, &report, false), F12_OK);
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "FSCK.BIN", F12_OPEN_WRITE, &file), F12_OK);
+  ASSERT_EQ(f12_fsck(&fs, &report, false), F12_ERR_CONFLICT);
+  ASSERT_EQ(f12_fsck(&fs, &report, true), F12_ERR_CONFLICT);
+  ASSERT_EQ(f12_abort(&file), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+}
+
+TEST(test_mount_block_errors_are_exact) {
+  static const struct {
+    block_status_t block;
+    f12_err_t f12;
+  } cases[] = {
+      {BLOCK_ERR_TIMEOUT, F12_ERR_TIMEOUT},
+      {BLOCK_ERR_BUSY, F12_ERR_BUSY},
+      {BLOCK_ERR_CRC, F12_ERR_CRC},
+      {BLOCK_ERR_WRONG_TRACK, F12_ERR_WRONG_TRACK},
+      {BLOCK_ERR_WRONG_SIDE, F12_ERR_WRONG_SIDE},
+      {BLOCK_ERR_NO_TRACK0, F12_ERR_NO_TRACK0},
+      {BLOCK_ERR_MEDIA_CHANGED, F12_ERR_MEDIA_CHANGED},
+      {BLOCK_ERR_WRITE_PROTECTED, F12_ERR_WRITE_PROTECTED},
+      {BLOCK_ERR_UNDERRUN, F12_ERR_UNDERRUN},
+      {BLOCK_ERR_OVERRUN, F12_ERR_OVERRUN},
+      {BLOCK_ERR_VERIFY, F12_ERR_VERIFY},
+      {BLOCK_ERR_CORRUPT, F12_ERR_CORRUPT},
+      {BLOCK_ERR_IO, F12_ERR_IO},
   };
 
-  fs.io = io;
-  ASSERT_EQ(f12_format(&fs, "T", false), F12_OK);
-  ASSERT_EQ(f12_mount(&fs, io), F12_OK);
-
-  f12_file_t *f = f12_open(&fs, "X.TXT", "w");
-  ASSERT_NOT_NULL(f);
-  ASSERT_EQ(f12_write(f, "hi", 2), 2);
-  ASSERT_EQ(f12_close(f), F12_OK);
-
-  f = f12_open(&fs, "X.TXT", "r");
-  ASSERT_NOT_NULL(f);
-  char buf[8];
-  ASSERT_EQ(f12_read(f, buf, sizeof(buf)), 2);
-  f12_close(f);
-
-  f12_unmount(&fs);
+  disk_reset();
+  ASSERT_EQ(f12_init(&fs, disk_device(true)), F12_OK);
+  ASSERT_EQ(f12_format(&fs, format_options("ERRORS", F12_FORMAT_QUICK)), F12_OK);
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    ASSERT_EQ(f12_init(&fs, disk_device(true)), F12_OK);
+    disk.read_status = cases[i].block;
+    ASSERT_EQ(f12_mount(&fs), cases[i].f12);
+    disk.read_status = BLOCK_OK;
+  }
 }
 
-TEST(test_seek_propagates_error) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "S.TXT", "w");
-  uint8_t buf[1500];
-  memset(buf, 0xCD, sizeof(buf));
-  f12_write(f, buf, sizeof(buf));
-  f12_close(f);
-
-  f = f12_open(&fs, "S.TXT", "r");
-  ASSERT_NOT_NULL(f);
-
-  ASSERT_EQ(f12_seek(f, 100), F12_OK);
-  ASSERT_EQ(f12_tell(f), 100);
-
-  f12_close(f);
-  f12_unmount(&fs);
+TEST(test_format_block_error_is_exact) {
+  disk_reset();
+  ASSERT_EQ(f12_init(&fs, disk_device(true)), F12_OK);
+  disk.write_status = BLOCK_ERR_VERIFY;
+  ASSERT_EQ(f12_format(&fs, format_options("FAIL", F12_FORMAT_FULL)),
+            F12_ERR_VERIFY);
 }
 
-TEST(test_read_at_seek_back_after_failure) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
+TEST(test_internal_generations_and_cache_clock_skip_zero_on_wrap) {
+  prepare();
 
-  f12_file_t *f = f12_open(&fs, "RA.TXT", "w");
-  uint8_t buf[256];
-  memset(buf, 0xEE, sizeof(buf));
-  f12_write(f, buf, sizeof(buf));
-  f12_close(f);
+  fs.mount_generation = UINT64_MAX;
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+  ASSERT_EQ(fs.mount_generation, 1);
+  ASSERT_EQ(f12_mount(&fs), F12_OK);
+  ASSERT_EQ(fs.mount_generation, 2);
 
-  f = f12_open(&fs, "RA.TXT", "r");
-  ASSERT_NOT_NULL(f);
+  fs.files[0].generation = UINT64_MAX;
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&fs, "WRAP.BIN", F12_OPEN_WRITE, &file), F12_OK);
+  ASSERT_EQ(file.token.slot, 0);
+  ASSERT_EQ(file.token.slot_generation, 1);
+  ASSERT_EQ(f12_abort(&file), F12_OK);
 
-  uint8_t out[16];
-  int n = f12_read_at(f, 50, out, sizeof(out));
-  ASSERT_EQ(n, (int)sizeof(out));
-  ASSERT_EQ(f12_tell(f), 0);
-
-  ASSERT_EQ(f12_read_at(NULL, 0, out, 1), -1);
-
-  f12_close(f);
-  f12_unmount(&fs);
-}
-
-TEST(test_close_already_closed_is_safe) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "C.TXT", "w");
-  f12_write(f, "x", 1);
-  ASSERT_EQ(f12_close(f), F12_OK);
-  ASSERT_EQ(f12_close(f), F12_OK);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_open_directory_returns_is_dir) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  uint16_t root_lba = fs.fat.root_dir_start_sector;
-  fat12_dirent_t entry;
-  memset(&entry, 0, sizeof(entry));
-  memcpy(entry.name, "SUBDIR  ", 8);
-  memcpy(entry.ext, "   ", 3);
-  entry.attr = FAT12_ATTR_DIRECTORY;
-  entry.start_cluster = 2;
-  entry.size = 0;
-  memcpy(&vdisk.data[root_lba][0], &entry, sizeof(entry));
-
-  f12_file_t *f = f12_open(&fs, "SUBDIR", "r");
-  ASSERT_NULL(f);
-  ASSERT_EQ(f12_errno(&fs), F12_ERR_IS_DIR);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_read_propagates_fat_error) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_file_t *f = f12_open(&fs, "B.TXT", "w");
-  uint8_t buf[2000];
-  memset(buf, 0xBB, sizeof(buf));
-  f12_write(f, buf, sizeof(buf));
-  f12_close(f);
-
-  fat12_dirent_t e;
-  ASSERT_EQ(fat12_find(&fs.fat, "B.TXT", &e), FAT12_OK);
-  uint16_t start = e.start_cluster;
-
-  vdisk_set_fat_entry(&vdisk, start, 0xFF7);
-
-  f = f12_open(&fs, "B.TXT", "r");
-  ASSERT_NOT_NULL(f);
-  uint8_t out[2000];
-  int n = f12_read(f, out, sizeof(out));
-  ASSERT(n >= 0);
-
-  f12_close(f);
-  f12_unmount(&fs);
-}
-
-TEST(test_stat_null_args) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "T", false);
-  f12_mount(&fs, vdisk_f12_io());
-
-  f12_stat_t stat;
-  ASSERT_EQ(f12_stat(NULL, "X.TXT", &stat), F12_ERR_INVALID);
-  ASSERT_EQ(f12_stat(&fs, NULL, &stat), F12_ERR_INVALID);
-  ASSERT_EQ(f12_stat(&fs, "X.TXT", NULL), F12_ERR_INVALID);
-
-  ASSERT_EQ(f12_delete(NULL, "X.TXT"), F12_ERR_INVALID);
-  ASSERT_EQ(f12_delete(&fs, NULL), F12_ERR_INVALID);
-
+  fs.dirs[0].generation = UINT64_MAX;
   f12_dir_t dir;
-  ASSERT_EQ(f12_opendir(NULL, "/", &dir), F12_ERR_INVALID);
-  ASSERT_EQ(f12_opendir(&fs, NULL, &dir), F12_ERR_INVALID);
-  ASSERT_EQ(f12_opendir(&fs, "/", NULL), F12_ERR_INVALID);
+  ASSERT_EQ(f12_opendir(&fs, "/", &dir), F12_OK);
+  ASSERT_EQ(dir.token.slot, 0);
+  ASSERT_EQ(dir.token.slot_generation, 1);
+  ASSERT_EQ(f12_closedir(&dir), F12_OK);
 
-  ASSERT_EQ(f12_readdir(NULL, &stat), F12_ERR_INVALID);
-  ASSERT_EQ(f12_closedir(NULL), F12_ERR_INVALID);
-
-  ASSERT_EQ(f12_list(NULL, NULL, NULL), F12_ERR_INVALID);
-  ASSERT_EQ(f12_list(&fs, NULL, NULL), F12_ERR_INVALID);
-
-  f12_unmount(&fs);
+  memset(fs.cache, 0, sizeof(fs.cache));
+  fs.cache_clock = 0;
+  uint8_t sector[DISK_SECTOR_SIZE];
+  for (uint16_t track = 0; track < F12_CACHE_TRACKS; track++) {
+    ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx,
+                             track * DISK_SECTORS_PER_TRACK, sector), BLOCK_OK);
+  }
+  fs.cache_clock = UINT64_MAX;
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx, 0, sector), BLOCK_OK);
+  ASSERT_EQ(fs.cache_clock, 1);
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx,
+                           F12_CACHE_TRACKS * DISK_SECTORS_PER_TRACK,
+                           sector), BLOCK_OK);
+  ASSERT_EQ(fs.fat.io.read(fs.fat.io.ctx,
+                           (F12_CACHE_TRACKS + 1u) * DISK_SECTORS_PER_TRACK,
+                           sector), BLOCK_OK);
+  ASSERT(cache_has(0, 0));
+  ASSERT_EQ(fs.cache_clock, 3);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_fat2_sectors_not_pinned) {
-  vdisk_init(&vdisk);
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  fs.io = vdisk_f12_io();
-  f12_format(&fs, "PINTEST", true);
-  ASSERT_EQ(f12_mount(&fs, vdisk_f12_io()), F12_OK);
-
-  uint8_t buf[4096];
-  for (int i = 0; i < (int)sizeof(buf); i++) buf[i] = (uint8_t)(i * 31 + 7);
-  f12_file_t *f = f12_open(&fs, "DATA.BIN", "w");
-  ASSERT_NOT_NULL(f);
-  f12_write(f, buf, sizeof(buf));
-  ASSERT_EQ(f12_close(f), F12_OK);
-  f = f12_open(&fs, "DATA.BIN", "r");
-  ASSERT_NOT_NULL(f);
-  f12_read(f, buf, sizeof(buf));
-  f12_close(f);
-
-  uint16_t fat2_lo = fs.fat.fat_start_sector + fs.fat.bpb.sectors_per_fat;
-  uint16_t fat2_hi = fat2_lo + fs.fat.bpb.sectors_per_fat;
-  uint16_t fat1_lo = fs.fat.fat_start_sector;
-
-  lru_t *c = fs.cache;
-  int pinned_fat2 = 0, pinned_fat1 = 0;
-  for (uint32_t i = 0; i < c->max_entries; i++) {
-    lru_entry_t *e = (lru_entry_t *)(c->storage + i * c->entry_stride);
-    if (!e->occupied || !e->pinned) continue;
-    uint8_t track = (e->key >> 16) & 0xFF;
-    uint8_t side = (e->key >> 8) & 0xFF;
-    uint8_t sec = e->key & 0xFF;
-    uint16_t lba = (track * 2 + side) * SECTORS_PER_TRACK + (sec - 1);
-    if (lba >= fat2_lo && lba < fat2_hi) pinned_fat2++;
-    if (lba >= fat1_lo && lba < fat2_lo) pinned_fat1++;
+TEST(test_strerror_is_total) {
+  for (int error = F12_OK; error <= F12_ERR_IO; error++) {
+    ASSERT(strcmp(f12_strerror((f12_err_t)error), "unknown error") != 0);
   }
-
-  ASSERT_EQ(pinned_fat2, 0);
-  ASSERT(pinned_fat1 > 0);
-
-  f12_unmount(&fs);
-}
-
-TEST(test_large_write_avoids_cylinder_zero) {
-  vdisk_format_valid(&vdisk);
-
-  f12_t fs;
-  memset(&fs, 0, sizeof(fs));
-  ASSERT_EQ(f12_mount(&fs, vdisk_f12_io()), F12_OK);
-
-  uint8_t buf[SECTOR_SIZE];
-  f12_file_t *pad = f12_open(&fs, "PAD.BIN", "w");
-  ASSERT_NOT_NULL(pad);
-  memset(buf, 0x11, sizeof(buf));
-  for (int i = 0; i < 6; i++) {
-    ASSERT_EQ(f12_write(pad, buf, sizeof(buf)), (int)sizeof(buf));
-  }
-  ASSERT_EQ(f12_close(pad), F12_OK);
-
-  int before = vdisk.cyl_writes[0];
-
-  f12_file_t *f = f12_open(&fs, "BIG.BIN", "w");
-  ASSERT_NOT_NULL(f);
-  for (int i = 0; i < 96; i++) {
-    memset(buf, (uint8_t)i, sizeof(buf));
-    ASSERT_EQ(f12_write(f, buf, sizeof(buf)), (int)sizeof(buf));
-  }
-  ASSERT_EQ(f12_close(f), F12_OK);
-
-  ASSERT(vdisk.cyl_writes[0] - before <= 2);
-
-  f = f12_open(&fs, "BIG.BIN", "r");
-  ASSERT_NOT_NULL(f);
-  for (int i = 0; i < 96; i++) {
-    ASSERT_EQ(f12_read(f, buf, sizeof(buf)), (int)sizeof(buf));
-    ASSERT_EQ(buf[0], (uint8_t)i);
-    ASSERT_EQ(buf[SECTOR_SIZE - 1], (uint8_t)i);
-  }
-  ASSERT_EQ(f12_close(f), F12_OK);
-
-  f12_unmount(&fs);
 }
 
 int main(void) {
-  printf("=== F12 High-Level API Tests ===\n\n");
-
-  RUN_TEST(test_mount_unmount);
-  RUN_TEST(test_mount_clears_uninitialized_state);
-  RUN_TEST(test_failed_track_read_falls_back_to_sector_read);
-  RUN_TEST(test_format_and_mount);
-  RUN_TEST(test_create_write_read_file);
-  RUN_TEST(test_file_stat);
-  RUN_TEST(test_file_delete);
-  RUN_TEST(test_directory_listing);
-  RUN_TEST(test_too_many_open_files);
-  RUN_TEST(test_write_protected);
-  RUN_TEST(test_disk_changed);
-  RUN_TEST(test_disk_changed_aborts_pending_write);
-  RUN_TEST(test_seek_and_tell);
-  RUN_TEST(test_read_at);
-  RUN_TEST(test_file_not_found);
-  RUN_TEST(test_large_file);
-  RUN_TEST(test_large_single_call_io);
-  RUN_TEST(test_large_write_avoids_cylinder_zero);
-  RUN_TEST(test_multiple_small_writes);
-  RUN_TEST(test_single_byte_writes);
-  RUN_TEST(test_rpc_chunk_writes);
-  RUN_TEST(test_strerror);
-  RUN_TEST(test_list_callback_proper);
-  RUN_TEST(test_open_null_args);
-  RUN_TEST(test_open_invalid_mode);
-  RUN_TEST(test_op_on_unmounted);
-  RUN_TEST(test_format_with_null_write_callback);
-  RUN_TEST(test_format_write_protected);
-  RUN_TEST(test_format_remounts_when_already_mounted);
-  RUN_TEST(test_read_in_write_mode_fails);
-  RUN_TEST(test_write_in_read_mode_fails);
-  RUN_TEST(test_seek_in_write_mode_fails);
-  RUN_TEST(test_tell_on_write_file);
-  RUN_TEST(test_delete_not_found);
-  RUN_TEST(test_rename);
-  RUN_TEST(test_fsck_through_f12);
-  RUN_TEST(test_fsck_requires_mount);
-  RUN_TEST(test_opendir_non_root);
-  RUN_TEST(test_strerror_all_codes);
-  RUN_TEST(test_unmount_closes_open_files);
-  RUN_TEST(test_seek_clamped_past_eof);
-  RUN_TEST(test_close_invalid_handle);
-  RUN_TEST(test_seek_null_handle);
-  RUN_TEST(test_read_negative_args);
-  RUN_TEST(test_readdir_eof_after_all);
-  RUN_TEST(test_errno_null_fs);
-  RUN_TEST(test_io_callbacks_null_optional);
-  RUN_TEST(test_seek_propagates_error);
-  RUN_TEST(test_read_at_seek_back_after_failure);
-  RUN_TEST(test_close_already_closed_is_safe);
-  RUN_TEST(test_open_directory_returns_is_dir);
-  RUN_TEST(test_read_propagates_fat_error);
-  RUN_TEST(test_stat_null_args);
-  RUN_TEST(test_fat2_sectors_not_pinned);
-
+  printf("=== F12 Contract Tests ===\n\n");
+  RUN_TEST(test_init_contract);
+  RUN_TEST(test_format_mount_unmount);
+  RUN_TEST(test_format_options_and_progress_context);
+  RUN_TEST(test_read_only_device_mounts);
+  RUN_TEST(test_block_adapter_rejects_null_context_and_output);
+  RUN_TEST(test_track_cache_is_atomic_lru);
+  RUN_TEST(test_partial_crc_track_serves_valid_sector);
+  RUN_TEST(test_corrupt_full_track_rejected);
+  RUN_TEST(test_partial_write_materializes_full_track);
+  RUN_TEST(test_failed_write_does_not_poison_cache);
+  RUN_TEST(test_failed_mutating_write_evicts_cache);
+  RUN_TEST(test_conflicting_partial_reads_never_form_a_track);
+  RUN_TEST(test_file_roundtrip_and_end);
+  RUN_TEST(test_seek_tell_and_read_at);
+  RUN_TEST(test_mode_errors_are_typed);
+  RUN_TEST(test_stale_file_handle_generation);
+  RUN_TEST(test_stale_mount_generation);
+  RUN_TEST(test_media_generation_invalidates_mount);
+  RUN_TEST(test_tell_observes_media_generation);
+  RUN_TEST(test_cache_hit_generation_race_is_detected);
+  RUN_TEST(test_reinit_does_not_resurrect_handles);
+  RUN_TEST(test_live_reinit_resets_and_invalidates_handles);
+  RUN_TEST(test_invalid_reinit_preserves_live_context);
+  RUN_TEST(test_media_change_forgets_commit_phase_writer);
+  RUN_TEST(test_open_conflicts);
+  RUN_TEST(test_multiple_readers_and_limit);
+  RUN_TEST(test_directory_end_and_generation);
+  RUN_TEST(test_readdir_preserves_io_error);
+  RUN_TEST(test_list_propagates_callback_error);
+  RUN_TEST(test_delete_rename_and_stat);
+  RUN_TEST(test_free_count_is_typed_and_transaction_safe);
+  RUN_TEST(test_write_protection);
+  RUN_TEST(test_generation_observer_errors_are_exact);
+  RUN_TEST(test_write_protection_observer_errors_are_exact);
+  RUN_TEST(test_abort_discards_uncommitted_writer);
+  RUN_TEST(test_failed_close_is_retryable_and_not_abortable);
+  RUN_TEST(test_unmount_preserves_open_handle_ownership);
+  RUN_TEST(test_fsck_conflict_and_clean);
+  RUN_TEST(test_mount_block_errors_are_exact);
+  RUN_TEST(test_format_block_error_is_exact);
+  RUN_TEST(test_internal_generations_and_cache_clock_skip_zero_on_wrap);
+  RUN_TEST(test_strerror_is_total);
   TEST_RESULTS();
 }

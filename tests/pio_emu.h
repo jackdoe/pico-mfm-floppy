@@ -90,13 +90,14 @@ typedef struct {
     uint8_t delay_remaining;
     uint64_t cycle_count;
     bool stalled;
+    bool fault;
 } pio_emu_t;
 
 void pio_emu_init(pio_emu_t *emu);
-void pio_emu_load(pio_emu_t *emu, const uint16_t *program, uint8_t len,
+bool pio_emu_load(pio_emu_t *emu, const uint16_t *program, uint8_t len,
                   uint8_t wrap_target, uint8_t wrap);
-void pio_emu_step(pio_emu_t *emu);
-void pio_emu_run(pio_emu_t *emu, uint32_t cycles);
+bool pio_emu_step(pio_emu_t *emu);
+bool pio_emu_run(pio_emu_t *emu, uint32_t cycles);
 
 bool pio_emu_rx_empty(pio_emu_t *emu);
 uint32_t pio_emu_rx_get(pio_emu_t *emu);

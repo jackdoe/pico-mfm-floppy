@@ -1,46 +1,71 @@
-#include <stdio.h>
-#include <string.h>
-#include <ctype.h>
+#include "f12.h"
+#include "floppy.h"
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+#include "hardware/pio.h"
+#include "hardware/watchdog.h"
+#include "mfm_decode.h"
 #include "pico/stdlib.h"
 #include "pico/time.h"
-#include "hardware/clocks.h"
-#include "hardware/pio.h"
-#include "hardware/gpio.h"
-#include "hardware/watchdog.h"
-#include "floppy.h"
-#include "f12.h"
-#include "mfm_decode.h"
-
-// ============== Configuration ==============
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 
 #define FW_VERSION "0.2.0"
+#define CMD_BUF_SIZE 256
+#define IO_BUF_SIZE DISK_SECTOR_SIZE
+#define WORK_BUF_SIZE (8u * DISK_SECTOR_SIZE)
+#define MAX_ARGS 4
+#define PULSE_BINS 128
+#define WRITER_CLOSE_ATTEMPTS 3
+#define CLUSTER_SIZE (FAT12_MAX_CLUSTER_SECTORS * DISK_SECTOR_SIZE)
+#define CAPACITY_FILE_COUNT 64u
+#define CAPACITY_MAX_FILE_CLUSTERS 96u
+#define CLI_INPUT_OVERFLOW (-1)
+#define CLI_INPUT_CANCELLED (-2)
 
 static floppy_t floppy;
 static f12_t fs;
-static bool mounted;
-
-// ============== Buffers ==============
-
-#define CMD_BUF_SIZE  256
-#define IO_BUF_SIZE   512
-#define SELF_BUF_SIZE 50000
-#define MAX_ARGS      4
-#define PULSE_BINS    128
+static f12_file_t owned_writer;
+static bool writer_owned;
+static const floppy_pins_t drive_pins = {
+    .index = 14,
+    .track0 = 5,
+    .write_protect = 4,
+    .read_data = 3,
+    .disk_change = 1,
+    .drive_select = 12,
+    .motor_enable = 10,
+    .direction = 9,
+    .step = 8,
+    .write_data = 7,
+    .write_gate = 6,
+    .side_select = 2,
+    .density = 15,
+};
 
 static char cmd_buf[CMD_BUF_SIZE];
 static uint8_t io_buf[IO_BUF_SIZE];
-static uint8_t self_buf[SELF_BUF_SIZE];
+static uint8_t work_buf[WORK_BUF_SIZE];
 
-// ============== Forward Declarations ==============
+typedef struct {
+  uint32_t id;
+  uint32_t size;
+  uint32_t chunk;
+  char prefix;
+} capacity_file_t;
+
+static capacity_file_t capacity_files[CAPACITY_FILE_COUNT];
 
 typedef void (*cmd_fn_t)(int argc, char **argv);
 
 typedef struct {
   const char *name;
-  const char *alias;
   cmd_fn_t fn;
   bool needs_mount;
-  const char *usage;
+  uint8_t min_args;
+  uint8_t max_args;
+  const char *syntax;
   const char *desc;
 } cmd_entry_t;
 
@@ -49,6 +74,7 @@ static void cmd_ls(int argc, char **argv);
 static void cmd_cat(int argc, char **argv);
 static void cmd_hexdump(int argc, char **argv);
 static void cmd_write(int argc, char **argv);
+static void cmd_commit(int argc, char **argv);
 static void cmd_rm(int argc, char **argv);
 static void cmd_cp(int argc, char **argv);
 static void cmd_mv(int argc, char **argv);
@@ -67,139 +93,206 @@ static void cmd_flux(int argc, char **argv);
 static void cmd_seek(int argc, char **argv);
 static void cmd_dump(int argc, char **argv);
 static void cmd_mfm(int argc, char **argv);
-static void cmd_selftest(int argc, char **argv);
-static void cmd_selftest2(int argc, char **argv);
-static void cmd_selftest3(int argc, char **argv);
-static void cmd_selftest3_a(int argc, char **argv);
-static void cmd_selftest3_b(int argc, char **argv);
-static void cmd_selftest4(int argc, char **argv);
 static void cmd_crashtest(int argc, char **argv);
 static void cmd_crashcheck(int argc, char **argv);
 static void cmd_rpm(int argc, char **argv);
 static void cmd_test_full(int argc, char **argv);
-static void cmd_starwars(int argc, char **argv);
+static void cmd_test_media(int argc, char **argv);
 static void cmd_diskdump(int argc, char **argv);
 static void cmd_mfmscan(int argc, char **argv);
 static void cmd_reboot(int argc, char **argv);
 static void cmd_version(int argc, char **argv);
 
-// ============== Command Table ==============
-
 static const cmd_entry_t commands[] = {
-  {"help",    "?",     cmd_help,    false, "help",                "Show all commands"},
-  {"ls",      "dir",   cmd_ls,      true,  "ls",                  "List files"},
-  {"cat",     "read",  cmd_cat,     true,  "cat <file>",          "Print file contents"},
-  {"hexdump", "xxd",   cmd_hexdump, true,  "hexdump <file>",      "Hex dump file contents"},
-  {"write",   NULL,    cmd_write,   true,  "write <file>",        "Write file (end with . on own line)"},
-  {"rm",      "del",   cmd_rm,      true,  "rm <file>",           "Delete file"},
-  {"cp",      NULL,    cmd_cp,      true,  "cp <src> <dst>",      "Copy file"},
-  {"mv",      NULL,    cmd_mv,      true,  "mv <src> <dst>",      "Move/rename file"},
-  {"stat",    NULL,    cmd_stat,    true,  "stat <file>",         "File details and cluster chain"},
-  {"format",  NULL,    cmd_format,  false, "format [label] [full]","Format disk"},
-  {"fsck",    NULL,    cmd_fsck,    true,  "fsck [fix]",          "Check filesystem, 'fix' repairs"},
-  {"mount",   NULL,    cmd_mount,   false, "mount",               "Mount filesystem"},
-  {"unmount", "umount",cmd_unmount, false, "unmount",             "Unmount filesystem"},
-  {"status",  "info",  cmd_status,  false, "status",              "Drive status and disk info"},
-  {"motor",   NULL,    cmd_motor,   false, "motor [on|off]",      "Control motor"},
-  {"select",  "sel",   cmd_select,  false, "select [on|off]",     "Control drive select"},
-  {"home",    NULL,    cmd_home,    false, "home",                "Seek to track 0"},
-  {"pins",    "gpio",  cmd_pins,    false, "pins",                "Read all GPIO pin states"},
-  {"poll",    NULL,    cmd_poll,    false, "poll",                "Poll read_data + index (no PIO)"},
-  {"flux",    NULL,    cmd_flux,    false, "flux [count]",        "Dump raw flux transitions"},
-  {"seek",    NULL,    cmd_seek,    false, "seek <track>",        "Seek head to track (0-79)"},
-  {"dump",    NULL,    cmd_dump,    false, "dump <trk> <side> [sector]", "Raw sector hex dump"},
-  {"mfm",     NULL,    cmd_mfm,    false, "mfm <track> <side>",  "MFM signal analysis"},
-  {"selftest",NULL,    cmd_selftest,false, "selftest",            "Format + write/read/verify cycle"},
-  {"selftest2",NULL,   cmd_selftest2,false,"selftest2 <n> <size>","Stress: n rounds of write/delete/verify"},
-  {"selftest3",NULL,   cmd_selftest3,false,"selftest3 [rounds]",  "Patch-specific full-disk overwrite test"},
-  {"selftest3-a",NULL, cmd_selftest3_a,false,"selftest3-a [rounds]","Format + prepare reboot-resume overwrite test"},
-  {"selftest3-b",NULL, cmd_selftest3_b,false,"selftest3-b [rounds]","Resume selftest3 after power cycle without format"},
-  {"selftest4",NULL,   cmd_selftest4,false, "selftest4",           "Simulated power-loss leak + fsck repair on real media"},
-  {"crashtest",NULL,   cmd_crashtest,false, "crashtest",           "Endless overwrite loop -- pull power mid-write"},
-  {"crashcheck",NULL,  cmd_crashcheck,false,"crashcheck",          "Verify filesystem after crashtest power cut"},
-  {"rpm",     NULL,    cmd_rpm,     false, "rpm",                  "Measure spindle speed from index pulses"},
-  {"test-full",NULL,   cmd_test_full,false,"test-full [rounds]", "Full hardware test sequence, no selftest3"},
-  {"starwars", NULL,   cmd_starwars, false,"starwars",            "Imperial March on the stepper motor"},
-  {"diskdump",NULL,    cmd_diskdump,false, "diskdump [quiet]",    "Full disk sector scan + retry summary"},
-  {"mfmscan", NULL,    cmd_mfmscan, false, "mfmscan",             "MFM signal quality across all tracks"},
-  {"reboot",  NULL,    cmd_reboot,  false, "reboot",              "Reboot the Pico"},
-  {"version", "ver",   cmd_version, false, "version",             "Show firmware version and build"},
+    {"help", cmd_help, false, 1, 1, "", "Show all commands"},
+    {"ls", cmd_ls, true, 1, 1, "", "List files"},
+    {"cat", cmd_cat, true, 2, 2, "<file>", "Print file contents"},
+    {"hexdump", cmd_hexdump, true, 2, 2, "<file>", "Hex dump file contents"},
+    {"write", cmd_write, true, 2, 2, "<file>", "Write file"},
+    {"commit", cmd_commit, false, 1, 1, "", "Retry a pending file commit"},
+    {"rm", cmd_rm, true, 2, 2, "<file>", "Delete file"},
+    {"cp", cmd_cp, true, 3, 3, "<src> <dst>", "Copy file"},
+    {"mv", cmd_mv, true, 3, 3, "<src> <dst>", "Move or rename file"},
+    {"stat", cmd_stat, true, 2, 2, "<file>", "Show file details"},
+    {"format", cmd_format, false, 1, 3, "[label] [full]", "Format disk"},
+    {"fsck", cmd_fsck, true, 1, 2, "[fix]", "Check or repair filesystem"},
+    {"mount", cmd_mount, false, 1, 1, "", "Mount filesystem"},
+    {"unmount", cmd_unmount, false, 1, 1, "", "Unmount filesystem"},
+    {"status", cmd_status, false, 1, 1, "", "Show drive and disk status"},
+    {"motor", cmd_motor, false, 2, 2, "<on|off>", "Control motor"},
+    {"select", cmd_select, false, 2, 2, "<on|off>", "Control drive select"},
+    {"home", cmd_home, false, 1, 1, "", "Seek to cylinder zero"},
+    {"pins", cmd_pins, false, 1, 1, "", "Read GPIO states"},
+    {"poll", cmd_poll, false, 1, 1, "", "Poll read-data and index"},
+    {"flux", cmd_flux, false, 1, 2, "[count]", "Dump raw flux transitions"},
+    {"seek", cmd_seek, false, 2, 2, "<cylinder>", "Seek the head"},
+    {"dump", cmd_dump, false, 3, 4, "<cylinder> <head> [sector]",
+     "Dump raw sectors"},
+    {"mfm", cmd_mfm, false, 3, 3, "<cylinder> <head>", "Analyze MFM signal"},
+    {"rpm", cmd_rpm, false, 1, 1, "", "Measure spindle speed"},
+    {"test-full", cmd_test_full, false, 1, 2, "[rounds]",
+     "Run destructive hardware tests"},
+    {"test-media", cmd_test_media, true, 1, 1, "",
+     "Run interactive media-change tests"},
+    {"crashtest", cmd_crashtest, false, 1, 1, "",
+     "Prepare and loop for power-cut testing"},
+    {"crashcheck", cmd_crashcheck, false, 1, 1, "", "Verify after a power cut"},
+    {"diskdump", cmd_diskdump, false, 1, 2, "[quiet]", "Scan every sector"},
+    {"mfmscan", cmd_mfmscan, false, 1, 1, "", "Scan MFM quality"},
+    {"reboot", cmd_reboot, false, 1, 1, "", "Safely reboot"},
+    {"version", cmd_version, false, 1, 1, "", "Show firmware version"},
 };
 
 #define NUM_COMMANDS (sizeof(commands) / sizeof(commands[0]))
 
-// ============== IO Helpers ==============
+static f12_err_t do_mount(void) { return f12_mount(&fs); }
 
-static f12_err_t do_mount(void) {
-  f12_io_t io = {
-    .read = floppy_io_read,
-    .read_track = floppy_io_read_track,
-    .write = floppy_io_write,
-    .disk_changed = floppy_io_disk_changed,
-    .write_protected = floppy_io_write_protected,
-    .ctx = &floppy,
-  };
-  return f12_mount(&fs, io);
+static bool writer_handle_gone(f12_err_t error) {
+  return error == F12_ERR_BAD_HANDLE || error == F12_ERR_MEDIA_CHANGED ||
+         error == F12_ERR_NOT_MOUNTED || error == F12_ERR_NOT_INITIALIZED;
 }
 
-static void setup_io(void) {
-  fs.io = (f12_io_t){
-    .read = floppy_io_read,
-    .read_track = floppy_io_read_track,
-    .write = floppy_io_write,
-    .disk_changed = floppy_io_disk_changed,
-    .write_protected = floppy_io_write_protected,
-    .ctx = &floppy,
-  };
+static void writer_forget(void) {
+  memset(&owned_writer, 0, sizeof(owned_writer));
+  writer_owned = false;
 }
 
-static uint32_t f12_write_full(f12_file_t *f, const void *buf, uint32_t len) {
-  uint32_t written = 0;
-  while (written < len) {
-    uint32_t chunk = len - written;
-    if (chunk > 512) chunk = 512;
-    int n = f12_write(f, (const uint8_t *)buf + written, chunk);
-    if (n <= 0) break;
-    written += n;
+static f12_err_t writer_commit(void) {
+  if (!writer_owned)
+    return F12_OK;
+  f12_err_t error = F12_OK;
+  for (unsigned attempt = 0; attempt < WRITER_CLOSE_ATTEMPTS; attempt++) {
+    error = f12_close(&owned_writer);
+    if (error == F12_OK) {
+      writer_forget();
+      return F12_OK;
+    }
+    if (writer_handle_gone(error)) {
+      writer_forget();
+      return error;
+    }
   }
-  return written;
+  return error;
 }
 
-static uint32_t f12_read_full(f12_file_t *f, void *buf, uint32_t max_len) {
-  uint32_t total = 0;
-  int n;
-  while ((n = f12_read(f, (uint8_t *)buf + total, 512)) > 0) {
-    total += n;
-    if (total >= max_len) break;
+static f12_err_t writer_abort(void) {
+  if (!writer_owned)
+    return F12_OK;
+  f12_err_t error = f12_abort(&owned_writer);
+  if (error == F12_OK || writer_handle_gone(error))
+    writer_forget();
+  return error;
+}
+
+static f12_err_t writer_open(const char *name) {
+  f12_err_t error = writer_commit();
+  if (error != F12_OK)
+    return error;
+  error = f12_open(&fs, name, F12_OPEN_WRITE, &owned_writer);
+  writer_owned = error == F12_OK;
+  return error;
+}
+
+static f12_err_t unmount_filesystem(void) {
+  f12_err_t error = writer_commit();
+  if (error != F12_OK)
+    return error;
+  bool mounted;
+  error = f12_is_mounted(&fs, &mounted);
+  if (error != F12_OK)
+    return error;
+  return mounted ? f12_unmount(&fs) : F12_OK;
+}
+
+static f12_result_t f12_write_full(f12_file_t *file, const void *buf,
+                                   uint32_t len) {
+  f12_result_t total = {.error = F12_OK, .count = 0};
+  while (total.count < len) {
+    uint32_t chunk = len - (uint32_t)total.count;
+    if (chunk > DISK_SECTOR_SIZE)
+      chunk = DISK_SECTOR_SIZE;
+    f12_result_t result =
+        f12_write(file, (const uint8_t *)buf + total.count, chunk);
+    if (result.count > chunk) {
+      total.error = F12_ERR_IO;
+      return total;
+    }
+    total.count += result.count;
+    if (result.error != F12_OK) {
+      total.error = result.error;
+      return total;
+    }
+    if (result.count == 0) {
+      total.error = F12_ERR_IO;
+      return total;
+    }
   }
   return total;
 }
 
-static uint16_t count_free_clusters(void) {
-  uint16_t free_clusters = 0;
-  fat12_free_count(&fs.fat, &free_clusters);
-  return free_clusters;
-}
-
-static void upcase(char *s) {
-  while (*s) {
-    *s = toupper((unsigned char)*s);
-    s++;
+static f12_result_t f12_read_full(f12_file_t *file, void *buf,
+                                  uint32_t capacity) {
+  f12_result_t total = {.error = F12_OK, .count = 0};
+  while (total.count < capacity) {
+    size_t remaining = (size_t)capacity - total.count;
+    size_t chunk = remaining < DISK_SECTOR_SIZE ? remaining : DISK_SECTOR_SIZE;
+    f12_result_t result = f12_read(file, (uint8_t *)buf + total.count, chunk);
+    if (result.count > chunk) {
+      total.error = F12_ERR_IO;
+      return total;
+    }
+    total.count += result.count;
+    if (result.error == F12_END)
+      return total;
+    if (result.error != F12_OK) {
+      total.error = result.error;
+      return total;
+    }
+    if (result.count == 0) {
+      total.error = F12_ERR_IO;
+      return total;
+    }
   }
+  return total;
 }
 
-// ============== Line Editor ==============
+static bool text_equal_case(const char *left, const char *right);
+
+static bool canonical_name(const char *input, char output[13]) {
+  fat12_name_t name;
+  if (fat12_name_parse(input, &name) != FAT12_OK)
+    return false;
+  size_t pos = 0;
+  for (size_t i = 0; i < sizeof(name.name) && name.name[i] != ' '; i++) {
+    output[pos++] = name.name[i];
+  }
+  size_t ext = 0;
+  while (ext < sizeof(name.ext) && name.ext[ext] != ' ')
+    ext++;
+  if (ext != 0) {
+    output[pos++] = '.';
+    memcpy(output + pos, name.ext, ext);
+    pos += ext;
+  }
+  output[pos] = '\0';
+  return text_equal_case(input, output);
+}
 
 static void print_prompt(void) {
-  if (mounted)
+  bool mounted;
+  f12_err_t error = f12_is_mounted(&fs, &mounted);
+  if (error != F12_OK)
+    printf("[??]> ");
+  else if (mounted)
     printf("[A:]> ");
   else
     printf("[--]> ");
 }
 
-static int cli_readline(char *buf, int max) {
-  int pos = 0;
-  memset(buf, 0, max);
+static int cli_readline(char buf[static CMD_BUF_SIZE]) {
+  size_t pos = 0;
+  bool overflow = false;
+  memset(buf, 0, CMD_BUF_SIZE);
 
   for (;;) {
     int c = getchar();
@@ -210,72 +303,138 @@ static int cli_readline(char *buf, int max) {
 
     if (c == '\r' || c == '\n') {
       printf("\r\n");
+      if (overflow) {
+        buf[0] = '\0';
+        return CLI_INPUT_OVERFLOW;
+      }
       buf[pos] = '\0';
-      return pos;
+      return (int)pos;
     }
 
-    // Ctrl-C: cancel line
     if (c == 3) {
       printf("^C\r\n");
       buf[0] = '\0';
-      return 0;
+      return CLI_INPUT_CANCELLED;
     }
 
-    // Ctrl-U: clear line
     if (c == 21) {
       while (pos > 0) {
         printf("\b \b");
         pos--;
       }
+      overflow = false;
       continue;
     }
 
-    // Backspace (BS or DEL)
     if (c == 8 || c == 127) {
-      if (pos > 0) {
+      if (overflow) {
+        continue;
+      } else if (pos > 0) {
         printf("\b \b");
         pos--;
       }
       continue;
     }
 
-    // Printable character
-    if (pos < max - 1 && c >= 32 && c < 127) {
-      buf[pos++] = c;
-      putchar(c);
+    if (c >= 32 && c < 127) {
+      if (pos < CMD_BUF_SIZE - 1u) {
+        buf[pos++] = (char)c;
+        putchar(c);
+      } else {
+        overflow = true;
+      }
     }
   }
 }
 
-// ============== Tokenizer ==============
+static bool cli_confirm(void) {
+  char line[CMD_BUF_SIZE];
+  int response = cli_readline(line);
+  if (response == CLI_INPUT_OVERFLOW) {
+    printf("Confirmation too long; cancelled.\n");
+    return false;
+  }
+  if (response == CLI_INPUT_CANCELLED || !text_equal_case(line, "y")) {
+    printf("Cancelled.\n");
+    return false;
+  }
+  return true;
+}
 
 static int tokenize(char *buf, char **argv, int max_args) {
   int argc = 0;
   char *p = buf;
 
-  while (*p && argc < max_args) {
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p == '\0') break;
+  while (*p) {
+    while (*p == ' ' || *p == '\t')
+      p++;
+    if (*p == '\0')
+      break;
+    if (argc == max_args)
+      return -1;
     argv[argc++] = p;
-    while (*p && *p != ' ' && *p != '\t') p++;
-    if (*p) *p++ = '\0';
+    while (*p && *p != ' ' && *p != '\t')
+      p++;
+    if (*p)
+      *p++ = '\0';
   }
   return argc;
 }
 
-// ============== Dispatch ==============
+static bool parse_u32(const char *text, uint32_t minimum, uint32_t maximum,
+                      uint32_t *value) {
+  if (!text || !*text || !value || minimum > maximum)
+    return false;
+  uint32_t parsed = 0;
+  for (const unsigned char *cursor = (const unsigned char *)text;
+       *cursor != '\0'; cursor++) {
+    if (*cursor < (unsigned char)'0' || *cursor > (unsigned char)'9')
+      return false;
+    uint32_t digit = (uint32_t)(*cursor - (unsigned char)'0');
+    if (parsed > maximum / 10u ||
+        (parsed == maximum / 10u && digit > maximum % 10u)) {
+      return false;
+    }
+    parsed = parsed * 10u + digit;
+  }
+  if (parsed < minimum)
+    return false;
+  *value = parsed;
+  return true;
+}
+
+static unsigned char ascii_fold(unsigned char value) {
+  if (value >= (unsigned char)'A' && value <= (unsigned char)'Z') {
+    return (unsigned char)(value + ((unsigned char)'a' - (unsigned char)'A'));
+  }
+  return value;
+}
+
+static bool text_equal_case(const char *left, const char *right) {
+  if (!left || !right)
+    return false;
+  while (*left != '\0' && *right != '\0') {
+    if (ascii_fold((unsigned char)*left) != ascii_fold((unsigned char)*right)) {
+      return false;
+    }
+    left++;
+    right++;
+  }
+  return *left == *right;
+}
 
 static const cmd_entry_t *find_command(const char *name) {
   for (unsigned i = 0; i < NUM_COMMANDS; i++) {
-    if (strcasecmp(name, commands[i].name) == 0)
-      return &commands[i];
-    if (commands[i].alias && strcasecmp(name, commands[i].alias) == 0)
+    if (text_equal_case(name, commands[i].name))
       return &commands[i];
   }
   return NULL;
 }
 
-// ============== MFM Helpers (ported from mfmstats.c) ==============
+static void print_usage(const cmd_entry_t *command) {
+  printf("Usage: %s%s%s\n", command->name,
+         command->syntax[0] == '\0' ? "" : " ", command->syntax);
+}
 
 typedef struct {
   uint32_t short_count;
@@ -290,7 +449,7 @@ typedef struct {
   uint32_t sector_records;
   uint32_t unique_sectors;
   uint32_t crc_errors;
-  bool seen[SECTORS_PER_TRACK];
+  bool seen[DISK_SECTORS_PER_TRACK];
 } track_stats_t;
 
 typedef struct {
@@ -302,28 +461,88 @@ typedef struct {
 
 static diskdump_stats_t run_diskdump(bool verbose);
 
+static const char *block_status_text(block_status_t status) {
+  switch (status) {
+  case BLOCK_OK:
+    return "success";
+  case BLOCK_ERR_INVALID:
+    return "invalid state or argument";
+  case BLOCK_ERR_BUSY:
+    return "busy";
+  case BLOCK_ERR_TIMEOUT:
+    return "timeout";
+  case BLOCK_ERR_CRC:
+    return "CRC error";
+  case BLOCK_ERR_WRONG_TRACK:
+    return "wrong track";
+  case BLOCK_ERR_WRONG_SIDE:
+    return "wrong side";
+  case BLOCK_ERR_NO_TRACK0:
+    return "track zero unavailable";
+  case BLOCK_ERR_MEDIA_CHANGED:
+    return "media changed";
+  case BLOCK_ERR_WRITE_PROTECTED:
+    return "write protected";
+  case BLOCK_ERR_UNDERRUN:
+    return "underrun";
+  case BLOCK_ERR_OVERRUN:
+    return "overrun";
+  case BLOCK_ERR_VERIFY:
+    return "verification failed";
+  case BLOCK_ERR_CORRUPT:
+    return "corrupt data";
+  case BLOCK_ERR_IO:
+    return "I/O error";
+  }
+  return "unknown error";
+}
+
+static bool drive_status(const char *operation, block_status_t status) {
+  if (status == BLOCK_OK)
+    return true;
+  printf("%s failed: %s\n", operation, block_status_text(status));
+  return false;
+}
+
+static bool drive_idle(void) {
+  bool idle = drive_status("Motor stop", floppy_motor_off(&floppy));
+  if (!drive_status("Drive deselect", floppy_select(&floppy, false)))
+    idle = false;
+  return idle;
+}
+
+static bool drive_generation(uint32_t *generation) {
+  return drive_status("Media generation",
+                      floppy_media_generation(&floppy, generation));
+}
+
 static void print_drive_stats(const floppy_stats_t *s) {
   printf("  Sector reads:  %lu\n", s->reads);
   printf("  Flux words:    %lu\n", s->flux_words);
   printf("  Track writes:  %lu (DMA)\n", s->dma_writes);
   printf("  Read retries:  %lu attempts, %lu recovered, %lu failed\n",
          s->retries, s->recovered, s->failed);
-  if (s->timeout || s->wrong_track || s->wrong_side) {
-    printf("  Retry causes:  timeout=%lu wrong_track=%lu wrong_side=%lu\n",
-           s->timeout, s->wrong_track, s->wrong_side);
-  }
-  printf("  Ring peak:     %lu/%u words\n", s->ring_peak, FLOPPY_FLUX_RING_WORDS);
-  if (s->overruns) {
-    printf("  Ring overruns: %lu\n", s->overruns);
-  }
+  printf("  Read faults:   timeout=%lu crc=%lu track=%lu side=%lu\n",
+         s->timeout, s->crc, s->wrong_track, s->wrong_side);
+  printf("  Flow faults:   overrun=%lu underrun=%lu\n", s->overruns,
+         s->underruns);
+  printf("  Media changes: %lu\n", s->media_changes);
+  printf("  Ring peak:     %lu/%u words\n", s->ring_peak,
+         FLOPPY_FLUX_RING_WORDS);
 }
 
 static void read_track_stats(int track, int side, track_stats_t *stats) {
   memset(stats, 0, sizeof(*stats));
 
-  floppy_seek(&floppy, track);
-  floppy_side_select(&floppy, side);
-  floppy_flux_begin(&floppy);
+  if (!drive_status("Seek", floppy_seek(&floppy, (uint8_t)track)))
+    return;
+  if (!drive_status("Side select", floppy_side_select(&floppy, (uint8_t)side)))
+    return;
+  uint32_t generation;
+  if (!drive_generation(&generation))
+    return;
+  if (!drive_status("Flux capture", floppy_flux_begin(&floppy, generation)))
+    return;
 
   mfm_t mfm;
   mfm_init(&mfm);
@@ -331,15 +550,20 @@ static void read_track_stats(int track, int side, track_stats_t *stats) {
 
   bool ix_prev = false;
   bool ix_primed = false;
-  sector_t sector;
+  mfm_sector_t sector;
   int ix_edges = 0;
 
   while (ix_edges < 6) {
     uint16_t delta;
     bool ix;
-    if (!floppy_flux_next(&floppy, &delta, &ix)) break;
+    block_status_t status = floppy_flux_next(&floppy, &delta, &ix);
+    if (status != BLOCK_OK) {
+      drive_status("Flux read", status);
+      break;
+    }
 
-    if (ix_primed && ix != ix_prev) ix_edges++;
+    if (ix_primed && ix != ix_prev)
+      ix_edges++;
     ix_prev = ix;
     ix_primed = true;
 
@@ -358,9 +582,9 @@ static void read_track_stats(int track, int side, track_stats_t *stats) {
       stats->long_count++;
     }
 
-    if (mfm_feed(&mfm, delta, &sector) && sector.valid &&
-        sector.sector_n >= 1 && sector.sector_n <= SECTORS_PER_TRACK) {
-      uint8_t idx = sector.sector_n - 1;
+    if (mfm_feed(&mfm, delta, &sector) &&
+        sector.sector < DISK_SECTORS_PER_TRACK) {
+      uint8_t idx = sector.sector;
       if (!stats->seen[idx]) {
         stats->seen[idx] = true;
         stats->unique_sectors++;
@@ -368,7 +592,7 @@ static void read_track_stats(int track, int side, track_stats_t *stats) {
     }
   }
 
-  floppy_flux_end(&floppy);
+  drive_status("Flux stop", floppy_flux_end(&floppy));
 
   stats->T2_max = mfm.T2_max;
   stats->T3_max = mfm.T3_max;
@@ -380,103 +604,114 @@ static void read_track_stats(int track, int side, track_stats_t *stats) {
 static void print_histogram(track_stats_t *stats) {
   uint32_t peak = 0;
   for (int i = 0; i < PULSE_BINS; i++) {
-    if (stats->histogram[i] > peak) peak = stats->histogram[i];
+    if (stats->histogram[i] > peak)
+      peak = stats->histogram[i];
   }
-  if (peak == 0) return;
+  if (peak == 0)
+    return;
 
   int first = 0, last = PULSE_BINS - 1;
-  while (first < PULSE_BINS && stats->histogram[first] == 0) first++;
-  while (last > first && stats->histogram[last] == 0) last--;
+  while (first < PULSE_BINS && stats->histogram[first] == 0)
+    first++;
+  while (last > first && stats->histogram[last] == 0)
+    last--;
 
   printf("  Pulse Distribution (delta ticks):\n");
   for (int i = first; i <= last; i++) {
-    if (stats->histogram[i] == 0) continue;
-    int bar = (stats->histogram[i] * 50) / peak;
+    if (stats->histogram[i] == 0)
+      continue;
+    uint32_t bar = (stats->histogram[i] * 50u) / peak;
     printf("  %3d: %6lu |", i, stats->histogram[i]);
-    for (int j = 0; j < bar; j++) printf("#");
+    for (uint32_t j = 0; j < bar; j++)
+      printf("#");
     printf("\n");
   }
 }
 
-// ============== Selftest Helpers (ported from selftest.c) ==============
-
-static uint32_t gen_pattern_byte(int file_id, uint32_t offset) {
+static uint8_t gen_pattern_byte(uint32_t file_id, uint32_t offset) {
   uint32_t v = file_id * 2654435761u + offset * 40503u;
-  return (v >> 16) & 0xFF;
+  return (uint8_t)((v >> 16) & 0xFFu);
 }
 
-static uint32_t checksum_buf(const uint8_t *buf, size_t len) {
-  uint32_t sum = 0;
+static uint32_t checksum_extend(uint32_t sum, const uint8_t *buf, size_t len) {
   for (size_t i = 0; i < len; i++) {
     sum = (sum << 5) + sum + buf[i];
   }
   return sum;
 }
 
-static uint32_t pattern_checksum(int file_id, uint32_t size) {
-  uint32_t sum = 0;
-  for (uint32_t i = 0; i < size; i++) {
-    sum = (sum << 5) + sum + gen_pattern_byte(file_id, i);
-  }
-  return sum;
-}
-
-static void fill_pattern_range(uint8_t *buf, int file_id, uint32_t offset, uint32_t size) {
+static void fill_pattern_range(uint8_t *buf, uint32_t file_id, uint32_t offset,
+                               uint32_t size) {
   for (uint32_t i = 0; i < size; i++) {
     buf[i] = gen_pattern_byte(file_id, offset + i);
   }
 }
 
-static uint32_t fs_cluster_size(void) {
-  return (uint32_t)fs.fat.bpb.sectors_per_cluster * fs.fat.bpb.bytes_per_sector;
-}
-
-static uint32_t clusters_for_size(uint32_t size) {
-  uint32_t cluster_size = fs_cluster_size();
-  if (size == 0) return 0;
-  return (size + cluster_size - 1) / cluster_size;
-}
-
-static bool write_pattern_file_chunked(const char *name, int file_id, uint32_t size,
-                                       uint32_t chunk_size, uint32_t *written_out,
+static bool write_pattern_file_chunked(const char *name, uint32_t file_id,
+                                       uint32_t size, uint32_t chunk_size,
+                                       uint32_t *written_out,
                                        f12_err_t *close_err_out) {
-  if (chunk_size == 0 || chunk_size > SELF_BUF_SIZE) {
-    chunk_size = SELF_BUF_SIZE;
+  if (chunk_size == 0 || chunk_size > WORK_BUF_SIZE) {
+    chunk_size = WORK_BUF_SIZE;
   }
 
-  f12_file_t *f = f12_open(&fs, name, "w");
-  if (!f) {
-    if (written_out) *written_out = 0;
-    if (close_err_out) *close_err_out = f12_errno(&fs);
+  f12_err_t open_error = writer_open(name);
+  if (open_error != F12_OK) {
+    if (written_out)
+      *written_out = 0;
+    if (close_err_out)
+      *close_err_out = open_error;
     return false;
   }
 
   uint32_t written = 0;
   while (written < size) {
     uint32_t chunk = size - written;
-    if (chunk > chunk_size) chunk = chunk_size;
-    fill_pattern_range(self_buf, file_id, written, chunk);
+    if (chunk > chunk_size)
+      chunk = chunk_size;
+    fill_pattern_range(work_buf, file_id, written, chunk);
 
-    int n = f12_write(f, self_buf, chunk);
-    if (n <= 0) break;
-    written += (uint32_t)n;
+    f12_result_t result = f12_write_full(&owned_writer, work_buf, chunk);
+    written += (uint32_t)result.count;
+    if (result.error != F12_OK || result.count != chunk) {
+      f12_err_t abort_error = writer_abort();
+      if (written_out)
+        *written_out = written;
+      if (close_err_out) {
+        *close_err_out =
+            abort_error == F12_OK
+                ? (result.error == F12_OK ? F12_ERR_IO : result.error)
+                : abort_error;
+      }
+      return false;
+    }
   }
 
-  if (written_out) *written_out = written;
-  if (close_err_out) *close_err_out = f12_close(f);
-  else f12_close(f);
-  return true;
+  if (written_out)
+    *written_out = written;
+  f12_err_t close_error = writer_commit();
+  if (close_err_out)
+    *close_err_out = close_error;
+  return close_error == F12_OK;
 }
 
-static bool verify_pattern_file_chunked(const char *name, int file_id, uint32_t size,
-                                        uint32_t chunk_size, uint32_t *read_out) {
-  if (chunk_size == 0 || chunk_size > SELF_BUF_SIZE) {
-    chunk_size = SELF_BUF_SIZE;
+static bool verify_pattern_file_chunked(const char *name, uint32_t file_id,
+                                        uint32_t size, uint32_t chunk_size,
+                                        uint32_t *read_out) {
+  if (chunk_size == 0 || chunk_size > WORK_BUF_SIZE) {
+    chunk_size = WORK_BUF_SIZE;
   }
 
-  f12_file_t *f = f12_open(&fs, name, "r");
-  if (!f) {
-    if (read_out) *read_out = 0;
+  f12_stat_t stat;
+  if (f12_stat(&fs, name, &stat) != F12_OK || stat.size != size) {
+    if (read_out)
+      *read_out = 0;
+    return false;
+  }
+  f12_file_t file;
+  if (f12_open(&fs, name, F12_OPEN_READ, &file) != F12_OK) {
+    if (read_out)
+      *read_out = 0;
     return false;
   }
 
@@ -484,237 +719,244 @@ static bool verify_pattern_file_chunked(const char *name, int file_id, uint32_t 
   uint32_t total = 0;
   while (total < size) {
     uint32_t chunk = size - total;
-    if (chunk > chunk_size) chunk = chunk_size;
+    if (chunk > chunk_size)
+      chunk = chunk_size;
 
-    int n = f12_read(f, self_buf, chunk);
-    if (n <= 0) {
+    f12_result_t result = f12_read(&file, work_buf, chunk);
+    if (result.count > chunk || result.error != F12_OK || result.count == 0) {
       ok = false;
       break;
     }
 
-    for (int i = 0; i < n; i++) {
-      if (self_buf[i] != gen_pattern_byte(file_id, total + (uint32_t)i)) {
+    for (size_t i = 0; i < result.count; i++) {
+      if (work_buf[i] != gen_pattern_byte(file_id, total + (uint32_t)i)) {
         ok = false;
         break;
       }
     }
-    if (!ok) break;
+    if (!ok)
+      break;
 
-    total += (uint32_t)n;
+    total += (uint32_t)result.count;
   }
 
-  if (read_out) *read_out = total;
-  if (f12_close(f) != F12_OK) ok = false;
+  if (read_out)
+    *read_out = total;
+  if (f12_close(&file) != F12_OK)
+    ok = false;
   return ok && total == size;
 }
 
-static bool verify_pattern_at(f12_file_t *f, int file_id, uint32_t offset, uint32_t len) {
-  if (len > SELF_BUF_SIZE) return false;
+static uint32_t capacity_random(uint32_t *state) {
+  *state = *state * 1664525u + 1013904223u;
+  return *state;
+}
 
-  int n = f12_read_at(f, offset, self_buf, len);
-  if (n != (int)len) return false;
+static uint32_t capacity_partition(uint32_t *state, uint32_t clusters,
+                                   uint32_t files) {
+  if (files == 1u)
+    return clusters;
+  uint32_t available = clusters - (files - 1u);
+  uint32_t limit = available;
+  if (limit > CAPACITY_MAX_FILE_CLUSTERS)
+    limit = CAPACITY_MAX_FILE_CLUSTERS;
+  return 1u + capacity_random(state) % limit;
+}
 
-  for (uint32_t i = 0; i < len; i++) {
-    if (self_buf[i] != gen_pattern_byte(file_id, offset + i)) {
+static uint32_t capacity_cluster_count(uint32_t size) {
+  return (size + CLUSTER_SIZE - 1u) / CLUSTER_SIZE;
+}
+
+static void capacity_name(const capacity_file_t *file, uint32_t number,
+                          char name[13]) {
+  snprintf(name, 13, "%c%07lu.BIN", file->prefix, (unsigned long)number);
+}
+
+static void capacity_prepare(capacity_file_t *file, char prefix,
+                             uint32_t clusters, uint32_t *state) {
+  file->prefix = prefix;
+  file->id = capacity_random(state);
+  file->size = (clusters - 1u) * CLUSTER_SIZE + 1u +
+               capacity_random(state) % CLUSTER_SIZE;
+  file->chunk = 1u + capacity_random(state) % WORK_BUF_SIZE;
+}
+
+static bool capacity_write(capacity_file_t *file, char prefix, uint32_t number,
+                           uint32_t clusters, uint32_t *state) {
+  capacity_prepare(file, prefix, clusters, state);
+  char name[13];
+  capacity_name(file, number, name);
+  uint32_t written = 0;
+  f12_err_t close_error = F12_OK;
+  bool ok = write_pattern_file_chunked(name, file->id, file->size, file->chunk,
+                                       &written, &close_error);
+  if (!ok && writer_owned)
+    writer_abort();
+  return ok && written == file->size && close_error == F12_OK;
+}
+
+static bool capacity_verify(void) {
+  for (uint32_t i = 0; i < CAPACITY_FILE_COUNT; i++) {
+    const capacity_file_t *file = &capacity_files[i];
+    char name[13];
+    capacity_name(file, i, name);
+    if (!verify_pattern_file_chunked(name, file->id, file->size, file->chunk,
+                                     NULL))
       return false;
-    }
   }
-
   return true;
 }
 
-static bool verify_pattern_windows(const char *name, int file_id, uint32_t file_size) {
-  if (file_size == 0) return false;
-
-  uint32_t window = fs_cluster_size();
-  if (window == 0 || window > SELF_BUF_SIZE) window = SELF_BUF_SIZE;
-  if (window > file_size) window = file_size;
-
-  uint32_t offsets[3] = {
-    0,
-    file_size / 2,
-    file_size - window,
-  };
-
-  f12_file_t *f = f12_open(&fs, name, "r");
-  if (!f) return false;
-
-  bool ok = true;
-  for (int i = 0; i < 3; i++) {
-    uint32_t offset = offsets[i];
-    if (offset + window > file_size) {
-      offset = file_size - window;
-    }
-    if (!verify_pattern_at(f, file_id, offset, window)) {
-      ok = false;
-      break;
-    }
-  }
-
-  if (f12_close(f) != F12_OK) ok = false;
-  return ok;
-}
-
-#define SELFTEST3_STATE_FILE "SELF3.STA"
-#define SELFTEST3_STATE_MAGIC "S3STATE1"
-#define SELFTEST3_STATE_VERSION 1u
-#define SELFTEST3_STAGE_A_READY 1u
-#define SELFTEST3_STAGE_B_DONE  2u
-#define SELFTEST3_STAGE_CRASH_READY 3u
-#define SELFTEST3_RANDOM_SEED   0x13579BDFu
-#define SELFTEST3_BYTE_FILE     "BYTEIO.BIN"
-#define SELFTEST3_TARGET_FILE   "TARGET.BIN"
-#define SELFTEST3_FILLER_FILE   "FILLER.BIN"
+#define CRASH_STATE_FILE "CRASH.STA"
+#define CRASH_STATE_MAGIC "CRASH001"
+#define CRASH_STATE_VERSION 1u
+#define CRASH_STABLE_FILE "STABLE.BIN"
+#define CRASH_TARGET_FILE "TARGET.BIN"
+#define CRASH_FILLER_FILE "FILLER.BIN"
 
 typedef struct {
   char magic[8];
   uint32_t version;
-  uint32_t stage;
-  uint32_t seed;
-  uint32_t byte_id;
-  uint32_t byte_size;
-  uint32_t target_id;
+  uint32_t stable_id;
+  uint32_t stable_size;
+  uint32_t target_old_id;
+  uint32_t target_new_id;
   uint32_t target_size;
   uint32_t filler_id;
   uint32_t filler_size;
-  uint32_t cluster_size;
-  uint32_t rounds_a;
-  uint8_t reserved[460];
-} selftest3_state_t;
+  uint32_t checksum;
+  uint8_t reserved[DISK_SECTOR_SIZE - 8u - 9u * sizeof(uint32_t)];
+} crash_state_t;
 
-_Static_assert(sizeof(selftest3_state_t) == 512, "selftest3_state_t must be 512 bytes");
+_Static_assert(sizeof(crash_state_t) == DISK_SECTOR_SIZE, "crash_state_t size");
 
 static bool write_blob_file(const char *name, const void *buf, uint32_t size,
                             uint32_t chunk_size, uint32_t *written_out,
                             f12_err_t *close_err_out) {
-  if (chunk_size == 0 || chunk_size > SELF_BUF_SIZE) {
-    chunk_size = SELF_BUF_SIZE;
+  if (chunk_size == 0 || chunk_size > WORK_BUF_SIZE) {
+    chunk_size = WORK_BUF_SIZE;
   }
 
-  f12_file_t *f = f12_open(&fs, name, "w");
-  if (!f) {
-    if (written_out) *written_out = 0;
-    if (close_err_out) *close_err_out = f12_errno(&fs);
+  f12_err_t open_error = writer_open(name);
+  if (open_error != F12_OK) {
+    if (written_out)
+      *written_out = 0;
+    if (close_err_out)
+      *close_err_out = open_error;
     return false;
   }
 
   uint32_t written = 0;
   while (written < size) {
     uint32_t chunk = size - written;
-    if (chunk > chunk_size) chunk = chunk_size;
+    if (chunk > chunk_size)
+      chunk = chunk_size;
 
-    int n = f12_write(f, (const uint8_t *)buf + written, chunk);
-    if (n <= 0) break;
-    written += (uint32_t)n;
+    f12_result_t result =
+        f12_write_full(&owned_writer, (const uint8_t *)buf + written, chunk);
+    written += (uint32_t)result.count;
+    if (result.error != F12_OK || result.count != chunk) {
+      f12_err_t abort_error = writer_abort();
+      if (written_out)
+        *written_out = written;
+      if (close_err_out) {
+        *close_err_out =
+            abort_error == F12_OK
+                ? (result.error == F12_OK ? F12_ERR_IO : result.error)
+                : abort_error;
+      }
+      return false;
+    }
   }
 
-  if (written_out) *written_out = written;
-  if (close_err_out) *close_err_out = f12_close(f);
-  else f12_close(f);
-  return true;
+  if (written_out)
+    *written_out = written;
+  f12_err_t close_error = writer_commit();
+  if (close_err_out)
+    *close_err_out = close_error;
+  return close_error == F12_OK;
 }
 
-static bool read_blob_file(const char *name, void *buf, uint32_t size, uint32_t *read_out) {
-  f12_file_t *f = f12_open(&fs, name, "r");
-  if (!f) {
-    if (read_out) *read_out = 0;
+static bool read_blob_file(const char *name, void *buf, uint32_t size,
+                           uint32_t *read_out) {
+  f12_stat_t stat;
+  if (f12_stat(&fs, name, &stat) != F12_OK || stat.size != size) {
+    if (read_out)
+      *read_out = 0;
+    return false;
+  }
+  f12_file_t file;
+  if (f12_open(&fs, name, F12_OPEN_READ, &file) != F12_OK) {
+    if (read_out)
+      *read_out = 0;
     return false;
   }
 
-  uint32_t total = f12_read_full(f, buf, size);
-  bool ok = (f12_close(f) == F12_OK);
+  f12_result_t result = f12_read_full(&file, buf, size);
+  bool ok = result.error == F12_OK && f12_close(&file) == F12_OK;
 
-  if (read_out) *read_out = total;
-  return ok && total == size;
+  if (read_out)
+    *read_out = (uint32_t)result.count;
+  return ok && result.count == size;
 }
 
-static bool selftest3_store_state(const selftest3_state_t *state) {
+static uint32_t crash_state_checksum(const crash_state_t *state) {
+  const uint8_t *data = (const uint8_t *)state;
+  size_t checksum_offset = offsetof(crash_state_t, checksum);
+  uint32_t sum = 0;
+  for (size_t i = 0; i < sizeof(*state); i++) {
+    uint8_t value =
+        i >= checksum_offset && i < checksum_offset + sizeof(state->checksum)
+            ? 0
+            : data[i];
+    sum = (sum << 5) + sum + value;
+  }
+  return sum;
+}
+
+static bool crash_state_valid(const crash_state_t *state) {
+  uint32_t capacity = FAT12_DATA_CLUSTERS * CLUSTER_SIZE;
+  return memcmp(state->magic, CRASH_STATE_MAGIC, sizeof(state->magic)) == 0 &&
+         state->version == CRASH_STATE_VERSION &&
+         state->checksum == crash_state_checksum(state) &&
+         state->target_old_id != state->target_new_id &&
+         state->stable_size != 0 && state->stable_size <= capacity &&
+         state->target_size != 0 && state->target_size <= capacity &&
+         state->filler_size != 0 && state->filler_size <= capacity;
+}
+
+static bool crash_state_store(crash_state_t *state) {
+  state->checksum = crash_state_checksum(state);
   uint32_t written = 0;
   f12_err_t close_err = F12_OK;
-  return write_blob_file(SELFTEST3_STATE_FILE, state, sizeof(*state), 37,
-                         &written, &close_err) &&
-         written == sizeof(*state) &&
-         close_err == F12_OK;
+  return write_blob_file(CRASH_STATE_FILE, state, sizeof(*state), 37, &written,
+                         &close_err) &&
+         written == sizeof(*state) && close_err == F12_OK;
 }
 
-static bool selftest3_load_state(selftest3_state_t *state) {
+static bool crash_state_load(crash_state_t *state) {
   uint32_t got = 0;
-  if (!read_blob_file(SELFTEST3_STATE_FILE, state, sizeof(*state), &got)) {
+  if (!read_blob_file(CRASH_STATE_FILE, state, sizeof(*state), &got)) {
     return false;
   }
 
-  return got == sizeof(*state) &&
-         memcmp(state->magic, SELFTEST3_STATE_MAGIC, sizeof(state->magic)) == 0 &&
-         state->version == SELFTEST3_STATE_VERSION;
+  return got == sizeof(*state) && crash_state_valid(state);
 }
-
-static uint32_t selftest3_rand(uint32_t *state) {
-  uint32_t x = *state ? *state : 1u;
-  x ^= x << 13;
-  x ^= x >> 17;
-  x ^= x << 5;
-  *state = x;
-  return x;
-}
-
-static uint32_t selftest3_random_chunk(uint32_t *rng) {
-  static const uint16_t choices[] = {1, 2, 3, 5, 7, 19, 37, 73, 113, 257, 509};
-  return choices[selftest3_rand(rng) % (sizeof(choices) / sizeof(choices[0]))];
-}
-
-static uint32_t selftest3_random_pause_ms(uint32_t *rng) {
-  return 200 + (selftest3_rand(rng) % 500);
-}
-
-static f12_err_t selftest3_remount_after_pause(uint32_t pause_ms) {
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-
-  floppy_motor_off(&floppy);
-  floppy_select(&floppy, false);
-  if (pause_ms > 0) {
-    sleep_ms(pause_ms);
-  }
-
-  f12_err_t err = do_mount();
-  if (err == F12_OK) {
-    mounted = true;
-  }
-  return err;
-}
-
-static uint32_t selftest3_random_target_size(uint32_t *rng, uint32_t cluster_size,
-                                             uint32_t max_clusters, uint32_t current_clusters) {
-  uint32_t clusters = 1 + (selftest3_rand(rng) % max_clusters);
-  if (clusters == current_clusters) {
-    clusters = (clusters % max_clusters) + 1;
-  }
-
-  if (clusters == 1) {
-    return 1 + (selftest3_rand(rng) % cluster_size);
-  }
-
-  return (clusters - 1) * cluster_size + 1 + (selftest3_rand(rng) % cluster_size);
-}
-
-// ============== Command Handlers ==============
 
 static void cmd_help(int argc, char **argv) {
-  (void)argc; (void)argv;
+  (void)argc;
+  (void)argv;
   printf("\nCommands:\n");
   for (unsigned i = 0; i < NUM_COMMANDS; i++) {
-    printf("  %-28s %s", commands[i].usage, commands[i].desc);
-    if (commands[i].alias)
-      printf("  (alias: %s)", commands[i].alias);
-    printf("\n");
+    printf("  %-12s %-28s %s\n", commands[i].name, commands[i].syntax,
+           commands[i].desc);
   }
   printf("\n");
 }
 
 static void cmd_ls(int argc, char **argv) {
-  (void)argc; (void)argv;
+  (void)argc;
+  (void)argv;
   f12_dir_t dir;
   f12_stat_t st;
 
@@ -726,149 +968,218 @@ static void cmd_ls(int argc, char **argv) {
 
   int count = 0;
   uint32_t total_bytes = 0;
-  while (f12_readdir(&dir, &st) == F12_OK) {
-    if (st.is_dir)
+  f12_err_t read_error;
+  while ((read_error = f12_readdir(&dir, &st)) == F12_OK) {
+    if ((st.attr & FAT12_ATTR_DIRECTORY) != 0)
       printf("  %-12s    <DIR>\n", st.name);
     else
       printf("  %-12s %8lu\n", st.name, st.size);
     total_bytes += st.size;
     count++;
   }
-  f12_closedir(&dir);
+  f12_err_t close_error = f12_closedir(&dir);
+  if (read_error != F12_END) {
+    printf("Error: %s\n", f12_strerror(read_error));
+    return;
+  }
+  if (close_error != F12_OK) {
+    printf("Error: %s\n", f12_strerror(close_error));
+    return;
+  }
 
   if (count == 0) {
     printf("  (empty)\n");
   }
 
-  uint16_t free_cl = count_free_clusters();
-  uint32_t free_bytes = (uint32_t)free_cl * fs.fat.bpb.sectors_per_cluster * fs.fat.bpb.bytes_per_sector;
-  printf("  %d file(s), %lu bytes used, %lu bytes free\n", count, total_bytes, free_bytes);
+  uint16_t free_cl;
+  f12_err_t error = f12_free_count(&fs, &free_cl);
+  if (error != F12_OK) {
+    printf("Free-space query failed: %s\n", f12_strerror(error));
+    return;
+  }
+  uint32_t free_bytes = (uint32_t)free_cl * CLUSTER_SIZE;
+  printf("  %d entries, %lu bytes used, %lu bytes free\n", count, total_bytes,
+         free_bytes);
 }
 
 static void cmd_cat(int argc, char **argv) {
-  if (argc < 2) {
-    printf("Usage: cat <file>\n");
+  (void)argc;
+  char name[13];
+  if (!canonical_name(argv[1], name)) {
+    printf("Invalid 8.3 filename: %s\n", argv[1]);
     return;
   }
-  char name[13];
-  strncpy(name, argv[1], sizeof(name) - 1);
-  name[sizeof(name) - 1] = '\0';
-  upcase(name);
 
-  f12_file_t *file = f12_open(&fs, name, "r");
-  if (!file) {
-    printf("Error: %s\n", f12_strerror(f12_errno(&fs)));
+  f12_file_t file;
+  f12_err_t error = f12_open(&fs, name, F12_OPEN_READ, &file);
+  if (error != F12_OK) {
+    printf("Error: %s\n", f12_strerror(error));
     return;
   }
 
   int total = 0;
-  int n;
-  while ((n = f12_read(file, io_buf, IO_BUF_SIZE)) > 0) {
-    for (int i = 0; i < n; i++) {
+  for (;;) {
+    f12_result_t result = f12_read(&file, io_buf, IO_BUF_SIZE);
+    if (result.count > IO_BUF_SIZE) {
+      printf("\nRead error: invalid transfer count\n");
+      break;
+    }
+    for (size_t i = 0; i < result.count; i++) {
       putchar(io_buf[i]);
     }
-    total += n;
+    total += (int)result.count;
+    if (result.error == F12_END)
+      break;
+    if (result.error != F12_OK) {
+      printf("\nRead error: %s\n", f12_strerror(result.error));
+      break;
+    }
   }
   printf("\n(%d bytes)\n", total);
-  f12_close(file);
+  error = f12_close(&file);
+  if (error != F12_OK)
+    printf("Close error: %s\n", f12_strerror(error));
 }
 
 static void cmd_hexdump(int argc, char **argv) {
-  if (argc < 2) {
-    printf("Usage: hexdump <file>\n");
+  (void)argc;
+  char name[13];
+  if (!canonical_name(argv[1], name)) {
+    printf("Invalid 8.3 filename: %s\n", argv[1]);
     return;
   }
-  char name[13];
-  strncpy(name, argv[1], sizeof(name) - 1);
-  name[sizeof(name) - 1] = '\0';
-  upcase(name);
 
-  f12_file_t *file = f12_open(&fs, name, "r");
-  if (!file) {
-    printf("Error: %s\n", f12_strerror(f12_errno(&fs)));
+  f12_file_t file;
+  f12_err_t error = f12_open(&fs, name, F12_OPEN_READ, &file);
+  if (error != F12_OK) {
+    printf("Error: %s\n", f12_strerror(error));
     return;
   }
 
   uint32_t offset = 0;
-  int n;
-  while ((n = f12_read(file, io_buf, 16)) > 0) {
+  for (;;) {
+    f12_result_t result = f12_read(&file, io_buf, 16);
+    if (result.count > 16u) {
+      printf("Read error: invalid transfer count\n");
+      break;
+    }
+    size_t n = result.count;
+    if (n == 0 && result.error == F12_END)
+      break;
+    if (result.error != F12_OK && result.error != F12_END) {
+      printf("Read error: %s\n", f12_strerror(result.error));
+      break;
+    }
     printf("  %08lX: ", offset);
-    for (int i = 0; i < 16; i++) {
+    for (size_t i = 0; i < 16u; i++) {
       if (i < n)
-        printf("%02X ", io_buf[i]);
+        printf("%02X ", (unsigned)io_buf[i]);
       else
         printf("   ");
-      if (i == 7) printf(" ");
+      if (i == 7)
+        printf(" ");
     }
     printf(" |");
-    for (int i = 0; i < n; i++) {
+    for (size_t i = 0; i < n; i++) {
       putchar((io_buf[i] >= 32 && io_buf[i] < 127) ? io_buf[i] : '.');
     }
     printf("|\n");
-    offset += n;
+    offset += (uint32_t)n;
+    if (result.error == F12_END)
+      break;
   }
   printf("  %lu bytes\n", offset);
-  f12_close(file);
+  error = f12_close(&file);
+  if (error != F12_OK)
+    printf("Close error: %s\n", f12_strerror(error));
 }
 
 static void cmd_write(int argc, char **argv) {
-  if (argc < 2) {
-    printf("Usage: write <file>\n");
+  (void)argc;
+  char name[13];
+  if (!canonical_name(argv[1], name)) {
+    printf("Invalid 8.3 filename: %s\n", argv[1]);
     return;
   }
-  char name[13];
-  strncpy(name, argv[1], sizeof(name) - 1);
-  name[sizeof(name) - 1] = '\0';
-  upcase(name);
+
+  f12_err_t error = writer_open(name);
+  if (error != F12_OK) {
+    printf("Error: %s\n", f12_strerror(error));
+    return;
+  }
 
   printf("Enter text (end with . on its own line):\n");
-
-  // Buffer all input first, then write once
-  uint32_t pos = 0;
+  uint32_t total = 0;
   char line[CMD_BUF_SIZE];
-
   for (;;) {
-    cli_readline(line, sizeof(line));
-    if (strcmp(line, ".") == 0) break;
-
-    int len = strlen(line);
-    if (pos + len + 1 > SELF_BUF_SIZE) {
-      printf("Input too large (max %d bytes)\n", SELF_BUF_SIZE);
+    int line_length = cli_readline(line);
+    if (line_length == CLI_INPUT_CANCELLED) {
+      f12_err_t abort_error = writer_abort();
+      printf("Write cancelled.\n");
+      if (abort_error != F12_OK) {
+        printf("Abort failed and writer remains retained: %s\n",
+               f12_strerror(abort_error));
+      }
       return;
     }
-    memcpy(self_buf + pos, line, len);
-    pos += len;
-    self_buf[pos++] = '\n';
+    if (line_length == CLI_INPUT_OVERFLOW) {
+      f12_err_t abort_error = writer_abort();
+      printf("Input line too long; write aborted.\n");
+      if (abort_error != F12_OK) {
+        printf("Abort failed and writer remains retained: %s\n",
+               f12_strerror(abort_error));
+      }
+      return;
+    }
+    if (strcmp(line, ".") == 0)
+      break;
+
+    uint32_t requested = (uint32_t)line_length + 1u;
+    line[line_length] = '\n';
+    f12_result_t result = f12_write_full(&owned_writer, line, requested);
+    total += (uint32_t)result.count;
+    if (result.error != F12_OK || result.count != requested) {
+      f12_err_t abort_error = writer_abort();
+      printf("Write failed after %lu bytes: %s\n", (unsigned long)total,
+             f12_strerror(result.error == F12_OK ? F12_ERR_IO : result.error));
+      if (abort_error != F12_OK) {
+        printf("Abort failed and writer remains retained: %s\n",
+               f12_strerror(abort_error));
+      }
+      return;
+    }
   }
 
-  if (pos == 0) {
-    printf("Nothing to write.\n");
+  error = writer_commit();
+  if (error != F12_OK) {
+    printf("Commit failed and writer remains retained: %s\n",
+           f12_strerror(error));
     return;
   }
+  printf("Wrote %lu bytes to %s\n", (unsigned long)total, name);
+}
 
-  f12_file_t *file = f12_open(&fs, name, "w");
-  if (!file) {
-    printf("Error: %s\n", f12_strerror(f12_errno(&fs)));
+static void cmd_commit(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  if (!writer_owned) {
+    printf("No pending commit.\n");
     return;
   }
-
-  uint32_t wrote = f12_write_full(file, self_buf, pos);
-  f12_err_t cerr = f12_close(file);
-  if (wrote != pos || cerr != F12_OK)
-    printf("Error writing %s: wrote %lu/%lu close=%s\n", name, wrote, pos, f12_strerror(cerr));
+  f12_err_t error = writer_commit();
+  if (error == F12_OK)
+    printf("Commit complete.\n");
   else
-    printf("Wrote %lu bytes to %s\n", pos, name);
+    printf("Commit failed and remains retained: %s\n", f12_strerror(error));
 }
 
 static void cmd_rm(int argc, char **argv) {
-  if (argc < 2) {
-    printf("Usage: rm <file>\n");
+  (void)argc;
+  char name[13];
+  if (!canonical_name(argv[1], name)) {
+    printf("Invalid 8.3 filename: %s\n", argv[1]);
     return;
   }
-  char name[13];
-  strncpy(name, argv[1], sizeof(name) - 1);
-  name[sizeof(name) - 1] = '\0';
-  upcase(name);
 
   f12_err_t err = f12_delete(&fs, name);
   if (err != F12_OK)
@@ -878,55 +1189,79 @@ static void cmd_rm(int argc, char **argv) {
 }
 
 static void cmd_cp(int argc, char **argv) {
-  if (argc < 3) {
-    printf("Usage: cp <src> <dst>\n");
-    return;
-  }
+  (void)argc;
   char src[13], dst[13];
-  strncpy(src, argv[1], sizeof(src) - 1); src[sizeof(src) - 1] = '\0';
-  strncpy(dst, argv[2], sizeof(dst) - 1); dst[sizeof(dst) - 1] = '\0';
-  upcase(src);
-  upcase(dst);
-
-  f12_file_t *rf = f12_open(&fs, src, "r");
-  if (!rf) {
-    printf("Error opening %s: %s\n", src, f12_strerror(f12_errno(&fs)));
+  if (!canonical_name(argv[1], src) || !canonical_name(argv[2], dst)) {
+    printf("Source and destination must be valid 8.3 filenames.\n");
     return;
   }
 
-  f12_file_t *wf = f12_open(&fs, dst, "w");
-  if (!wf) {
-    printf("Error creating %s: %s\n", dst, f12_strerror(f12_errno(&fs)));
-    f12_close(rf);
+  f12_file_t reader;
+  f12_err_t error = f12_open(&fs, src, F12_OPEN_READ, &reader);
+  if (error != F12_OK) {
+    printf("Error opening %s: %s\n", src, f12_strerror(error));
+    return;
+  }
+
+  error = writer_open(dst);
+  if (error != F12_OK) {
+    printf("Error creating %s: %s\n", dst, f12_strerror(error));
+    f12_err_t read_close = f12_close(&reader);
+    if (read_close != F12_OK)
+      printf("Reader close failed: %s\n", f12_strerror(read_close));
     return;
   }
 
   uint32_t total = 0;
-  int n;
-  while ((n = f12_read(rf, io_buf, IO_BUF_SIZE)) > 0) {
-    int w = f12_write(wf, io_buf, n);
-    if (w < 0) {
-      printf("Write error: %s\n", f12_strerror(f12_errno(&fs)));
+  f12_err_t copy_error = F12_OK;
+  for (;;) {
+    f12_result_t read_result = f12_read(&reader, io_buf, IO_BUF_SIZE);
+    if (read_result.count > IO_BUF_SIZE) {
+      copy_error = F12_ERR_IO;
       break;
     }
-    total += w;
+    if (read_result.count != 0) {
+      f12_result_t write_result =
+          f12_write_full(&owned_writer, io_buf, (uint32_t)read_result.count);
+      total += (uint32_t)write_result.count;
+      if (write_result.error != F12_OK ||
+          write_result.count != read_result.count) {
+        copy_error =
+            write_result.error == F12_OK ? F12_ERR_IO : write_result.error;
+        break;
+      }
+    }
+    if (read_result.error == F12_END)
+      break;
+    if (read_result.error != F12_OK) {
+      copy_error = read_result.error;
+      break;
+    }
   }
 
-  f12_close(rf);
-  f12_close(wf);
+  f12_err_t read_close = f12_close(&reader);
+  if (copy_error == F12_OK && read_close != F12_OK)
+    copy_error = read_close;
+  f12_err_t write_close =
+      copy_error == F12_OK ? writer_commit() : writer_abort();
+  if (write_close != F12_OK)
+    copy_error = write_close;
+  if (copy_error != F12_OK) {
+    printf("Copy error after %lu bytes: %s\n", total, f12_strerror(copy_error));
+    if (writer_owned)
+      printf("Commit retained; run 'commit' to retry.\n");
+    return;
+  }
   printf("Copied %lu bytes: %s -> %s\n", total, src, dst);
 }
 
 static void cmd_mv(int argc, char **argv) {
-  if (argc < 3) {
-    printf("Usage: mv <src> <dst>\n");
+  (void)argc;
+  char src[13], dst[13];
+  if (!canonical_name(argv[1], src) || !canonical_name(argv[2], dst)) {
+    printf("Source and destination must be valid 8.3 filenames.\n");
     return;
   }
-  char src[13], dst[13];
-  strncpy(src, argv[1], sizeof(src) - 1); src[sizeof(src) - 1] = '\0';
-  strncpy(dst, argv[2], sizeof(dst) - 1); dst[sizeof(dst) - 1] = '\0';
-  upcase(src);
-  upcase(dst);
 
   f12_err_t err = f12_rename(&fs, src, dst);
   if (err != F12_OK) {
@@ -937,14 +1272,12 @@ static void cmd_mv(int argc, char **argv) {
 }
 
 static void cmd_stat(int argc, char **argv) {
-  if (argc < 2) {
-    printf("Usage: stat <file>\n");
+  (void)argc;
+  char name[13];
+  if (!canonical_name(argv[1], name)) {
+    printf("Invalid 8.3 filename: %s\n", argv[1]);
     return;
   }
-  char name[13];
-  strncpy(name, argv[1], sizeof(name) - 1);
-  name[sizeof(name) - 1] = '\0';
-  upcase(name);
 
   f12_stat_t st;
   f12_err_t err = f12_stat(&fs, name, &st);
@@ -956,91 +1289,79 @@ static void cmd_stat(int argc, char **argv) {
   printf("  Name:   %s\n", st.name);
   printf("  Size:   %lu bytes\n", st.size);
   printf("  Attr:   0x%02X", st.attr);
-  if (st.attr & 0x01) printf(" RO");
-  if (st.attr & 0x02) printf(" HID");
-  if (st.attr & 0x04) printf(" SYS");
-  if (st.attr & 0x08) printf(" VOL");
-  if (st.attr & 0x10) printf(" DIR");
-  if (st.attr & 0x20) printf(" ARC");
+  if (st.attr & FAT12_ATTR_READ_ONLY)
+    printf(" RO");
+  if (st.attr & FAT12_ATTR_HIDDEN)
+    printf(" HID");
+  if (st.attr & FAT12_ATTR_SYSTEM)
+    printf(" SYS");
+  if (st.attr & FAT12_ATTR_VOLUME_ID)
+    printf(" VOL");
+  if (st.attr & FAT12_ATTR_DIRECTORY)
+    printf(" DIR");
+  if (st.attr & FAT12_ATTR_ARCHIVE)
+    printf(" ARC");
   printf("\n");
-
-  // Walk cluster chain
-  fat12_dirent_t de;
-  fat12_err_t ferr = fat12_find(&fs.fat, name, &de);
-  if (ferr == FAT12_OK) {
-    printf("  Chain:  ");
-    uint16_t cluster = de.start_cluster;
-    int count = 0;
-    while (cluster >= 2 && !fat12_is_eof(cluster) && count < 50) {
-      if (count > 0) printf(" -> ");
-      printf("%u", cluster);
-      uint16_t next;
-      if (fat12_get_entry(&fs.fat, cluster, &next) != FAT12_OK) break;
-      cluster = next;
-      count++;
-    }
-    if (count >= 50) printf(" ...");
-    printf("\n  Clusters: %d\n", count);
-  }
 }
 
-static void format_progress(void *ctx, uint8_t cyl, uint8_t side,
-                            uint16_t done, uint16_t total) {
+static void format_progress(void *ctx, uint8_t cyl, uint8_t side, uint16_t done,
+                            uint16_t total) {
   (void)ctx;
   if (done == 1 || done == total || (done % 4) == 0) {
     uint32_t pct = total ? (uint32_t)done * 100 / total : 100;
-    printf("  formatting: %u/%u tracks (%lu%%), track %u side %u\n",
-           done, total, (unsigned long)pct, cyl, side);
+    printf("  formatting: %u/%u tracks (%lu%%), track %u side %u\n", done,
+           total, (unsigned long)pct, cyl, side);
   }
+}
+
+static f12_err_t do_format(const char *label, bool full) {
+  return f12_format(&fs, (f12_format_options_t){
+                             .label = label,
+                             .mode = full ? F12_FORMAT_FULL : F12_FORMAT_QUICK,
+                             .progress = format_progress,
+                             .progress_ctx = NULL,
+                         });
 }
 
 static void cmd_format(int argc, char **argv) {
   const char *label = "PICODISK";
   bool full = false;
 
-  if (argc >= 2) {
-    if (strcasecmp(argv[argc - 1], "full") == 0) {
+  if (argc == 2) {
+    if (text_equal_case(argv[1], "full")) {
       full = true;
-      if (argc >= 3) label = argv[1];
     } else {
       label = argv[1];
     }
+  } else if (argc == 3) {
+    if (!text_equal_case(argv[2], "full")) {
+      printf("Format mode must be 'full'.\n");
+      return;
+    }
+    label = argv[1];
+    full = true;
   }
 
   printf("Format disk as \"%s\" (%s)? [y/N] ", label, full ? "full" : "quick");
 
-  char line[CMD_BUF_SIZE];
-  cli_readline(line, sizeof(line));
-  if (line[0] != 'y' && line[0] != 'Y') {
-    printf("Cancelled.\n");
+  if (!cli_confirm())
+    return;
+
+  f12_err_t err = unmount_filesystem();
+  if (err != F12_OK) {
+    printf("Unmount failed: %s\n", f12_strerror(err));
     return;
   }
 
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-
-  setup_io();
-  fs.io.progress = format_progress;
-
-  // Need to upcase the label for FAT
-  char ulabel[12];
-  strncpy(ulabel, label, 11);
-  ulabel[11] = '\0';
-  upcase(ulabel);
-
-  f12_err_t err = f12_format(&fs, ulabel, full);
+  err = do_format(label, full);
   if (err != F12_OK) {
     printf("Format error: %s\n", f12_strerror(err));
     return;
   }
   printf("Format complete.\n");
 
-  // Auto-mount
   err = do_mount();
   if (err == F12_OK) {
-    mounted = true;
     printf("Mounted.\n");
   } else {
     printf("Mount error: %s\n", f12_strerror(err));
@@ -1048,30 +1369,49 @@ static void cmd_format(int argc, char **argv) {
 }
 
 static bool fsck_dirty(const fat12_fsck_t *r) {
-  return r->lost_clusters || r->broken_chains || r->crosslinked || r->fat_mismatch;
+  return r->lost_clusters || r->crosslinked || r->loops || r->broken_chains ||
+         r->size_mismatches || r->truncated_files || r->duplicate_names ||
+         r->fat_mismatch || r->fat_ambiguous || r->incomplete;
 }
 
 static void print_fsck_report(const fat12_fsck_t *r) {
   printf("  Files:         %u\n", r->files);
-  if (r->directories) {
-    printf("  Directories:   %u\n", r->directories);
-  }
-  if (r->incomplete) {
-    printf("  WARNING: too many directories, scan incomplete; lost-cluster repair disabled\n");
-  }
+  printf("  Directories:   %u\n", r->directories);
   printf("  Lost clusters: %u\n", r->lost_clusters);
-  printf("  Broken chains: %u\n", r->broken_chains);
   printf("  Crosslinked:   %u\n", r->crosslinked);
+  printf("  Loops:         %u\n", r->loops);
+  printf("  Broken chains: %u\n", r->broken_chains);
+  printf("  Size mismatch: %u\n", r->size_mismatches);
+  printf("  Truncated:     %u\n", r->truncated_files);
+  printf("  Duplicate:     %u\n", r->duplicate_names);
   if (r->fat_mismatch) {
-    printf("  FAT copies:    MISMATCH%s\n", r->repaired_fat2 ? " (FAT2 rewritten from FAT1)" : "");
+    const char *authority = r->fat_ambiguous             ? "ambiguous"
+                            : r->authoritative_fat == 1u ? "FAT1"
+                            : r->authoritative_fat == 2u ? "FAT2"
+                                                         : "none";
+    printf("  FAT copies:    mismatch, authority=%s, scores=%lu/%lu%s\n",
+           authority, (unsigned long)r->fat1_score,
+           (unsigned long)r->fat2_score,
+           r->repaired_fat1 || r->repaired_fat2 ? ", repaired" : "");
   }
-  if (r->freed) {
+  if (r->removed_directories)
+    printf("  Removed dirs:  %u\n", r->removed_directories);
+  if (r->removed_duplicates)
+    printf("  Removed dupes: %u\n", r->removed_duplicates);
+  if (r->freed_tails)
+    printf("  Freed tails:   %u\n", r->freed_tails);
+  if (r->freed)
     printf("  Freed:         %u clusters\n", r->freed);
-  }
+  if (r->incomplete)
+    printf("  Scan:          incomplete\n");
 }
 
 static void cmd_fsck(int argc, char **argv) {
-  bool fix = (argc >= 2 && strcasecmp(argv[1], "fix") == 0);
+  bool fix = argc == 2;
+  if (fix && !text_equal_case(argv[1], "fix")) {
+    printf("Repair mode must be 'fix'.\n");
+    return;
+  }
 
   fat12_fsck_t report;
   f12_err_t err = f12_fsck(&fs, &report, fix);
@@ -1083,7 +1423,18 @@ static void cmd_fsck(int argc, char **argv) {
   print_fsck_report(&report);
 
   if (fix) {
-    printf("  Result: %s\n", report.crosslinked ? "repaired (crosslinks need manual attention)" : "repaired");
+    fat12_fsck_t verification;
+    err = f12_fsck(&fs, &verification, false);
+    if (err != F12_OK) {
+      printf("  Verification failed: %s\n", f12_strerror(err));
+      return;
+    }
+    if (fsck_dirty(&verification)) {
+      printf("  Result: repair did not converge\n");
+      print_fsck_report(&verification);
+      return;
+    }
+    printf("  Result: repaired and verified clean\n");
   } else if (fsck_dirty(&report)) {
     printf("  Result: DIRTY -- run 'fsck fix' to repair\n");
   } else {
@@ -1092,175 +1443,209 @@ static void cmd_fsck(int argc, char **argv) {
 }
 
 static void cmd_mount(int argc, char **argv) {
-  (void)argc; (void)argv;
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
+  (void)argc;
+  (void)argv;
+  f12_err_t err = unmount_filesystem();
+  if (err != F12_OK) {
+    printf("Unmount failed: %s\n", f12_strerror(err));
+    return;
   }
 
-  f12_err_t err = do_mount();
+  err = do_mount();
   if (err != F12_OK) {
     printf("Mount error: %s\n", f12_strerror(err));
     return;
   }
 
   printf("Mounted.\n");
-  mounted = true;
 
   fat12_fsck_t report;
-  if (f12_fsck(&fs, &report, false) == F12_OK && fsck_dirty(&report)) {
-    printf("WARNING: filesystem dirty: %u lost clusters, %u broken chains, %u crosslinked%s\n",
-           report.lost_clusters, report.broken_chains, report.crosslinked,
-           report.fat_mismatch ? ", FAT copies disagree" : "");
-    printf("Nothing was modified. Run 'fsck fix' to repair.\n");
+  f12_err_t check_error = f12_fsck(&fs, &report, false);
+  if (check_error != F12_OK) {
+    printf("Filesystem check failed: %s\n", f12_strerror(check_error));
+  } else if (fsck_dirty(&report)) {
+    printf("WARNING: filesystem is not clean. Run 'fsck' for details.\n");
   }
 }
 
 static void cmd_unmount(int argc, char **argv) {
-  (void)argc; (void)argv;
+  (void)argc;
+  (void)argv;
+  bool mounted;
+  f12_err_t error = f12_is_mounted(&fs, &mounted);
+  if (error != F12_OK) {
+    printf("Filesystem state check failed: %s\n", f12_strerror(error));
+    return;
+  }
   if (!mounted) {
+    if (writer_owned) {
+      error = writer_commit();
+      if (error != F12_OK)
+        printf("Pending commit failed: %s\n", f12_strerror(error));
+    }
     printf("Not mounted.\n");
     return;
   }
-  f12_unmount(&fs);
-  mounted = false;
+  error = writer_commit();
+  if (error == F12_OK)
+    error = f12_unmount(&fs);
+  if (error != F12_OK) {
+    printf("Unmount failed: %s\n", f12_strerror(error));
+    return;
+  }
   printf("Unmounted.\n");
 }
 
 static void cmd_status(int argc, char **argv) {
-  (void)argc; (void)argv;
-  printf("  Drive:\n");
-  printf("    Write protected: %s\n", floppy_write_protected(&floppy) ? "YES" : "no");
-  printf("    Disk changed:    %s\n", floppy_disk_changed(&floppy) ? "YES" : "no");
-  printf("    Current track:   %d\n", floppy_current_track(&floppy));
-  printf("    At track 0:      %s\n", floppy_at_track0(&floppy) ? "yes" : "no");
-  printf("    Motor:           %s\n", floppy.motor_on ? "ON" : "off");
-  if (floppy.motor_on) {
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    uint32_t idle_ms = now - floppy.last_io_time_ms;
-    uint32_t remaining = (idle_ms < FLOPPY_IDLE_TIMEOUT_MS) ?
-                         (FLOPPY_IDLE_TIMEOUT_MS - idle_ms) / 1000 : 0;
-    printf("    Idle:            %lus (off in %lus)\n", idle_ms / 1000, remaining);
+  (void)argc;
+  (void)argv;
+  bool write_protected;
+  bool changed;
+  bool at_track0;
+  uint8_t cylinder;
+  if (!drive_status("Write-protect query",
+                    floppy_write_protected(&floppy, &write_protected)) ||
+      !drive_status("Media-change query",
+                    floppy_disk_changed(&floppy, &changed)) ||
+      !drive_status("Track query", floppy_current_track(&floppy, &cylinder)) ||
+      !drive_status("Track-zero query",
+                    floppy_at_track0(&floppy, &at_track0))) {
+    return;
   }
+  printf("  Drive:\n");
+  printf("    Write protected: %s\n", write_protected ? "YES" : "no");
+  printf("    Disk changed:    %s\n", changed ? "YES" : "no");
+  printf("    Current track:   %u\n", cylinder);
+  printf("    At track 0:      %s\n", at_track0 ? "yes" : "no");
+  printf("    Pending commit:  %s\n", writer_owned ? "YES" : "no");
 
+  bool mounted;
+  f12_err_t mount_error = f12_is_mounted(&fs, &mounted);
+  if (mount_error != F12_OK) {
+    printf("  Filesystem state: %s\n", f12_strerror(mount_error));
+    return;
+  }
   if (!mounted) {
     printf("  Filesystem: not mounted\n");
     return;
   }
 
-  fat12_bpb_t *bpb = &fs.fat.bpb;
-  printf("  BPB:\n");
-  printf("    Bytes/sector:     %d\n", bpb->bytes_per_sector);
-  printf("    Sectors/cluster:  %d\n", bpb->sectors_per_cluster);
-  printf("    Reserved sectors: %d\n", bpb->reserved_sectors);
-  printf("    FATs:             %d\n", bpb->num_fats);
-  printf("    Root entries:     %d\n", bpb->root_entries);
-  printf("    Total sectors:    %d\n", bpb->total_sectors);
-  printf("    Media descriptor: 0x%02X\n", bpb->media_descriptor);
-  printf("    Sectors/FAT:      %d\n", bpb->sectors_per_fat);
-  printf("    Sectors/track:    %d\n", bpb->sectors_per_track);
-  printf("    Heads:            %d\n", bpb->num_heads);
-  if (fs.fat.fat_mismatch) {
-    printf("  WARNING: FAT copies disagree (FAT1 is authoritative)\n");
-  }
+  printf("  Geometry:\n");
+  printf("    Bytes/sector:     %u\n", DISK_SECTOR_SIZE);
+  printf("    Sectors/cluster:  %u\n", FAT12_MAX_CLUSTER_SECTORS);
+  printf("    Reserved sectors: %u\n", FAT12_RESERVED_SECTORS);
+  printf("    FATs:             %u\n", FAT12_NUM_FATS);
+  printf("    Root entries:     %u\n", FAT12_ROOT_ENTRIES);
+  printf("    Total sectors:    %u\n", DISK_SECTOR_COUNT);
+  printf("    Media descriptor: 0x%02X\n", FAT12_MEDIA_DESCRIPTOR);
+  printf("    Sectors/FAT:      %u\n", FAT12_SECTORS_PER_FAT);
+  printf("    Sectors/track:    %u\n", DISK_SECTORS_PER_TRACK);
+  printf("    Heads:            %u\n", DISK_HEADS);
 
-  uint16_t free_cl = count_free_clusters();
-  uint32_t free_bytes = (uint32_t)free_cl * bpb->sectors_per_cluster * bpb->bytes_per_sector;
+  uint16_t free_cl;
+  f12_err_t error = f12_free_count(&fs, &free_cl);
+  if (error != F12_OK) {
+    printf("  Free-space query failed: %s\n", f12_strerror(error));
+    return;
+  }
+  uint32_t free_bytes = (uint32_t)free_cl * CLUSTER_SIZE;
   printf("  Free: %lu bytes (%d clusters)\n", free_bytes, free_cl);
 }
 
-static void touch_io_time(void) {
-  floppy.last_io_time_ms = to_ms_since_boot(get_absolute_time());
-}
-
 static void cmd_motor(int argc, char **argv) {
-  if (argc < 2) {
-    printf("Motor is %s\n", floppy.motor_on ? "ON" : "off");
-    return;
-  }
-  if (strcasecmp(argv[1], "on") == 0) {
-    touch_io_time();
-    floppy_motor_on(&floppy);
-    printf("Motor ON\n");
-  } else if (strcasecmp(argv[1], "off") == 0) {
-    floppy_motor_off(&floppy);
-    printf("Motor off\n");
+  (void)argc;
+  if (text_equal_case(argv[1], "on")) {
+    if (drive_status("Motor start", floppy_motor_on(&floppy))) {
+      printf("Motor ON\n");
+    }
+  } else if (text_equal_case(argv[1], "off")) {
+    if (drive_status("Motor stop", floppy_motor_off(&floppy))) {
+      printf("Motor off\n");
+    }
   } else {
-    printf("Usage: motor [on|off]\n");
+    printf("Motor state must be 'on' or 'off'.\n");
   }
 }
 
 static void cmd_select(int argc, char **argv) {
-  if (argc < 2) {
-    printf("Drive is %s\n", floppy.selected ? "selected" : "deselected");
-    return;
-  }
-  if (strcasecmp(argv[1], "on") == 0) {
-    touch_io_time();
-    floppy_select(&floppy, true);
-    printf("Drive selected\n");
-  } else if (strcasecmp(argv[1], "off") == 0) {
-    floppy_select(&floppy, false);
-    printf("Drive deselected\n");
+  (void)argc;
+  if (text_equal_case(argv[1], "on")) {
+    if (drive_status("Drive select", floppy_select(&floppy, true))) {
+      printf("Drive selected\n");
+    }
+  } else if (text_equal_case(argv[1], "off")) {
+    if (drive_status("Drive deselect", floppy_select(&floppy, false))) {
+      printf("Drive deselected\n");
+    }
   } else {
-    printf("Usage: select [on|off]\n");
+    printf("Selection state must be 'on' or 'off'.\n");
   }
 }
 
 static void cmd_home(int argc, char **argv) {
-  (void)argc; (void)argv;
+  (void)argc;
+  (void)argv;
   printf("Seeking to track 0...\n");
-  floppy_status_t st = floppy_seek(&floppy, 0);
-  if (st == FLOPPY_OK)
-    printf("At track 0 (TRK0 pin: %s)\n",
-           floppy_at_track0(&floppy) ? "active" : "NOT active");
-  else
-    printf("Seek error: %d\n", st);
+  block_status_t st = floppy_seek(&floppy, 0);
+  if (!drive_status("Seek", st))
+    return;
+  bool active;
+  if (!drive_status("Track-zero query", floppy_at_track0(&floppy, &active)))
+    return;
+  printf("At track 0 (TRK0 pin: %s)\n", active ? "active" : "NOT active");
 }
 
 static void cmd_pins(int argc, char **argv) {
-  (void)argc; (void)argv;
+  (void)argc;
+  (void)argv;
   printf("  GPIO  Pin  Signal          State\n");
   printf("  ----  ---  ------          -----\n");
 
-  struct { uint gpio; const char *fpin; const char *name; bool is_input; } pins[] = {
-    {floppy.pins.index,         " 8", "INDEX",         true},
-    {floppy.pins.track0,        "26", "TRACK0",        true},
-    {floppy.pins.write_protect, "28", "WRITE_PROTECT", true},
-    {floppy.pins.read_data,     "30", "READ_DATA",     true},
-    {floppy.pins.disk_change,   "34", "DISK_CHANGE",   true},
-    {floppy.pins.drive_select,  "12", "DRIVE_SELECT",  false},
-    {floppy.pins.motor_enable,  "10", "MOTOR_ENABLE",  false},
-    {floppy.pins.direction,     "18", "DIRECTION",      false},
-    {floppy.pins.step,          "20", "STEP",           false},
-    {floppy.pins.write_data,    "22", "WRITE_DATA",     false},
-    {floppy.pins.write_gate,    "24", "WRITE_GATE",     false},
-    {floppy.pins.side_select,   "32", "SIDE_SELECT",    false},
-    {floppy.pins.density,       " 2", "DENSITY",        false},
+  struct {
+    uint gpio;
+    const char *fpin;
+    const char *name;
+    bool is_input;
+  } pins[] = {
+      {drive_pins.index, " 8", "INDEX", true},
+      {drive_pins.track0, "26", "TRACK0", true},
+      {drive_pins.write_protect, "28", "WRITE_PROTECT", true},
+      {drive_pins.read_data, "30", "READ_DATA", true},
+      {drive_pins.disk_change, "34", "DISK_CHANGE", true},
+      {drive_pins.drive_select, "12", "DRIVE_SELECT", false},
+      {drive_pins.motor_enable, "10", "MOTOR_ENABLE", false},
+      {drive_pins.direction, "18", "DIRECTION", false},
+      {drive_pins.step, "20", "STEP", false},
+      {drive_pins.write_data, "22", "WRITE_DATA", false},
+      {drive_pins.write_gate, "24", "WRITE_GATE", false},
+      {drive_pins.side_select, "32", "SIDE_SELECT", false},
+      {drive_pins.density, " 2", "DENSITY", false},
   };
 
-  for (unsigned i = 0; i < sizeof(pins)/sizeof(pins[0]); i++) {
+  for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
     bool val = gpio_get(pins[i].gpio);
-    printf("  GP%-2d  %s   %-15s %d (%s)%s\n",
-           pins[i].gpio, pins[i].fpin, pins[i].name,
-           val, val ? "HIGH" : "LOW",
+    printf("  GP%-2u  %s   %-15s %d (%s)%s\n", pins[i].gpio, pins[i].fpin,
+           pins[i].name, val, val ? "HIGH" : "LOW",
            pins[i].is_input ? " <input>" : "");
   }
 }
 
 static void cmd_poll(int argc, char **argv) {
-  (void)argc; (void)argv;
+  (void)argc;
+  (void)argv;
 
-  touch_io_time();
-  if (!floppy.motor_on || !floppy.selected) {
-    printf("  Starting motor and selecting drive...\n");
-    floppy_select(&floppy, true);
-    floppy_motor_on(&floppy);
+  printf("  Starting motor and selecting drive...\n");
+  if (!drive_status("Drive select", floppy_select(&floppy, true)))
+    return;
+  if (!drive_status("Motor start", floppy_motor_on(&floppy))) {
+    drive_status("Drive deselect", floppy_select(&floppy, false));
+    return;
   }
 
-  uint pin = floppy.pins.read_data;
-  uint ix_pin = floppy.pins.index;
-  printf("  Polling GP%d (read_data) and GP%d (index) for 2 seconds...\n", pin, ix_pin);
+  uint pin = drive_pins.read_data;
+  uint ix_pin = drive_pins.index;
+  printf("  Polling GP%u (read_data) and GP%u (index) for 2 seconds...\n", pin,
+         ix_pin);
 
   int transitions = 0;
   int ix_transitions = 0;
@@ -1281,102 +1666,112 @@ static void cmd_poll(int argc, char **argv) {
     }
   }
 
-  printf("  read_data transitions: %d  (expect ~200k+ if disk present)\n", transitions);
-  printf("  index transitions:     %d  (expect ~24 for 360rpm)\n", ix_transitions);
+  printf("  read_data transitions: %d  (expect ~200k+ if disk present)\n",
+         transitions);
+  printf("  index transitions:     %d  (expect about 20 at 300 RPM)\n",
+         ix_transitions);
   if (transitions == 0)
     printf("  No activity on read_data -- check wiring or disk.\n");
+  drive_idle();
 }
 
 static void cmd_flux(int argc, char **argv) {
-  int count = 200;
-  if (argc >= 2) count = atoi(argv[1]);
-  if (count < 1) count = 1;
-  if (count > 10000) count = 10000;
+  uint32_t count = 200;
+  if (argc == 2 && !parse_u32(argv[1], 1, 10000, &count)) {
+    printf("Count must be an integer from 1 through 10000.\n");
+    return;
+  }
 
-  printf("  Reading %d raw flux transitions...\n", count);
-  printf("  read_data=GP%d  index=GP%d\n", floppy.pins.read_data, floppy.pins.index);
+  printf("  Reading %lu raw flux transitions...\n", (unsigned long)count);
+  printf("  read_data=GP%u  index=GP%u\n", drive_pins.read_data,
+         drive_pins.index);
 
-  floppy_flux_begin(&floppy);
+  uint32_t generation;
+  if (!drive_generation(&generation) ||
+      !drive_status("Flux capture", floppy_flux_begin(&floppy, generation)))
+    return;
 
-  for (int i = 0; i < count; i++) {
+  for (uint32_t i = 0; i < count; i++) {
     uint16_t delta;
     bool ix;
-    if (!floppy_flux_next(&floppy, &delta, &ix)) {
-      printf("  TIMEOUT after %d transitions.\n", i);
+    block_status_t status = floppy_flux_next(&floppy, &delta, &ix);
+    if (status != BLOCK_OK) {
+      printf("  Capture stopped after %lu transitions: %s.\n", (unsigned long)i,
+             block_status_text(status));
       printf("  Check: disk inserted? read_data wiring? motor spinning?\n");
-      printf("  Current read_data (GP%d) = %d\n",
-             floppy.pins.read_data, gpio_get(floppy.pins.read_data));
-      floppy_flux_end(&floppy);
+      printf("  Current read_data (GP%u) = %d\n", drive_pins.read_data,
+             gpio_get(drive_pins.read_data));
+      drive_status("Flux stop", floppy_flux_end(&floppy));
       return;
     }
 
-    printf("  %4d: delta=%3d  ix=%d\n", i, delta, ix);
+    printf("  %4lu: delta=%3u  ix=%d\n", (unsigned long)i, delta, ix);
   }
 
-  floppy_flux_end(&floppy);
+  if (!drive_status("Flux stop", floppy_flux_end(&floppy)))
+    return;
   printf("  Done.\n");
 }
 
 static void cmd_seek(int argc, char **argv) {
-  if (argc < 2) {
-    printf("Usage: seek <track>\n");
+  (void)argc;
+  uint32_t cylinder;
+  if (!parse_u32(argv[1], 0, DISK_CYLINDERS - 1u, &cylinder)) {
+    printf("Cylinder must be 0 through %u.\n", DISK_CYLINDERS - 1u);
     return;
   }
-  int track = atoi(argv[1]);
-  if (track < 0 || track > 79) {
-    printf("Track must be 0-79\n");
-    return;
-  }
-  floppy_status_t st = floppy_seek(&floppy, track);
-  if (st != FLOPPY_OK)
-    printf("Seek error: %d\n", st);
-  else
-    printf("Head at track %d\n", track);
+  block_status_t st = floppy_seek(&floppy, (uint8_t)cylinder);
+  if (drive_status("Seek", st))
+    printf("Head at cylinder %lu\n", (unsigned long)cylinder);
 }
 
 static void cmd_dump(int argc, char **argv) {
-  if (argc < 3) {
-    printf("Usage: dump <track> <side> [sector]\n");
+  uint32_t cylinder;
+  uint32_t head;
+  uint32_t sec_start = 1;
+  uint32_t sec_end = DISK_SECTORS_PER_TRACK;
+
+  if (!parse_u32(argv[1], 0, DISK_CYLINDERS - 1u, &cylinder) ||
+      !parse_u32(argv[2], 0, DISK_HEADS - 1u, &head)) {
+    printf("Cylinder must be 0 through %u and head 0 through %u.\n",
+           DISK_CYLINDERS - 1u, DISK_HEADS - 1u);
     return;
   }
-  int track = atoi(argv[1]);
-  int side = atoi(argv[2]);
-  int sec_start = 1, sec_end = SECTORS_PER_TRACK;
-
-  if (argc >= 4) {
-    sec_start = atoi(argv[3]);
+  if (argc == 4) {
+    if (!parse_u32(argv[3], 1, DISK_SECTORS_PER_TRACK, &sec_start)) {
+      printf("Sector must be 1 through %u.\n", DISK_SECTORS_PER_TRACK);
+      return;
+    }
     sec_end = sec_start;
   }
 
-  if (track < 0 || track > 79 || side < 0 || side > 1 ||
-      sec_start < 1 || sec_end > SECTORS_PER_TRACK) {
-    printf("Invalid: track 0-79, side 0-1, sector 1-%d\n", SECTORS_PER_TRACK);
+  uint8_t sector[DISK_SECTOR_SIZE];
+  uint32_t generation;
+  if (!drive_generation(&generation))
     return;
-  }
+  for (uint32_t sector_number = sec_start; sector_number <= sec_end;
+       sector_number++) {
+    block_status_t st = floppy_read_sector(
+        &floppy, generation, (uint8_t)cylinder, (uint8_t)head,
+        (uint8_t)(sector_number - 1u), sector);
+    printf("  --- C%lu/H%lu/S%lu %s ---\n", (unsigned long)cylinder,
+           (unsigned long)head, (unsigned long)sector_number,
+           block_status_text(st));
 
-  sector_t sector;
-  for (int s = sec_start; s <= sec_end; s++) {
-    sector.track = track;
-    sector.side = side;
-    sector.sector_n = s;
-    sector.valid = false;
-
-    floppy_status_t st = floppy_read_sector(&floppy, &sector);
-    printf("  --- T%d/S%d/Sec%d %s ---\n", track, side, s,
-           (st == FLOPPY_OK && sector.valid) ? "OK" : "FAIL");
-
-    if (st != FLOPPY_OK || !sector.valid) continue;
+    if (st != BLOCK_OK)
+      continue;
 
     for (int row = 0; row < 32; row++) {
       int off = row * 16;
       printf("  %03X: ", off);
       for (int i = 0; i < 16; i++) {
-        printf("%02X ", sector.data[off + i]);
-        if (i == 7) printf(" ");
+        printf("%02X ", sector[off + i]);
+        if (i == 7)
+          printf(" ");
       }
       printf(" |");
       for (int i = 0; i < 16; i++) {
-        uint8_t c = sector.data[off + i];
+        uint8_t c = sector[off + i];
         putchar((c >= 32 && c < 127) ? c : '.');
       }
       printf("|\n");
@@ -1385,43 +1780,42 @@ static void cmd_dump(int argc, char **argv) {
 }
 
 static void cmd_mfm(int argc, char **argv) {
-  if (argc < 3) {
-    printf("Usage: mfm <track> <side>\n");
-    return;
-  }
-  int track = atoi(argv[1]);
-  int side = atoi(argv[2]);
-
-  if (track < 0 || track > 79 || side < 0 || side > 1) {
-    printf("Invalid: track 0-79, side 0-1\n");
+  (void)argc;
+  uint32_t cylinder;
+  uint32_t head;
+  if (!parse_u32(argv[1], 0, DISK_CYLINDERS - 1u, &cylinder) ||
+      !parse_u32(argv[2], 0, DISK_HEADS - 1u, &head)) {
+    printf("Cylinder must be 0 through %u and head 0 through %u.\n",
+           DISK_CYLINDERS - 1u, DISK_HEADS - 1u);
     return;
   }
 
-  printf("  Analyzing track %d side %d...\n", track, side);
+  printf("  Analyzing cylinder %lu head %lu...\n", (unsigned long)cylinder,
+         (unsigned long)head);
   track_stats_t stats;
-  read_track_stats(track, side, &stats);
+  read_track_stats((int)cylinder, (int)head, &stats);
 
   printf("  Pulses:   %lu total\n", stats.total_pulses);
   printf("  Short:    %lu (%.1f%%)\n", stats.short_count,
-         stats.total_pulses ? stats.short_count * 100.0 / stats.total_pulses : 0);
+         stats.total_pulses ? stats.short_count * 100.0 / stats.total_pulses
+                            : 0);
   printf("  Medium:   %lu (%.1f%%)\n", stats.medium_count,
-         stats.total_pulses ? stats.medium_count * 100.0 / stats.total_pulses : 0);
+         stats.total_pulses ? stats.medium_count * 100.0 / stats.total_pulses
+                            : 0);
   printf("  Long:     %lu (%.1f%%)\n", stats.long_count,
-         stats.total_pulses ? stats.long_count * 100.0 / stats.total_pulses : 0);
+         stats.total_pulses ? stats.long_count * 100.0 / stats.total_pulses
+                            : 0);
   printf("  Invalid:  %lu (%.1f%%)\n", stats.invalid_count,
-         stats.total_pulses ? stats.invalid_count * 100.0 / stats.total_pulses : 0);
+         stats.total_pulses ? stats.invalid_count * 100.0 / stats.total_pulses
+                            : 0);
   printf("  Syncs:    %lu\n", stats.syncs);
   printf("  Records:  %lu\n", stats.sector_records);
-  printf("  Unique:   %lu / %d\n", stats.unique_sectors, SECTORS_PER_TRACK);
+  printf("  Unique:   %lu / %d\n", stats.unique_sectors,
+         DISK_SECTORS_PER_TRACK);
   printf("  CRC err:  %lu\n", stats.crc_errors);
   printf("  Adaptive: T2_max=%d  T3_max=%d\n", stats.T2_max, stats.T3_max);
 
   print_histogram(&stats);
-}
-
-static void fill_pattern(uint8_t *buf, int file_id, uint32_t size) {
-  for (uint32_t i = 0; i < size; i++)
-    buf[i] = gen_pattern_byte(file_id, i);
 }
 
 static void check(bool cond, const char *tag, int *pass, int *fail) {
@@ -1435,143 +1829,187 @@ static void check(bool cond, const char *tag, int *pass, int *fail) {
 }
 
 static bool read_file_exact(const char *name, uint8_t *buf, uint32_t expected) {
-  f12_file_t *f = f12_open(&fs, name, "r");
-  if (!f) return false;
-  uint32_t got = f12_read_full(f, buf, expected + 1);
-  bool close_ok = f12_close(f) == F12_OK;
-  return close_ok && got == expected;
+  f12_stat_t stat;
+  if (f12_stat(&fs, name, &stat) != F12_OK || stat.size != expected)
+    return false;
+  f12_file_t file;
+  if (f12_open(&fs, name, F12_OPEN_READ, &file) != F12_OK)
+    return false;
+  f12_result_t result = f12_read_full(&file, buf, expected);
+  bool close_ok = f12_close(&file) == F12_OK;
+  return close_ok && result.error == F12_OK && result.count == expected;
 }
 
-static bool mfm_health_check(int track, int side, const char *label, int *pass, int *fail) {
+static void mfm_health_check(int track, int side, const char *label, int *pass,
+                             int *fail) {
   track_stats_t stats;
   read_track_stats(track, side, &stats);
 
   printf("  %s T%d/S%d: unique=%lu/%d records=%lu crc=%lu invalid=%lu/%lu\n",
-         label, track, side, stats.unique_sectors, SECTORS_PER_TRACK,
-         stats.sector_records, stats.crc_errors,
-         stats.invalid_count, stats.total_pulses);
+         label, track, side, stats.unique_sectors, DISK_SECTORS_PER_TRACK,
+         stats.sector_records, stats.crc_errors, stats.invalid_count,
+         stats.total_pulses);
 
   uint32_t invalid_limit = stats.total_pulses / 200;
-  if (invalid_limit < 1) invalid_limit = 1;
+  if (invalid_limit < 1)
+    invalid_limit = 1;
 
   char tag[96];
   snprintf(tag, sizeof(tag), "%s unique sectors", label);
-  check(stats.unique_sectors == SECTORS_PER_TRACK, tag, pass, fail);
+  check(stats.unique_sectors == DISK_SECTORS_PER_TRACK, tag, pass, fail);
   snprintf(tag, sizeof(tag), "%s CRC clean", label);
   check(stats.crc_errors == 0, tag, pass, fail);
   snprintf(tag, sizeof(tag), "%s invalid pulse threshold", label);
   check(stats.invalid_count <= invalid_limit, tag, pass, fail);
-
-  return stats.unique_sectors == SECTORS_PER_TRACK &&
-         stats.crc_errors == 0 &&
-         stats.invalid_count <= invalid_limit;
 }
 
 static void cmd_test_full(int argc, char **argv) {
-  int rounds = 6;
-  if (argc > 2) {
-    printf("Usage: test-full [rounds]\n");
-    return;
-  }
+  uint32_t rounds = 6;
   if (argc == 2) {
-    rounds = atoi(argv[1]);
-    if (rounds < 1 || rounds > 100) {
-      printf("Rounds must be 1-100\n");
+    if (!parse_u32(argv[1], 1, 100, &rounds)) {
+      printf("Rounds must be an integer from 1 through 100.\n");
       return;
     }
   }
 
-  printf("This will FORMAT the disk, run diagnostics, file I/O, and a full sector scan.\n");
-  printf("It does not run selftest3. Continue? [y/N] ");
+  printf("This will FORMAT the disk, run diagnostics, file I/O, and a full "
+         "sector scan.\n");
+  printf("Continue? [y/N] ");
 
-  char line[CMD_BUF_SIZE];
-  cli_readline(line, sizeof(line));
-  if (line[0] != 'y' && line[0] != 'Y') {
-    printf("Cancelled.\n");
+  if (!cli_confirm())
     return;
-  }
 
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
+  f12_err_t start_error = unmount_filesystem();
+  if (start_error != F12_OK) {
+    printf("Cannot start test: %s\n", f12_strerror(start_error));
+    return;
   }
 
   int pass = 0;
   int fail = 0;
+  f12_err_t cleanup;
 
   printf("\n--- Phase 1: GPIO and Flux Sanity ---\n");
   cmd_pins(0, NULL);
   cmd_status(0, NULL);
-  check(!floppy_write_protected(&floppy), "disk is writable", &pass, &fail);
+  block_status_t home_status = floppy_seek(&floppy, 0);
+  check(home_status == BLOCK_OK, "home and clear media latch", &pass, &fail);
+  uint32_t test_generation = 0;
+  block_status_t generation_status =
+      floppy_media_generation(&floppy, &test_generation);
+  bool generation_ready = generation_status == BLOCK_OK && test_generation != 0;
+  check(generation_ready, "capture nonzero media generation", &pass, &fail);
+  bool stats_reset = floppy_stats_reset(&floppy) == BLOCK_OK;
+  check(stats_reset, "reset drive statistics", &pass, &fail);
+
+  block_status_t flux_status = generation_ready
+                                   ? floppy_flux_begin(&floppy, test_generation)
+                                   : BLOCK_ERR_INVALID;
+  check(flux_status == BLOCK_OK, "raw flux session starts", &pass, &fail);
+  if (flux_status == BLOCK_OK) {
+    check(floppy_seek(&floppy, 1) == BLOCK_ERR_BUSY,
+          "raw flux excludes head motion", &pass, &fail);
+    check(floppy_deinit(&floppy) == BLOCK_ERR_BUSY,
+          "raw flux excludes teardown", &pass, &fail);
+    check(floppy_flux_end(&floppy) == BLOCK_OK, "raw flux session stops", &pass,
+          &fail);
+  }
+
+  bool write_protected = true;
+  bool protection_ok = drive_status(
+      "Write-protect query", floppy_write_protected(&floppy, &write_protected));
+  check(protection_ok && !write_protected, "disk is writable", &pass, &fail);
   cmd_poll(0, NULL);
   char *flux_args[] = {"flux", "50"};
   cmd_flux(2, flux_args);
+  uint32_t current_generation = 0;
+  generation_status = floppy_media_generation(&floppy, &current_generation);
+  bool generation_stable =
+      generation_status == BLOCK_OK && current_generation == test_generation;
+  check(generation_stable, "media generation remains stable", &pass, &fail);
 
-  if (floppy_write_protected(&floppy)) goto done;
+  if (home_status != BLOCK_OK || !generation_ready || !generation_stable ||
+      !stats_reset || !protection_ok || write_protected)
+    goto done;
 
   printf("\n--- Phase 2: Full Format and Mount ---\n");
-  setup_io();
-  fs.io.progress = format_progress;
-  f12_err_t err = f12_format(&fs, "TESTFULL", true);
+  f12_err_t err = do_format("TESTFULL", true);
   check(err == F12_OK, "full format", &pass, &fail);
-  if (err != F12_OK) goto done;
+  if (err != F12_OK)
+    goto done;
 
   err = do_mount();
   check(err == F12_OK, "mount after full format", &pass, &fail);
-  if (err != F12_OK) goto done;
-  mounted = true;
+  if (err != F12_OK)
+    goto done;
   cmd_status(0, NULL);
 
   printf("\n--- Phase 3: MFM Signal Checks ---\n");
   mfm_health_check(0, 0, "outer", &pass, &fail);
-  mfm_health_check(79, 0, "inner", &pass, &fail);
+  mfm_health_check(DISK_CYLINDERS - 1, 0, "inner", &pass, &fail);
 
   printf("\n--- Phase 4: Shell File Operations ---\n");
-  const char text[] = "test-full hardware sequence\nformat mount write copy move delete verify\n";
+  const char text[] = "test-full hardware sequence\nformat mount write copy "
+                      "move delete verify\n";
   uint32_t text_len = sizeof(text) - 1;
-  f12_file_t *f = f12_open(&fs, "TEST.TXT", "w");
-  check(f != NULL, "open TEST.TXT for write", &pass, &fail);
-  if (f) {
-    uint32_t wrote = f12_write_full(f, text, text_len);
-    f12_err_t close_err = f12_close(f);
-    check(wrote == text_len && close_err == F12_OK, "write TEST.TXT", &pass, &fail);
+  f12_err_t open_error = writer_open("TEST.TXT");
+  check(open_error == F12_OK, "open TEST.TXT for write", &pass, &fail);
+  if (open_error == F12_OK) {
+    f12_result_t write_result = f12_write_full(&owned_writer, text, text_len);
+    f12_err_t close_err =
+        write_result.error == F12_OK ? writer_commit() : writer_abort();
+    check(write_result.error == F12_OK && write_result.count == text_len &&
+              close_err == F12_OK,
+          "write TEST.TXT", &pass, &fail);
   }
 
-  bool exact = read_file_exact("TEST.TXT", self_buf, text_len);
-  check(exact && memcmp(self_buf, text, text_len) == 0, "read TEST.TXT", &pass, &fail);
+  bool exact = read_file_exact("TEST.TXT", work_buf, text_len);
+  check(exact && memcmp(work_buf, text, text_len) == 0, "read TEST.TXT", &pass,
+        &fail);
 
   char *cp_args[] = {"cp", "TEST.TXT", "COPY.TXT"};
   cmd_cp(3, cp_args);
-  exact = read_file_exact("COPY.TXT", self_buf, text_len);
-  check(exact && memcmp(self_buf, text, text_len) == 0, "copy TEST.TXT to COPY.TXT", &pass, &fail);
+  exact = read_file_exact("COPY.TXT", work_buf, text_len);
+  check(exact && memcmp(work_buf, text, text_len) == 0,
+        "copy TEST.TXT to COPY.TXT", &pass, &fail);
 
   char *mv_args[] = {"mv", "COPY.TXT", "MOVED.TXT"};
   cmd_mv(3, mv_args);
   f12_stat_t st;
-  check(f12_stat(&fs, "COPY.TXT", &st) == F12_ERR_NOT_FOUND, "COPY.TXT removed by mv", &pass, &fail);
-  exact = read_file_exact("MOVED.TXT", self_buf, text_len);
-  check(exact && memcmp(self_buf, text, text_len) == 0, "MOVED.TXT verified", &pass, &fail);
+  check(f12_stat(&fs, "COPY.TXT", &st) == F12_ERR_NOT_FOUND,
+        "COPY.TXT removed by mv", &pass, &fail);
+  exact = read_file_exact("MOVED.TXT", work_buf, text_len);
+  check(exact && memcmp(work_buf, text, text_len) == 0, "MOVED.TXT verified",
+        &pass, &fail);
 
   char *rm_args[] = {"rm", "MOVED.TXT"};
   cmd_rm(2, rm_args);
-  check(f12_stat(&fs, "MOVED.TXT", &st) == F12_ERR_NOT_FOUND, "rm MOVED.TXT", &pass, &fail);
+  check(f12_stat(&fs, "MOVED.TXT", &st) == F12_ERR_NOT_FOUND, "rm MOVED.TXT",
+        &pass, &fail);
 
   printf("\n--- Phase 5: Pattern Stress ---\n");
-  struct { const char *name; uint32_t size; int id; uint32_t chunk; } files[] = {
-    {"BYTEIO.BIN", 4096, 1000, 1},
-    {"SMALL.BIN", 512, 1001, 17},
-    {"MEDIUM.BIN", 8192, 1002, 257},
-    {"LARGE.BIN", 32768, 1003, 4096},
+  struct {
+    const char *name;
+    uint32_t size;
+    uint32_t id;
+    uint32_t chunk;
+  } files[] = {
+      {"BYTEIO.BIN", 4096, 1000, 1},
+      {"SMALL.BIN", DISK_SECTOR_SIZE, 1001, 17},
+      {"MEDIUM.BIN", 8192, 1002, 257},
+      {"LARGE.BIN", 32768, 1003, 4096},
   };
 
   for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
     uint32_t written = 0;
     f12_err_t close_err = F12_OK;
-    bool ok = write_pattern_file_chunked(files[i].name, files[i].id, files[i].size,
-                                         files[i].chunk, &written, &close_err);
+    bool ok =
+        write_pattern_file_chunked(files[i].name, files[i].id, files[i].size,
+                                   files[i].chunk, &written, &close_err);
     char tag[80];
     snprintf(tag, sizeof(tag), "write %s", files[i].name);
-    check(ok && written == files[i].size && close_err == F12_OK, tag, &pass, &fail);
+    check(ok && written == files[i].size && close_err == F12_OK, tag, &pass,
+          &fail);
   }
 
   for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
@@ -1582,1177 +2020,389 @@ static void cmd_test_full(int argc, char **argv) {
           tag, &pass, &fail);
   }
 
-  for (int round = 0; round < rounds; round++) {
-    uint32_t size = 2048 + (uint32_t)(round % 9) * 1536;
-    uint32_t chunk = 1 + (uint32_t)(round % 7) * 73;
-    int id = 2000 + round;
+  for (uint32_t round = 0; round < rounds; round++) {
+    uint32_t size = 2048 + (round % 9u) * 1536;
+    uint32_t chunk = 1 + (round % 7u) * 73;
+    uint32_t id = 2000u + round;
     uint32_t written = 0;
     f12_err_t close_err = F12_OK;
-    bool ok = write_pattern_file_chunked("ROUND.BIN", id, size, chunk, &written, &close_err);
+    bool ok = write_pattern_file_chunked("ROUND.BIN", id, size, chunk, &written,
+                                         &close_err);
     char tag[96];
-    snprintf(tag, sizeof(tag), "round %d overwrite write", round + 1);
+    snprintf(tag, sizeof(tag), "round %lu overwrite write",
+             (unsigned long)round + 1u);
     check(ok && written == size && close_err == F12_OK, tag, &pass, &fail);
 
-    snprintf(tag, sizeof(tag), "round %d overwrite verify", round + 1);
-    check(verify_pattern_file_chunked("ROUND.BIN", id, size, chunk + 31, NULL), tag, &pass, &fail);
+    snprintf(tag, sizeof(tag), "round %lu overwrite verify",
+             (unsigned long)round + 1u);
+    check(verify_pattern_file_chunked("ROUND.BIN", id, size, chunk + 31, NULL),
+          tag, &pass, &fail);
   }
 
   err = f12_delete(&fs, "SMALL.BIN");
   check(err == F12_OK, "delete SMALL.BIN", &pass, &fail);
   err = f12_delete(&fs, "MEDIUM.BIN");
   check(err == F12_OK, "delete MEDIUM.BIN", &pass, &fail);
-  check(f12_stat(&fs, "SMALL.BIN", &st) == F12_ERR_NOT_FOUND, "SMALL.BIN gone", &pass, &fail);
-  check(f12_stat(&fs, "MEDIUM.BIN", &st) == F12_ERR_NOT_FOUND, "MEDIUM.BIN gone", &pass, &fail);
+  check(f12_stat(&fs, "SMALL.BIN", &st) == F12_ERR_NOT_FOUND, "SMALL.BIN gone",
+        &pass, &fail);
+  check(f12_stat(&fs, "MEDIUM.BIN", &st) == F12_ERR_NOT_FOUND,
+        "MEDIUM.BIN gone", &pass, &fail);
 
   uint32_t written = 0;
   f12_err_t close_err = F12_OK;
-  bool ok = write_pattern_file_chunked("REFILL.BIN", 3000, 12000, 333, &written, &close_err);
-  check(ok && written == 12000 && close_err == F12_OK, "write REFILL.BIN", &pass, &fail);
-  check(verify_pattern_file_chunked("REFILL.BIN", 3000, 12000, 777, NULL), "verify REFILL.BIN", &pass, &fail);
+  bool ok = write_pattern_file_chunked("REFILL.BIN", 3000, 12000, 333, &written,
+                                       &close_err);
+  check(ok && written == 12000 && close_err == F12_OK, "write REFILL.BIN",
+        &pass, &fail);
+  check(verify_pattern_file_chunked("REFILL.BIN", 3000, 12000, 777, NULL),
+        "verify REFILL.BIN", &pass, &fail);
 
-  printf("\n--- Phase 6: Remount Verify ---\n");
-  f12_unmount(&fs);
-  mounted = false;
-  err = do_mount();
-  check(err == F12_OK, "remount after stress", &pass, &fail);
-  if (err != F12_OK) goto done;
-  mounted = true;
-  check(verify_pattern_file_chunked("BYTEIO.BIN", 1000, 4096, 1, NULL), "BYTEIO.BIN survives remount", &pass, &fail);
-  check(verify_pattern_file_chunked("LARGE.BIN", 1003, 32768, 4096, NULL), "LARGE.BIN survives remount", &pass, &fail);
-  check(verify_pattern_file_chunked("REFILL.BIN", 3000, 12000, 777, NULL), "REFILL.BIN survives remount", &pass, &fail);
+  printf("\n--- Phase 6: Full Capacity and Fragmentation ---\n");
+  uint16_t free_clusters = 0;
+  err = f12_free_count(&fs, &free_clusters);
+  bool capacity_ready = err == F12_OK && free_clusters >= CAPACITY_FILE_COUNT;
+  check(capacity_ready, "capacity workload has enough free clusters", &pass,
+        &fail);
+  if (!capacity_ready)
+    goto done;
 
-  printf("\n--- Phase 7: Full Disk Scan ---\n");
+  memset(capacity_files, 0, sizeof(capacity_files));
+  uint32_t random_state = 0x6D2B79F5u;
+  uint32_t remaining_clusters = free_clusters;
+  bool capacity_ok = true;
+  for (uint32_t i = 0; i < CAPACITY_FILE_COUNT; i++) {
+    uint32_t files_left = CAPACITY_FILE_COUNT - i;
+    uint32_t clusters =
+        capacity_partition(&random_state, remaining_clusters, files_left);
+    if (!capacity_write(&capacity_files[i], 'R', i, clusters, &random_state)) {
+      capacity_ok = false;
+      break;
+    }
+    remaining_clusters -= clusters;
+    if ((i + 1u) % 8u == 0u) {
+      printf("  capacity: %lu/%u files, %lu clusters remain\n",
+             (unsigned long)(i + 1u), CAPACITY_FILE_COUNT,
+             (unsigned long)remaining_clusters);
+    }
+  }
+  check(capacity_ok && remaining_clusters == 0u,
+        "randomized files consume every free cluster", &pass, &fail);
+  if (!capacity_ok || remaining_clusters != 0u)
+    goto done;
+
+  free_clusters = 1u;
+  err = f12_free_count(&fs, &free_clusters);
+  check(err == F12_OK && free_clusters == 0u, "disk reports zero free space",
+        &pass, &fail);
+  if (err != F12_OK || free_clusters != 0u)
+    goto done;
+
+  bool capacity_exact = capacity_verify();
+  check(capacity_exact, "all randomized full-disk files are exact", &pass,
+        &fail);
+  if (!capacity_exact)
+    goto done;
+
+  f12_err_t overflow_open = writer_open("OVERFLOW.BIN");
+  f12_result_t overflow_write = {.error = F12_ERR_INVALID, .count = 0};
+  if (overflow_open == F12_OK) {
+    work_buf[0] = gen_pattern_byte(0xFFFFFFFFu, 0);
+    overflow_write = f12_write_full(&owned_writer, work_buf, 1);
+  }
+  f12_err_t overflow_abort = writer_abort();
+  bool overflow_rejected =
+      overflow_open == F12_OK && overflow_write.error == F12_ERR_FULL &&
+      overflow_write.count == 0u && overflow_abort == F12_OK;
+  check(overflow_rejected, "new-file write reports disk full", &pass, &fail);
+  if (!overflow_rejected)
+    goto done;
+
+  free_clusters = 1u;
+  err = f12_free_count(&fs, &free_clusters);
+  bool overflow_absent =
+      f12_stat(&fs, "OVERFLOW.BIN", &st) == F12_ERR_NOT_FOUND;
+  check(err == F12_OK && free_clusters == 0u && overflow_absent,
+        "failed full-disk file remains unpublished", &pass, &fail);
+  if (err != F12_OK || free_clusters != 0u || !overflow_absent)
+    goto done;
+
+  const capacity_file_t *preserved = &capacity_files[0];
+  char preserved_name[13];
+  capacity_name(preserved, 0, preserved_name);
+  f12_err_t replace_open = writer_open(preserved_name);
+  f12_result_t replace_write = {.error = F12_ERR_INVALID, .count = 0};
+  if (replace_open == F12_OK) {
+    work_buf[0] =
+        (uint8_t)(gen_pattern_byte(preserved->id, 0) ^ (uint8_t)0xFFu);
+    replace_write = f12_write_full(&owned_writer, work_buf, 1);
+  }
+  f12_err_t replace_abort = writer_abort();
+  bool replace_rejected = replace_open == F12_OK &&
+                          replace_write.error == F12_ERR_FULL &&
+                          replace_write.count == 0u && replace_abort == F12_OK;
+  check(replace_rejected, "copy-on-write write reports disk full", &pass,
+        &fail);
+  check(replace_rejected && verify_pattern_file_chunked(
+                                preserved_name, preserved->id, preserved->size,
+                                preserved->chunk, NULL),
+        "failed replacement preserves original file", &pass, &fail);
+  if (!replace_rejected)
+    goto done;
+
+  uint32_t freed_clusters = 0;
+  uint32_t deleted_files = 0;
+  bool delete_ok = true;
+  for (uint32_t i = 1u; i < CAPACITY_FILE_COUNT; i += 3u) {
+    char name[13];
+    capacity_name(&capacity_files[i], i, name);
+    if (f12_delete(&fs, name) != F12_OK) {
+      delete_ok = false;
+      break;
+    }
+    freed_clusters += capacity_cluster_count(capacity_files[i].size);
+    deleted_files++;
+  }
+  check(delete_ok, "delete randomized files across the full disk", &pass,
+        &fail);
+  if (!delete_ok)
+    goto done;
+
+  free_clusters = 0;
+  err = f12_free_count(&fs, &free_clusters);
+  check(err == F12_OK && free_clusters == freed_clusters,
+        "fragmented free-space count is exact", &pass, &fail);
+  if (err != F12_OK || free_clusters != freed_clusters)
+    goto done;
+
+  random_state = 0xB5297A4Du;
+  remaining_clusters = freed_clusters;
+  uint32_t refill_number = 0;
+  bool refill_ok = true;
+  for (uint32_t i = 1u; i < CAPACITY_FILE_COUNT; i += 3u) {
+    uint32_t files_left = deleted_files - refill_number;
+    uint32_t clusters =
+        capacity_partition(&random_state, remaining_clusters, files_left);
+    if (!capacity_write(&capacity_files[i], 'F', i, clusters, &random_state)) {
+      refill_ok = false;
+      break;
+    }
+    remaining_clusters -= clusters;
+    refill_number++;
+  }
+  check(refill_ok && refill_number == deleted_files && remaining_clusters == 0u,
+        "randomized refill consumes every fragmented cluster", &pass, &fail);
+  if (!refill_ok || refill_number != deleted_files || remaining_clusters != 0u)
+    goto done;
+
+  free_clusters = 1u;
+  err = f12_free_count(&fs, &free_clusters);
+  check(err == F12_OK && free_clusters == 0u,
+        "fragmented refill returns disk to full", &pass, &fail);
+  if (err != F12_OK || free_clusters != 0u)
+    goto done;
+
+  printf("\n--- Phase 7: Remount Verify ---\n");
+  err = unmount_filesystem();
+  if (err == F12_OK)
+    err = do_mount();
+  check(err == F12_OK, "remount after full-capacity stress", &pass, &fail);
+  if (err != F12_OK)
+    goto done;
+  check(verify_pattern_file_chunked("BYTEIO.BIN", 1000, 4096, 1, NULL),
+        "BYTEIO.BIN survives remount", &pass, &fail);
+  check(verify_pattern_file_chunked("LARGE.BIN", 1003, 32768, 4096, NULL),
+        "LARGE.BIN survives remount", &pass, &fail);
+  check(verify_pattern_file_chunked("REFILL.BIN", 3000, 12000, 777, NULL),
+        "REFILL.BIN survives remount", &pass, &fail);
+  check(capacity_verify(), "all fragmented files survive remount", &pass,
+        &fail);
+  free_clusters = 1u;
+  err = f12_free_count(&fs, &free_clusters);
+  check(err == F12_OK && free_clusters == 0u, "full capacity survives remount",
+        &pass, &fail);
+
+  fat12_fsck_t report;
+  err = f12_fsck(&fs, &report, false);
+  check(err == F12_OK && !fsck_dirty(&report),
+        "filesystem is clean after remount", &pass, &fail);
+
+  floppy_stats_t write_stats;
+  block_status_t stats_status = floppy_stats(&floppy, &write_stats);
+  check(stats_status == BLOCK_OK, "query write-path statistics", &pass, &fail);
+  if (stats_status == BLOCK_OK) {
+    check(write_stats.dma_writes != 0, "verified DMA track writes observed",
+          &pass, &fail);
+    check(write_stats.underruns == 0 && write_stats.overruns == 0,
+          "no write or read flow faults", &pass, &fail);
+    check(write_stats.media_changes == 0, "no unexpected media changes", &pass,
+          &fail);
+  }
+  current_generation = 0;
+  generation_status = floppy_media_generation(&floppy, &current_generation);
+  check(generation_status == BLOCK_OK && current_generation == test_generation,
+        "media generation stable across writes and remount", &pass, &fail);
+
+  printf("\n--- Phase 8: Full Disk Scan ---\n");
   diskdump_stats_t dump = run_diskdump(true);
-  check(dump.total_valid == FLOPPY_TRACKS * 2 * SECTORS_PER_TRACK, "all sectors readable", &pass, &fail);
+  check(dump.total_valid == DISK_SECTOR_COUNT, "all sectors readable", &pass,
+        &fail);
   check(dump.total_invalid == 0, "no unreadable sectors", &pass, &fail);
   check(dump.retries.failed == 0, "no final read failures", &pass, &fail);
-  check(dump.retries.recovered <= 8, "recovered read retry threshold", &pass, &fail);
+  check(dump.retries.recovered <= 8, "recovered read retry threshold", &pass,
+        &fail);
   check(dump.retries.overruns == 0, "no flux ring overruns", &pass, &fail);
 
 done:
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
+  cleanup = unmount_filesystem();
+  if (cleanup != F12_OK) {
+    printf("Cleanup failed: %s\n", f12_strerror(cleanup));
+    fail++;
   }
-  floppy_motor_off(&floppy);
-  floppy_select(&floppy, false);
+  if (!drive_idle())
+    fail++;
 
   printf("\n=== Test-Full Complete ===\n");
   printf("  Checks: %d passed, %d failed\n", pass, fail);
   printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
 }
 
-static void cmd_selftest(int argc, char **argv) {
-  (void)argc; (void)argv;
+static void cmd_test_media(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
 
-  printf("This will FORMAT the disk and run full write/read/verify.\n");
+  f12_err_t error = writer_commit();
+  if (error != F12_OK) {
+    printf("Cannot start test: %s\n", f12_strerror(error));
+    return;
+  }
+
+  block_status_t motor_status = floppy_motor_off(&floppy);
+  block_status_t select_status = floppy_select(&floppy, true);
+  if (motor_status != BLOCK_OK || select_status != BLOCK_OK) {
+    drive_status("Motor stop", motor_status);
+    drive_status("Drive select", select_status);
+    drive_idle();
+    return;
+  }
+
+  f12_dir_t stale_dir;
+  error = f12_opendir(&fs, "/", &stale_dir);
+  if (error != F12_OK) {
+    printf("Cannot open stale-handle probe: %s\n", f12_strerror(error));
+    drive_idle();
+    return;
+  }
+
+  uint32_t original_generation = 0;
+  block_status_t generation_status =
+      floppy_media_generation(&floppy, &original_generation);
+  if (generation_status != BLOCK_OK || original_generation == 0) {
+    drive_status("Media generation", generation_status);
+    f12_closedir(&stale_dir);
+    drive_idle();
+    return;
+  }
+
+  printf("Eject the mounted disk, leave the drive empty, then enter y.\n");
   printf("Continue? [y/N] ");
-
-  char line[CMD_BUF_SIZE];
-  cli_readline(line, sizeof(line));
-  if (line[0] != 'y' && line[0] != 'Y') {
-    printf("Cancelled.\n");
+  if (!cli_confirm()) {
+    f12_closedir(&stale_dir);
+    drive_idle();
     return;
   }
-
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-
-  int pass = 0, fail = 0;
-
-  printf("\n--- Phase 1: Mount Existing Disk ---\n");
-  f12_err_t err = do_mount();
-  if (err == F12_OK) {
-    printf("  Existing disk mounted, listing files:\n");
-    f12_dir_t dir;
-    f12_stat_t st;
-    f12_opendir(&fs, "/", &dir);
-    int count = 0;
-    while (f12_readdir(&dir, &st) == F12_OK) {
-      printf("    %-12s %8lu\n", st.name, st.size);
-      count++;
-    }
-    f12_closedir(&dir);
-    printf("  %d files found\n", count);
-    f12_unmount(&fs);
-  } else {
-    printf("  No existing filesystem (%s)\n", f12_strerror(err));
-  }
-
-  printf("\n--- Phase 2: Format ---\n");
-  setup_io();
-  err = f12_format(&fs, "SELFTEST", false);
-  check(err == F12_OK, "format quick", &pass, &fail);
-
-  err = do_mount();
-  check(err == F12_OK, "mount after format", &pass, &fail);
-  if (err != F12_OK) return;
-  mounted = true;
-
-  #define NUM_TEST_FILES 10
-  struct { const char *name; uint32_t size; } tests[NUM_TEST_FILES] = {
-    {"TINY.BIN",   1},
-    {"SMALL.DAT",  100},
-    {"HALF.DAT",   256},
-    {"SECT.DAT",   512},
-    {"MULTI.DAT",  1024},
-    {"MED.DAT",    4096},
-    {"BIG.DAT",    10000},
-    {"LARGE.DAT",  20000},
-    {"HUGE.DAT",   35000},
-    {"MAX.DAT",    50000},
-  };
-
-  printf("\n--- Phase 3: Write %d Test Files ---\n", NUM_TEST_FILES);
-  uint32_t write_bytes = 0;
-  uint32_t write_start = to_ms_since_boot(get_absolute_time());
-  for (int i = 0; i < NUM_TEST_FILES; i++) {
-    fill_pattern(self_buf, i, tests[i].size);
-    f12_file_t *f = f12_open(&fs, tests[i].name, "w");
-    if (!f) {
-      printf("  FAIL: open %s for write: %s\n", tests[i].name, f12_strerror(f12_errno(&fs)));
-      fail++;
-      continue;
-    }
-    uint32_t wrote = f12_write_full(f, self_buf, tests[i].size);
-    f12_err_t cerr = f12_close(f);
-    if (wrote != tests[i].size || cerr != F12_OK) {
-      printf("  FAIL: %s wrote %lu/%lu close=%s\n",
-             tests[i].name, wrote, tests[i].size, f12_strerror(cerr));
-      fail++;
-      continue;
-    }
-    write_bytes += tests[i].size;
-    printf("  wrote %s (%lu bytes)\n", tests[i].name, tests[i].size);
-  }
-  uint32_t write_ms = to_ms_since_boot(get_absolute_time()) - write_start;
-  uint32_t write_bps = write_ms ? (write_bytes * 1000) / write_ms : 0;
-  printf("  Write: %lu bytes in %lu ms = %lu B/s (%lu kbit/s)\n",
-         write_bytes, write_ms, write_bps, (write_bps * 8) / 1000);
-
-  printf("\n--- Phase 4: Read Back & Verify ---\n");
-  uint32_t read_bytes = 0;
-  uint32_t read_start = to_ms_since_boot(get_absolute_time());
-  for (int i = 0; i < NUM_TEST_FILES; i++) {
-    f12_file_t *f = f12_open(&fs, tests[i].name, "r");
-    if (!f) {
-      printf("  FAIL: open %s for read\n", tests[i].name);
-      fail++;
-      continue;
-    }
-    uint32_t got = f12_read_full(f, self_buf, tests[i].size);
-    f12_close(f);
-    read_bytes += got;
-
-    f12_stat_t st;
-    f12_stat(&fs, tests[i].name, &st);
-
-    bool size_ok = (got == tests[i].size && st.size == tests[i].size);
-    bool cksum_ok = (checksum_buf(self_buf, got) == pattern_checksum(i, tests[i].size));
-
-    char tag[64];
-    snprintf(tag, sizeof(tag), "%s size=%lu cksum=0x%08lX",
-             tests[i].name, got, checksum_buf(self_buf, got));
-    check(size_ok && cksum_ok, tag, &pass, &fail);
-  }
-  uint32_t read_ms = to_ms_since_boot(get_absolute_time()) - read_start;
-  uint32_t read_bps = read_ms ? (read_bytes * 1000) / read_ms : 0;
-  printf("  Read: %lu bytes in %lu ms = %lu B/s (%lu kbit/s)\n",
-         read_bytes, read_ms, read_bps, (read_bps * 8) / 1000);
-
-  printf("\n--- Phase 5: Delete 5 Files ---\n");
-  for (int i = 0; i < 5; i++) {
-    err = f12_delete(&fs, tests[i].name);
-    char tag[32];
-    snprintf(tag, sizeof(tag), "delete %s", tests[i].name);
-    check(err == F12_OK, tag, &pass, &fail);
-  }
-  for (int i = 0; i < 5; i++) {
-    f12_stat_t st;
-    err = f12_stat(&fs, tests[i].name, &st);
-    char tag[32];
-    snprintf(tag, sizeof(tag), "%s gone", tests[i].name);
-    check(err == F12_ERR_NOT_FOUND, tag, &pass, &fail);
-  }
-
-  printf("\n--- Phase 6: Write 5 New Files in Freed Space ---\n");
-  struct { const char *name; uint32_t size; } new_files[5] = {
-    {"NEW01.DAT", 500},
-    {"NEW02.DAT", 2048},
-    {"NEW03.DAT", 8000},
-    {"NEW04.DAT", 15000},
-    {"NEW05.DAT", 30000},
-  };
-  for (int i = 0; i < 5; i++) {
-    fill_pattern(self_buf, 100 + i, new_files[i].size);
-    f12_file_t *f = f12_open(&fs, new_files[i].name, "w");
-    if (!f) {
-      printf("  FAIL: open %s for write\n", new_files[i].name);
-      fail++;
-      continue;
-    }
-    uint32_t wrote = f12_write_full(f, self_buf, new_files[i].size);
-    f12_err_t cerr = f12_close(f);
-    if (wrote != new_files[i].size || cerr != F12_OK) {
-      printf("  FAIL: %s wrote %lu/%lu close=%s\n",
-             new_files[i].name, wrote, new_files[i].size, f12_strerror(cerr));
-      fail++;
-      continue;
-    }
-    printf("  wrote %s (%lu bytes)\n", new_files[i].name, new_files[i].size);
-  }
-
-  printf("\n--- Phase 7: Verify ALL Remaining Files ---\n");
-  for (int i = 5; i < NUM_TEST_FILES; i++) {
-    f12_file_t *f = f12_open(&fs, tests[i].name, "r");
-    if (!f) {
-      printf("  FAIL: open %s\n", tests[i].name);
-      fail++;
-      continue;
-    }
-    uint32_t got = f12_read_full(f, self_buf, tests[i].size);
-    f12_close(f);
-    bool ok = (got == tests[i].size) &&
-              (checksum_buf(self_buf, got) == pattern_checksum(i, tests[i].size));
-    char tag[64];
-    snprintf(tag, sizeof(tag), "original %s verified", tests[i].name);
-    check(ok, tag, &pass, &fail);
-  }
-  for (int i = 0; i < 5; i++) {
-    f12_file_t *f = f12_open(&fs, new_files[i].name, "r");
-    if (!f) {
-      printf("  FAIL: open %s\n", new_files[i].name);
-      fail++;
-      continue;
-    }
-    uint32_t got = f12_read_full(f, self_buf, new_files[i].size);
-    f12_close(f);
-    bool ok = (got == new_files[i].size) &&
-              (checksum_buf(self_buf, got) == pattern_checksum(100 + i, new_files[i].size));
-    char tag[64];
-    snprintf(tag, sizeof(tag), "new %s verified", new_files[i].name);
-    check(ok, tag, &pass, &fail);
-  }
-
-  printf("\n--- Phase 8: Read All 2880 Sectors ---\n");
-  int valid_sectors = 0;
-  int invalid_sectors = 0;
-  sector_t sector;
-  uint32_t scan_start = to_ms_since_boot(get_absolute_time());
-
-  for (int track = 0; track < FLOPPY_TRACKS; track++) {
-    for (int side = 0; side < 2; side++) {
-      int track_valid = 0;
-      for (int s = 1; s <= SECTORS_PER_TRACK; s++) {
-        sector.track = track;
-        sector.side = side;
-        sector.sector_n = s;
-        sector.valid = false;
-        floppy_status_t st = floppy_read_sector(&floppy, &sector);
-        if (st == FLOPPY_OK && sector.valid) {
-          valid_sectors++;
-          track_valid++;
-        } else {
-          invalid_sectors++;
-        }
-      }
-      if (track_valid < SECTORS_PER_TRACK)
-        printf("  T%02d/S%d: %d/%d sectors\n", track, side,
-               track_valid, SECTORS_PER_TRACK);
-    }
-    if ((track + 1) % 10 == 0)
-      printf("  ... %d tracks done\n", track + 1);
-  }
-  uint32_t scan_ms = to_ms_since_boot(get_absolute_time()) - scan_start;
-  uint32_t scan_bytes = (uint32_t)valid_sectors * SECTOR_SIZE;
-  uint32_t scan_bps = scan_ms ? (scan_bytes * 1000) / scan_ms : 0;
-  printf("  Valid: %d  Invalid: %d  Total: %d\n",
-         valid_sectors, invalid_sectors, valid_sectors + invalid_sectors);
-  printf("  Scan: %lu bytes in %lu.%01lus = %lu B/s (%lu kbit/s)\n",
-         scan_bytes, scan_ms / 1000, (scan_ms % 1000) / 100,
-         scan_bps, (scan_bps * 8) / 1000);
-  printf("  Industry ref: 500 kbit/s raw, ~62.5 KB/s user data (single sector)\n");
-  printf("  Theoretical max: ~45 KB/s sequential (seek + rotational latency)\n");
-  check(valid_sectors == 2880, "all 2880 sectors readable", &pass, &fail);
-
-  f12_unmount(&fs);
-  mounted = false;
-  #undef NUM_TEST_FILES
-
-  printf("\n=== Throughput Summary ===\n");
-  printf("  File write:  %lu B/s (%lu kbit/s)\n", write_bps, (write_bps * 8) / 1000);
-  printf("  File read:   %lu B/s (%lu kbit/s)\n", read_bps, (read_bps * 8) / 1000);
-  printf("  Full scan:   %lu B/s (%lu kbit/s)\n", scan_bps, (scan_bps * 8) / 1000);
-  printf("  HD raw rate: 62500 B/s (500 kbit/s)\n");
-
-  printf("\n  Results: %d passed, %d failed -- %s\n",
-         pass, fail, fail == 0 ? "ALL PASSED" : "SOME FAILED");
-}
-
-static void cmd_selftest2(int argc, char **argv) {
-  if (argc < 3) {
-    printf("Usage: selftest2 <iterations> <filesize>\n");
-    printf("  selftest2 30 1024    30 rounds of 1KB files\n");
-    printf("  selftest2 10 50000   10 rounds of 50KB files\n");
-    return;
-  }
-
-  int iterations = atoi(argv[1]);
-  int filesize = atoi(argv[2]);
-
-  if (iterations < 1 || iterations > 10000) {
-    printf("Iterations must be 1-10000\n");
-    return;
-  }
-  if (filesize < 1 || filesize > SELF_BUF_SIZE) {
-    printf("File size must be 1-%d\n", SELF_BUF_SIZE);
-    return;
-  }
-
-  printf("Stress test: %d iterations, %d byte files\n", iterations, filesize);
-  printf("This will FORMAT the disk. Continue? [y/N] ");
-
-  char line[CMD_BUF_SIZE];
-  cli_readline(line, sizeof(line));
-  if (line[0] != 'y' && line[0] != 'Y') {
-    printf("Cancelled.\n");
-    return;
-  }
-
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-
-  setup_io();
-  f12_err_t err = f12_format(&fs, "STRESS", false);
-  if (err != F12_OK) {
-    printf("Format failed: %s\n", f12_strerror(err));
-    return;
-  }
-  err = do_mount();
-  if (err != F12_OK) {
-    printf("Mount failed: %s\n", f12_strerror(err));
-    return;
-  }
-  mounted = true;
-  printf("  Formatted and mounted\n");
-
-  struct { const char *name; uint32_t size; int id; } anchors[] = {
-    {"ANCHOR1.DAT", 512, 9000},
-    {"ANCHOR2.DAT", 4096, 9001},
-    {"ANCHOR3.DAT", 10000, 9002},
-  };
-  int num_anchors = 3;
-
-  printf("\n--- Anchor Files ---\n");
-  for (int i = 0; i < num_anchors; i++) {
-    fill_pattern(self_buf, anchors[i].id, anchors[i].size);
-    f12_file_t *f = f12_open(&fs, anchors[i].name, "w");
-    if (!f) {
-      printf("  FATAL: cannot write %s\n", anchors[i].name);
-      return;
-    }
-    uint32_t wrote = f12_write_full(f, self_buf, anchors[i].size);
-    f12_err_t cerr = f12_close(f);
-    if (wrote != anchors[i].size || cerr != F12_OK) {
-      printf("  FATAL: %s write failed\n", anchors[i].name);
-      return;
-    }
-    printf("  %s (%lu bytes)\n", anchors[i].name, anchors[i].size);
-  }
-
-  uint16_t free_cl = count_free_clusters();
-  uint32_t free_bytes = (uint32_t)free_cl * 512;
-  int files_per_round = (free_bytes * 8 / 10) / filesize;
-  if (files_per_round > 200) files_per_round = 200;
-  if (files_per_round < 1) files_per_round = 1;
-
-  printf("  Free: %lu bytes, %d files per round\n\n", free_bytes, files_per_round);
-
-  int total_pass = 0, total_fail = 0;
-  uint32_t total_written = 0, total_verified = 0;
-  uint32_t test_start = to_ms_since_boot(get_absolute_time());
-
-  for (int iter = 0; iter < iterations; iter++) {
-    printf("--- Round %d/%d ---\n", iter + 1, iterations);
-
-    int written_count = 0;
-    uint32_t round_start = to_ms_since_boot(get_absolute_time());
-
-    for (int i = 0; i < files_per_round; i++) {
-      char name[13];
-      snprintf(name, sizeof(name), "T%03d.DAT", i);
-      int file_id = iter * 1000 + i;
-
-      fill_pattern(self_buf, file_id, filesize);
-      f12_file_t *f = f12_open(&fs, name, "w");
-      if (!f) break;
-
-      uint32_t wrote = f12_write_full(f, self_buf, filesize);
-      f12_err_t cerr = f12_close(f);
-      if (wrote != (uint32_t)filesize || cerr != F12_OK) {
-        printf("  write error: %s wrote %lu/%d close=%s\n",
-               name, wrote, filesize, f12_strerror(cerr));
-        break;
-      }
-      written_count++;
-      total_written += filesize;
-    }
-
-    uint32_t write_ms = to_ms_since_boot(get_absolute_time()) - round_start;
-
-    f12_unmount(&fs);
-    mounted = false;
-    err = do_mount();
-    if (err != F12_OK) {
-      printf("  FATAL: remount failed: %s\n", f12_strerror(err));
-      total_fail++;
-      break;
-    }
-    mounted = true;
-
-    int iter_fail = 0;
-
-    for (int i = 0; i < written_count; i++) {
-      char name[13];
-      snprintf(name, sizeof(name), "T%03d.DAT", i);
-      int file_id = iter * 1000 + i;
-
-      f12_file_t *f = f12_open(&fs, name, "r");
-      if (!f) { iter_fail++; printf("  FAIL: open %s\n", name); continue; }
-
-      uint32_t got = f12_read_full(f, self_buf, filesize);
-      f12_close(f);
-      total_verified += got;
-
-      if (got != (uint32_t)filesize ||
-          checksum_buf(self_buf, got) != pattern_checksum(file_id, filesize)) {
-        printf("  FAIL: %s cksum mismatch\n", name);
-        iter_fail++;
-      }
-    }
-
-    for (int i = 0; i < num_anchors; i++) {
-      f12_file_t *f = f12_open(&fs, anchors[i].name, "r");
-      if (!f) { iter_fail++; printf("  FAIL: anchor %s missing\n", anchors[i].name); continue; }
-
-      uint32_t got = f12_read_full(f, self_buf, anchors[i].size);
-      f12_close(f);
-
-      if (got != anchors[i].size ||
-          checksum_buf(self_buf, got) != pattern_checksum(anchors[i].id, anchors[i].size)) {
-        printf("  FAIL: anchor %s corrupted\n", anchors[i].name);
-        iter_fail++;
-      }
-    }
-
-    for (int i = 0; i < written_count; i++) {
-      char name[13];
-      snprintf(name, sizeof(name), "T%03d.DAT", i);
-      f12_delete(&fs, name);
-    }
-
-    if (iter_fail == 0) {
-      total_pass++;
-      printf("  PASS  %d files + %d anchors  write=%lu.%01lus\n",
-             written_count, num_anchors, write_ms / 1000, (write_ms % 1000) / 100);
-    } else {
-      total_fail++;
-      printf("  FAIL  %d errors\n", iter_fail);
-    }
-  }
-
-  uint32_t test_ms = to_ms_since_boot(get_absolute_time()) - test_start;
-
-  printf("\n=== Stress Test Complete ===\n");
-  printf("  Rounds:   %d passed, %d failed\n", total_pass, total_fail);
-  printf("  Written:  %lu bytes total\n", total_written);
-  printf("  Verified: %lu bytes total\n", total_verified);
-  printf("  Duration: %lu.%01lus\n", test_ms / 1000, (test_ms % 1000) / 100);
-  printf("  Result:   %s\n", total_fail == 0 ? "ALL PASSED" : "SOME FAILED");
-
-  f12_unmount(&fs);
-  mounted = false;
-}
-
-static void cmd_selftest3(int argc, char **argv) {
-  int rounds = 6;
-  if (argc > 2) {
-    printf("Usage: selftest3 [rounds]\n");
-    printf("  selftest3      default 6 full-disk overwrite rounds\n");
-    printf("  selftest3 12   run 12 overwrite/remount rounds\n");
-    return;
-  }
-  if (argc == 2) {
-    rounds = atoi(argv[1]);
-    if (rounds < 1 || rounds > 50) {
-      printf("Rounds must be 1-50\n");
-      return;
-    }
-  }
-
-  printf("This will FORMAT the disk and run patch-specific overwrite/buffer tests.\n");
-  printf("It fills the disk, overwrites a file with 0 clusters free, then grows/shrinks it.\n");
-  printf("Continue? [y/N] ");
-
-  char line[CMD_BUF_SIZE];
-  cli_readline(line, sizeof(line));
-  if (line[0] != 'y' && line[0] != 'Y') {
-    printf("Cancelled.\n");
-    return;
-  }
-
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-
-  setup_io();
-  f12_err_t err = f12_format(&fs, "PATCH3", false);
-  if (err != F12_OK) {
-    printf("Format failed: %s\n", f12_strerror(err));
-    return;
-  }
-
-  err = do_mount();
-  if (err != F12_OK) {
-    printf("Mount failed: %s\n", f12_strerror(err));
-    return;
-  }
-  mounted = true;
-  floppy_stats_reset(&floppy);
-
-  const char *byte_name = "BYTEIO.BIN";
-  const char *target_name = "TARGET.BIN";
-  const char *filler_name = "FILLER.BIN";
-  const int byte_id = 3000;
-  const int target_initial_id = 3100;
-  const int filler_id = 3200;
-  const int target_grow_id = 3300;
-  const int target_shrink_id = 3301;
-
-  uint32_t cluster_size = fs_cluster_size();
-  uint32_t byte_size = cluster_size * 8;
-  uint32_t target_size = cluster_size * 8;
-  uint32_t grow_size = cluster_size * 48;
-  uint32_t shrink_size = cluster_size * 3;
-
-  if (byte_size < 2048) byte_size = 2048;
-  if (byte_size > 8192) byte_size = 8192;
-  if (byte_size > SELF_BUF_SIZE) byte_size = SELF_BUF_SIZE;
-
-  if (target_size < 1024) target_size = 1024;
-  if (grow_size <= target_size) grow_size = target_size + cluster_size * 4;
-  if (shrink_size == 0 || shrink_size >= grow_size) shrink_size = cluster_size;
-
-  printf("  Cluster size: %lu bytes\n", cluster_size);
-  printf("  Byte-I/O file: %lu bytes\n", byte_size);
-  printf("  Target file: %lu -> %lu -> %lu bytes\n", target_size, grow_size, shrink_size);
 
   int pass = 0;
   int fail = 0;
-  uint32_t written = 0;
-  uint32_t read_back = 0;
-  f12_err_t close_err = F12_OK;
-  uint32_t t0, elapsed_ms;
-  char tag[96];
+  bool changed = false;
+  block_status_t changed_status = floppy_disk_changed(&floppy, &changed);
+  uint32_t replacement_generation = 0;
+  generation_status = floppy_media_generation(&floppy, &replacement_generation);
+  uint32_t expected_generation = original_generation + 1u;
+  if (expected_generation == 0)
+    expected_generation = 1u;
+  bool generation_changed = generation_status == BLOCK_OK &&
+                            replacement_generation == expected_generation;
+  check(changed_status == BLOCK_OK && changed, "disk-change latch asserted",
+        &pass, &fail);
+  check(generation_changed, "media generation advanced exactly by event", &pass,
+        &fail);
 
-  printf("\n--- Phase 1: Buffered Byte-at-a-Time I/O ---\n");
-  t0 = to_ms_since_boot(get_absolute_time());
-  bool ok = write_pattern_file_chunked(byte_name, byte_id, byte_size, 1, &written, &close_err);
-  elapsed_ms = to_ms_since_boot(get_absolute_time()) - t0;
-  snprintf(tag, sizeof(tag), "%s write 1-byte chunks", byte_name);
-  check(ok && written == byte_size && close_err == F12_OK, tag, &pass, &fail);
-  printf("  write: %lu bytes in %lu ms = %lu B/s\n",
-         written, elapsed_ms, elapsed_ms ? (written * 1000) / elapsed_ms : 0);
+  track_t stale_track = {.cylinder = 0, .head = 0};
+  block_status_t stale_read =
+      floppy_read_track(&floppy, original_generation, &stale_track);
+  check(stale_read == BLOCK_ERR_MEDIA_CHANGED,
+        "stale hardware generation is rejected", &pass, &fail);
 
-  f12_stat_t st;
-  err = f12_stat(&fs, byte_name, &st);
-  snprintf(tag, sizeof(tag), "%s size %lu", byte_name, byte_size);
-  check(err == F12_OK && st.size == byte_size, tag, &pass, &fail);
+  bool mounted = true;
+  f12_err_t state_error = f12_is_mounted(&fs, &mounted);
+  check(state_error == F12_ERR_MEDIA_CHANGED && !mounted,
+        "mounted filesystem observes media change", &pass, &fail);
+  f12_err_t stale_close = f12_closedir(&stale_dir);
+  check(stale_close == F12_ERR_BAD_HANDLE,
+        "stale filesystem handle is invalidated", &pass, &fail);
 
-  t0 = to_ms_since_boot(get_absolute_time());
-  ok = verify_pattern_file_chunked(byte_name, byte_id, byte_size, 1, &read_back);
-  elapsed_ms = to_ms_since_boot(get_absolute_time()) - t0;
-  snprintf(tag, sizeof(tag), "%s read 1-byte chunks", byte_name);
-  check(ok && read_back == byte_size, tag, &pass, &fail);
-  printf("  read:  %lu bytes in %lu ms = %lu B/s\n",
-         read_back, elapsed_ms, elapsed_ms ? (read_back * 1000) / elapsed_ms : 0);
+  if (!generation_changed || state_error != F12_ERR_MEDIA_CHANGED)
+    goto done;
 
-  f12_unmount(&fs);
-  mounted = false;
-  err = do_mount();
-  check(err == F12_OK, "remount after byte I/O phase", &pass, &fail);
-  if (err != F12_OK) goto done;
-  mounted = true;
-
-  printf("\n--- Phase 2: Full-Disk Same-Size Overwrites ---\n");
-  ok = write_pattern_file_chunked(target_name, target_initial_id, target_size, 37, &written, &close_err);
-  check(ok && written == target_size && close_err == F12_OK,
-        "TARGET.BIN initial write", &pass, &fail);
-
-  uint16_t free_before_fill = count_free_clusters();
-  printf("  Free before filler: %u clusters (%lu bytes)\n",
-         free_before_fill, (uint32_t)free_before_fill * cluster_size);
-  check(free_before_fill > 0, "space remains for filler", &pass, &fail);
-
-  uint32_t filler_size = (uint32_t)free_before_fill * cluster_size;
-  ok = write_pattern_file_chunked(filler_name, filler_id, filler_size, 4096, &written, &close_err);
-  check(ok && written == filler_size && close_err == F12_OK,
-        "FILLER.BIN consumes remaining space", &pass, &fail);
-  check(count_free_clusters() == 0, "disk reports 0 free clusters", &pass, &fail);
-  check(verify_pattern_windows(filler_name, filler_id, filler_size),
-        "FILLER.BIN spot-check before overwrite rounds", &pass, &fail);
-
-  for (int round = 0; round < rounds; round++) {
-    int round_id = target_initial_id + 1 + round;
-
-    ok = write_pattern_file_chunked(target_name, round_id, target_size, 37, &written, &close_err);
-    snprintf(tag, sizeof(tag), "round %d same-size overwrite", round + 1);
-    check(ok && written == target_size && close_err == F12_OK, tag, &pass, &fail);
-
-    f12_unmount(&fs);
-    mounted = false;
-    err = do_mount();
-    snprintf(tag, sizeof(tag), "round %d remount", round + 1);
-    check(err == F12_OK, tag, &pass, &fail);
-    if (err != F12_OK) goto done;
-    mounted = true;
-
-    snprintf(tag, sizeof(tag), "round %d target verify", round + 1);
-    check(verify_pattern_file_chunked(target_name, round_id, target_size, 113, NULL),
-          tag, &pass, &fail);
-
-    snprintf(tag, sizeof(tag), "round %d filler spot-check", round + 1);
-    check(verify_pattern_windows(filler_name, filler_id, filler_size),
-          tag, &pass, &fail);
-
-    snprintf(tag, sizeof(tag), "round %d disk still full", round + 1);
-    check(count_free_clusters() == 0, tag, &pass, &fail);
+  printf("Insert another canonical 1.44 MB FAT12 disk, then enter y.\n");
+  printf("Continue? [y/N] ");
+  if (!cli_confirm()) {
+    drive_idle();
+    return;
   }
 
-  check(verify_pattern_file_chunked(filler_name, filler_id, filler_size, 4096, NULL),
-        "FILLER.BIN full verify after overwrite rounds", &pass, &fail);
+  block_status_t home_status = floppy_seek(&floppy, 0);
+  check(home_status == BLOCK_OK, "replacement disk homes successfully", &pass,
+        &fail);
+  changed = true;
+  changed_status = floppy_disk_changed(&floppy, &changed);
+  check(changed_status == BLOCK_OK && !changed,
+        "disk-change latch clears after physical step", &pass, &fail);
+  if (home_status != BLOCK_OK || changed_status != BLOCK_OK || changed)
+    goto done;
 
-  printf("\n--- Phase 2b: Rename With Disk Full ---\n");
-  int last_target_id = target_initial_id + rounds;
-
-  err = f12_rename(&fs, target_name, "RENAMED.BIN");
-  check(err == F12_OK, "rename TARGET.BIN with 0 free clusters", &pass, &fail);
-
-  err = f12_rename(&fs, byte_name, "RENAMED.BIN");
-  check(err == F12_ERR_EXISTS, "rename onto existing name rejected", &pass, &fail);
-
-  f12_unmount(&fs);
-  mounted = false;
-  err = do_mount();
-  check(err == F12_OK, "remount after rename", &pass, &fail);
-  if (err != F12_OK) goto done;
-  mounted = true;
-
-  err = f12_stat(&fs, target_name, &st);
-  check(err == F12_ERR_NOT_FOUND, "old name gone after remount", &pass, &fail);
-  check(verify_pattern_file_chunked("RENAMED.BIN", last_target_id, target_size, 113, NULL),
-        "RENAMED.BIN content after remount", &pass, &fail);
-  check(count_free_clusters() == 0, "disk still full after rename", &pass, &fail);
-
-  err = f12_rename(&fs, "RENAMED.BIN", target_name);
-  check(err == F12_OK, "rename back to TARGET.BIN", &pass, &fail);
-  check(verify_pattern_file_chunked(target_name, last_target_id, target_size, 257, NULL),
-        "TARGET.BIN content after rename back", &pass, &fail);
-
-  printf("\n--- Phase 3: Grow/Shrink Overwrites With Free Space ---\n");
-  err = f12_delete(&fs, filler_name);
-  check(err == F12_OK, "delete FILLER.BIN", &pass, &fail);
-  err = f12_stat(&fs, filler_name, &st);
-  check(err == F12_ERR_NOT_FOUND, "FILLER.BIN removed", &pass, &fail);
-
-  uint16_t free_before_grow = count_free_clusters();
-  printf("  Free after filler delete: %u clusters (%lu bytes)\n",
-         free_before_grow, (uint32_t)free_before_grow * cluster_size);
-  check(free_before_grow > 0, "space returned after filler delete", &pass, &fail);
-
-  ok = write_pattern_file_chunked(target_name, target_grow_id, grow_size, 73, &written, &close_err);
-  check(ok && written == grow_size && close_err == F12_OK,
-        "TARGET.BIN grow overwrite", &pass, &fail);
-
-  f12_unmount(&fs);
-  mounted = false;
-  err = do_mount();
-  check(err == F12_OK, "remount after grow overwrite", &pass, &fail);
-  if (err != F12_OK) goto done;
-  mounted = true;
-
-  err = f12_stat(&fs, target_name, &st);
-  check(err == F12_OK && st.size == grow_size,
-        "TARGET.BIN grow size after remount", &pass, &fail);
-  check(verify_pattern_file_chunked(target_name, target_grow_id, grow_size, 257, NULL),
-        "TARGET.BIN grow content verify", &pass, &fail);
-
-  uint16_t free_after_grow = count_free_clusters();
-  int32_t expected_free_after_grow =
-      (int32_t)free_before_grow + (int32_t)clusters_for_size(target_size) - (int32_t)clusters_for_size(grow_size);
-  snprintf(tag, sizeof(tag), "free clusters after grow = %ld", (long)expected_free_after_grow);
-  check(expected_free_after_grow >= 0 &&
-        free_after_grow == (uint16_t)expected_free_after_grow, tag, &pass, &fail);
-
-  ok = write_pattern_file_chunked(target_name, target_shrink_id, shrink_size, 19, &written, &close_err);
-  check(ok && written == shrink_size && close_err == F12_OK,
-        "TARGET.BIN shrink overwrite", &pass, &fail);
-
-  f12_unmount(&fs);
-  mounted = false;
-  err = do_mount();
-  check(err == F12_OK, "remount after shrink overwrite", &pass, &fail);
-  if (err != F12_OK) goto done;
-  mounted = true;
-
-  err = f12_stat(&fs, target_name, &st);
-  check(err == F12_OK && st.size == shrink_size,
-        "TARGET.BIN shrink size after remount", &pass, &fail);
-  check(verify_pattern_file_chunked(target_name, target_shrink_id, shrink_size, 97, NULL),
-        "TARGET.BIN shrink content verify", &pass, &fail);
-
-  uint16_t free_after_shrink = count_free_clusters();
-  int32_t expected_free_after_shrink =
-      (int32_t)free_after_grow + (int32_t)clusters_for_size(grow_size) - (int32_t)clusters_for_size(shrink_size);
-  snprintf(tag, sizeof(tag), "free clusters after shrink = %ld", (long)expected_free_after_shrink);
-  check(expected_free_after_shrink >= 0 &&
-        free_after_shrink == (uint16_t)expected_free_after_shrink, tag, &pass, &fail);
-
-  printf("\n--- Phase 3b: Truncate To Empty ---\n");
-  ok = write_pattern_file_chunked(target_name, 0, 0, 1, &written, &close_err);
-  check(ok && written == 0 && close_err == F12_OK,
-        "overwrite TARGET.BIN with 0 bytes", &pass, &fail);
-
-  f12_unmount(&fs);
-  mounted = false;
-  err = do_mount();
-  check(err == F12_OK, "remount after truncate", &pass, &fail);
-  if (err != F12_OK) goto done;
-  mounted = true;
-
-  err = f12_stat(&fs, target_name, &st);
-  check(err == F12_OK && st.size == 0, "TARGET.BIN size 0 after remount", &pass, &fail);
-
-  uint16_t free_after_truncate = count_free_clusters();
-  int32_t expected_free_after_truncate =
-      (int32_t)free_after_shrink + (int32_t)clusters_for_size(shrink_size);
-  snprintf(tag, sizeof(tag), "free clusters after truncate = %ld", (long)expected_free_after_truncate);
-  check(free_after_truncate == (uint16_t)expected_free_after_truncate, tag, &pass, &fail);
-
-  check(verify_pattern_file_chunked(byte_name, byte_id, byte_size, 1, NULL),
-        "BYTEIO.BIN still intact at end", &pass, &fail);
+  error = do_mount();
+  check(error == F12_OK, "replacement filesystem mounts", &pass, &fail);
+  if (error == F12_OK) {
+    fat12_fsck_t report;
+    error = f12_fsck(&fs, &report, false);
+    check(error == F12_OK && !fsck_dirty(&report),
+          "replacement filesystem is clean", &pass, &fail);
+  }
 
 done:
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
+  mounted = false;
+  f12_err_t cleanup = f12_is_mounted(&fs, &mounted);
+  if (cleanup == F12_OK && mounted)
+    cleanup = f12_unmount(&fs);
+  if (cleanup != F12_OK) {
+    printf("Filesystem cleanup failed: %s\n", f12_strerror(cleanup));
+    fail++;
   }
+  if (!drive_idle())
+    fail++;
 
-  floppy_stats_t drive_stats = floppy_stats(&floppy);
-  printf("\n--- Drive Stats ---\n");
-  print_drive_stats(&drive_stats);
-
-  printf("\n=== Selftest3 Complete ===\n");
+  printf("\n=== Test-Media Complete ===\n");
   printf("  Checks: %d passed, %d failed\n", pass, fail);
   printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
-}
-
-static void cmd_selftest3_a(int argc, char **argv) {
-  int rounds = 6;
-  if (argc > 2) {
-    printf("Usage: selftest3-a [rounds]\n");
-    printf("  selftest3-a      format + prepare state for reboot-resume test\n");
-    printf("  selftest3-a 10   do 10 full-disk overwrite rounds before reboot\n");
-    return;
-  }
-  if (argc == 2) {
-    rounds = atoi(argv[1]);
-    if (rounds < 1 || rounds > 50) {
-      printf("Rounds must be 1-50\n");
-      return;
-    }
-  }
-
-  printf("This will FORMAT the disk and prepare a reboot-resume patch test.\n");
-  printf("It leaves the disk full and writes a state marker for selftest3-b.\n");
-  printf("Continue? [y/N] ");
-
-  char line[CMD_BUF_SIZE];
-  cli_readline(line, sizeof(line));
-  if (line[0] != 'y' && line[0] != 'Y') {
-    printf("Cancelled.\n");
-    return;
-  }
-
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-
-  setup_io();
-  f12_err_t err = f12_format(&fs, "P3A", false);
-  if (err != F12_OK) {
-    printf("Format failed: %s\n", f12_strerror(err));
-    return;
-  }
-
-  err = do_mount();
-  if (err != F12_OK) {
-    printf("Mount failed: %s\n", f12_strerror(err));
-    return;
-  }
-  mounted = true;
-
-  const int byte_id = 4300;
-  const int target_initial_id = 4400;
-  const int filler_id = 4500;
-
-  uint32_t cluster_size = fs_cluster_size();
-  uint32_t byte_size = cluster_size * 8;
-  uint32_t target_size = cluster_size * 8;
-  if (byte_size < 2048) byte_size = 2048;
-  if (byte_size > 8192) byte_size = 8192;
-  if (byte_size > SELF_BUF_SIZE) byte_size = SELF_BUF_SIZE;
-  if (target_size < 1024) target_size = 1024;
-
-  int pass = 0;
-  int fail = 0;
-  uint32_t written = 0;
-  uint32_t read_back = 0;
-  f12_err_t close_err = F12_OK;
-  char tag[96];
-
-  selftest3_state_t state;
-  memset(&state, 0, sizeof(state));
-  memcpy(state.magic, SELFTEST3_STATE_MAGIC, sizeof(state.magic));
-  state.version = SELFTEST3_STATE_VERSION;
-  state.stage = SELFTEST3_STAGE_A_READY;
-  state.seed = SELFTEST3_RANDOM_SEED;
-  state.byte_id = byte_id;
-  state.byte_size = byte_size;
-  state.target_id = target_initial_id + rounds;
-  state.target_size = target_size;
-  state.filler_id = filler_id;
-  state.filler_size = 0;
-  state.cluster_size = cluster_size;
-  state.rounds_a = (uint32_t)rounds;
-
-  printf("  Cluster size: %lu bytes\n", cluster_size);
-  printf("  Byte-I/O file: %lu bytes\n", byte_size);
-  printf("  Target file: %lu bytes, %d rounds before reboot\n", target_size, rounds);
-
-  printf("\n--- Phase A1: Buffered Byte-at-a-Time I/O ---\n");
-  bool ok = write_pattern_file_chunked(SELFTEST3_BYTE_FILE, byte_id, byte_size, 1, &written, &close_err);
-  check(ok && written == byte_size && close_err == F12_OK,
-        "BYTEIO.BIN write 1-byte chunks", &pass, &fail);
-  check(verify_pattern_file_chunked(SELFTEST3_BYTE_FILE, byte_id, byte_size, 1, &read_back) &&
-        read_back == byte_size,
-        "BYTEIO.BIN read 1-byte chunks", &pass, &fail);
-
-  printf("\n--- Phase A2: Build Full-Disk Resume State ---\n");
-  ok = write_pattern_file_chunked(SELFTEST3_TARGET_FILE, target_initial_id, target_size, 37, &written, &close_err);
-  check(ok && written == target_size && close_err == F12_OK,
-        "TARGET.BIN initial write", &pass, &fail);
-
-  check(selftest3_store_state(&state), "SELF3.STA placeholder write", &pass, &fail);
-
-  uint16_t free_before_fill = count_free_clusters();
-  uint32_t filler_size = (uint32_t)free_before_fill * cluster_size;
-  state.filler_size = filler_size;
-  printf("  Free before filler: %u clusters (%lu bytes)\n",
-         free_before_fill, filler_size);
-  check(free_before_fill > 0, "space remains for filler", &pass, &fail);
-
-  ok = write_pattern_file_chunked(SELFTEST3_FILLER_FILE, filler_id, filler_size, 4096, &written, &close_err);
-  check(ok && written == filler_size && close_err == F12_OK,
-        "FILLER.BIN consumes remaining space", &pass, &fail);
-  check(count_free_clusters() == 0, "disk reports 0 free clusters", &pass, &fail);
-  check(verify_pattern_windows(SELFTEST3_FILLER_FILE, filler_id, filler_size),
-        "FILLER.BIN spot-check before reboot", &pass, &fail);
-
-  int current_target_id = target_initial_id;
-  for (int round = 0; round < rounds; round++) {
-    current_target_id++;
-
-    ok = write_pattern_file_chunked(SELFTEST3_TARGET_FILE, current_target_id, target_size, 37,
-                                    &written, &close_err);
-    snprintf(tag, sizeof(tag), "round %d same-size overwrite", round + 1);
-    check(ok && written == target_size && close_err == F12_OK, tag, &pass, &fail);
-
-    err = selftest3_remount_after_pause(0);
-    snprintf(tag, sizeof(tag), "round %d remount", round + 1);
-    check(err == F12_OK, tag, &pass, &fail);
-    if (err != F12_OK) goto done_a;
-
-    snprintf(tag, sizeof(tag), "round %d target verify", round + 1);
-    check(verify_pattern_file_chunked(SELFTEST3_TARGET_FILE, current_target_id, target_size, 113, NULL),
-          tag, &pass, &fail);
-
-    snprintf(tag, sizeof(tag), "round %d filler spot-check", round + 1);
-    check(verify_pattern_windows(SELFTEST3_FILLER_FILE, filler_id, filler_size),
-          tag, &pass, &fail);
-  }
-
-  state.target_id = (uint32_t)current_target_id;
-  check(selftest3_store_state(&state), "SELF3.STA final write on full disk", &pass, &fail);
-
-  selftest3_state_t verify_state;
-  bool state_ok = selftest3_load_state(&verify_state) &&
-                  verify_state.target_id == state.target_id &&
-                  verify_state.filler_size == state.filler_size &&
-                  verify_state.stage == SELFTEST3_STAGE_A_READY;
-  check(state_ok, "SELF3.STA verify after final write", &pass, &fail);
-
-done_a:
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-  floppy_motor_off(&floppy);
-  floppy_select(&floppy, false);
-
-  printf("\n--- Powercycle ---\n");
-  printf("  Now reboot or power-cycle the Pico.\n");
-  printf("  Then run: selftest3-b\n");
-  printf("  Optional longer soak: selftest3-b 12\n");
-  printf("  The disk should still contain %s, %s, %s, %s.\n",
-         SELFTEST3_BYTE_FILE, SELFTEST3_TARGET_FILE,
-         SELFTEST3_FILLER_FILE, SELFTEST3_STATE_FILE);
-
-  printf("\n=== Selftest3-A Complete ===\n");
-  printf("  Checks: %d passed, %d failed\n", pass, fail);
-  printf("  Result: %s\n", fail == 0 ? "READY FOR POWER CYCLE" : "FAILED");
-}
-
-static void cmd_selftest3_b(int argc, char **argv) {
-  int rounds = 12;
-  if (argc > 2) {
-    printf("Usage: selftest3-b [rounds]\n");
-    printf("  selftest3-b      resume after reboot with 12 randomized overwrite rounds\n");
-    printf("  selftest3-b 20   longer randomized overwrite/remount soak\n");
-    return;
-  }
-  if (argc == 2) {
-    rounds = atoi(argv[1]);
-    if (rounds < 1 || rounds > 100) {
-      printf("Rounds must be 1-100\n");
-      return;
-    }
-  }
-
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-
-  f12_err_t err = do_mount();
-  if (err != F12_OK) {
-    printf("Mount failed: %s\n", f12_strerror(err));
-    printf("Run selftest3-a first on a sacrificial disk.\n");
-    return;
-  }
-  mounted = true;
-
-  selftest3_state_t state;
-  if (!selftest3_load_state(&state)) {
-    printf("State file %s is missing or invalid.\n", SELFTEST3_STATE_FILE);
-    printf("Run selftest3-a first, then reboot, then run selftest3-b.\n");
-    goto done_b;
-  }
-
-  if (state.stage != SELFTEST3_STAGE_A_READY) {
-    printf("State file is not in the expected pre-reboot phase.\n");
-    printf("Current stage: %lu\n", state.stage);
-    goto done_b;
-  }
-
-  printf("Resuming patch test without format.\n");
-  printf("  Cluster size: %lu bytes\n", state.cluster_size);
-  printf("  Target from phase A: id=%lu size=%lu\n", state.target_id, state.target_size);
-  printf("  Filler size: %lu bytes\n", state.filler_size);
-  printf("  Randomized same-size rounds: %d\n", rounds);
-
-  int pass = 0;
-  int fail = 0;
-  char tag[96];
-
-  check(fs_cluster_size() == state.cluster_size, "cluster size matches saved state", &pass, &fail);
-
-  printf("\n--- Phase B1: Verify Post-Reboot State ---\n");
-  {
-    fat12_fsck_t fsck_report;
-    check(f12_fsck(&fs, &fsck_report, false) == F12_OK && !fsck_dirty(&fsck_report),
-          "fsck clean after reboot", &pass, &fail);
-  }
-  check(verify_pattern_file_chunked(SELFTEST3_BYTE_FILE, (int)state.byte_id, state.byte_size, 1, NULL),
-        "BYTEIO.BIN survived reboot", &pass, &fail);
-  check(verify_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)state.target_id, state.target_size, 113, NULL),
-        "TARGET.BIN survived reboot", &pass, &fail);
-  check(verify_pattern_windows(SELFTEST3_FILLER_FILE, (int)state.filler_id, state.filler_size),
-        "FILLER.BIN spot-check after reboot", &pass, &fail);
-  check(count_free_clusters() == 0, "disk still full after reboot", &pass, &fail);
-
-  printf("\n--- Phase B2: Randomized Full-Disk Overwrites ---\n");
-  uint32_t rng = state.seed ^ state.target_id ^ ((uint32_t)rounds * 0x9E3779B9u);
-  uint32_t current_target_id = state.target_id;
-  uint32_t current_target_size = state.target_size;
-  uint32_t current_target_clusters = clusters_for_size(current_target_size);
-
-  for (int round = 0; round < rounds; round++) {
-    uint32_t write_chunk = selftest3_random_chunk(&rng);
-    uint32_t verify_chunk = selftest3_random_chunk(&rng);
-    uint32_t pause_ms = selftest3_random_pause_ms(&rng);
-    uint32_t written = 0;
-    f12_err_t close_err = F12_OK;
-
-    current_target_id++;
-    bool ok = write_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)current_target_id,
-                                         current_target_size, write_chunk,
-                                         &written, &close_err);
-    snprintf(tag, sizeof(tag), "round %d overwrite chunk=%lu", round + 1, write_chunk);
-    check(ok && written == current_target_size && close_err == F12_OK, tag, &pass, &fail);
-
-    err = selftest3_remount_after_pause(pause_ms);
-    snprintf(tag, sizeof(tag), "round %d remount after %lums idle", round + 1, pause_ms);
-    check(err == F12_OK, tag, &pass, &fail);
-    if (err != F12_OK) goto done_b_counts;
-
-    snprintf(tag, sizeof(tag), "round %d target verify chunk=%lu", round + 1, verify_chunk);
-    check(verify_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)current_target_id,
-                                      current_target_size, verify_chunk, NULL),
-          tag, &pass, &fail);
-
-    if (((round + 1) % 4) == 0) {
-      snprintf(tag, sizeof(tag), "round %d filler full verify", round + 1);
-      check(verify_pattern_file_chunked(SELFTEST3_FILLER_FILE, (int)state.filler_id,
-                                        state.filler_size, 4096, NULL),
-            tag, &pass, &fail);
-    } else {
-      snprintf(tag, sizeof(tag), "round %d filler spot-check", round + 1);
-      check(verify_pattern_windows(SELFTEST3_FILLER_FILE, (int)state.filler_id, state.filler_size),
-            tag, &pass, &fail);
-    }
-
-    snprintf(tag, sizeof(tag), "round %d disk still full", round + 1);
-    check(count_free_clusters() == 0, tag, &pass, &fail);
-
-    if (round == 0 || round == rounds - 1) {
-      selftest3_state_t verify_state;
-      snprintf(tag, sizeof(tag), "round %d state file readable", round + 1);
-      check(selftest3_load_state(&verify_state) && verify_state.stage == SELFTEST3_STAGE_A_READY,
-            tag, &pass, &fail);
-    }
-  }
-
-  printf("\n--- Phase B3: Randomized Grow/Shrink Overwrites ---\n");
-  err = f12_delete(&fs, SELFTEST3_FILLER_FILE);
-  check(err == F12_OK, "delete FILLER.BIN", &pass, &fail);
-
-  f12_stat_t st;
-  err = f12_stat(&fs, SELFTEST3_FILLER_FILE, &st);
-  check(err == F12_ERR_NOT_FOUND, "FILLER.BIN removed", &pass, &fail);
-
-  uint32_t free_clusters = count_free_clusters();
-  printf("  Free after filler delete: %lu clusters (%lu bytes)\n",
-         free_clusters, free_clusters * state.cluster_size);
-  check(free_clusters > 0, "space returned after filler delete", &pass, &fail);
-
-  int size_rounds = rounds / 2 + 4;
-  for (int round = 0; round < size_rounds; round++) {
-    uint32_t max_target_clusters = free_clusters + current_target_clusters;
-    if (max_target_clusters > 96) max_target_clusters = 96;
-    if (max_target_clusters == 0) max_target_clusters = 1;
-
-    uint32_t new_size = selftest3_random_target_size(&rng, state.cluster_size,
-                                                     max_target_clusters,
-                                                     current_target_clusters);
-    uint32_t new_clusters = clusters_for_size(new_size);
-    uint32_t write_chunk = selftest3_random_chunk(&rng);
-    uint32_t pause_ms = selftest3_random_pause_ms(&rng);
-    uint32_t written = 0;
-    f12_err_t close_err = F12_OK;
-    int32_t expected_free;
-
-    current_target_id++;
-    bool ok = write_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)current_target_id, new_size,
-                                         write_chunk, &written, &close_err);
-    snprintf(tag, sizeof(tag), "size round %d write %lu bytes chunk=%lu",
-             round + 1, new_size, write_chunk);
-    check(ok && written == new_size && close_err == F12_OK, tag, &pass, &fail);
-
-    err = selftest3_remount_after_pause(pause_ms);
-    snprintf(tag, sizeof(tag), "size round %d remount after %lums idle", round + 1, pause_ms);
-    check(err == F12_OK, tag, &pass, &fail);
-    if (err != F12_OK) goto done_b_counts;
-
-    snprintf(tag, sizeof(tag), "size round %d content verify", round + 1);
-    check(verify_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)current_target_id,
-                                      new_size, selftest3_random_chunk(&rng), NULL),
-          tag, &pass, &fail);
-
-    expected_free = (int32_t)free_clusters + (int32_t)current_target_clusters - (int32_t)new_clusters;
-    free_clusters = count_free_clusters();
-    snprintf(tag, sizeof(tag), "size round %d free clusters = %ld", round + 1, (long)expected_free);
-    check(expected_free >= 0 && free_clusters == (uint32_t)expected_free, tag, &pass, &fail);
-
-    if (((round + 1) % 3) == 0) {
-      snprintf(tag, sizeof(tag), "size round %d BYTEIO.BIN verify", round + 1);
-      check(verify_pattern_file_chunked(SELFTEST3_BYTE_FILE, (int)state.byte_id, state.byte_size, 1, NULL),
-            tag, &pass, &fail);
-    }
-
-    current_target_size = new_size;
-    current_target_clusters = new_clusters;
-  }
-
-  state.stage = SELFTEST3_STAGE_B_DONE;
-  state.seed = rng;
-  state.target_id = current_target_id;
-  state.target_size = current_target_size;
-  state.filler_size = 0;
-  check(selftest3_store_state(&state), "SELF3.STA update after phase B", &pass, &fail);
-
-  selftest3_state_t final_state;
-  bool final_state_ok = selftest3_load_state(&final_state) &&
-                        final_state.stage == SELFTEST3_STAGE_B_DONE &&
-                        final_state.target_id == state.target_id &&
-                        final_state.target_size == state.target_size;
-  check(final_state_ok, "SELF3.STA verify after phase B", &pass, &fail);
-
-  check(verify_pattern_file_chunked(SELFTEST3_BYTE_FILE, (int)state.byte_id, state.byte_size, 1, NULL),
-        "BYTEIO.BIN final verify", &pass, &fail);
-
-done_b_counts:
-  printf("\n=== Selftest3-B Complete ===\n");
-  printf("  Checks: %d passed, %d failed\n", pass, fail);
-  printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
-
-done_b:
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-  floppy_motor_off(&floppy);
-  floppy_select(&floppy, false);
 }
 
 static void cmd_rpm(int argc, char **argv) {
-  (void)argc; (void)argv;
+  (void)argc;
+  (void)argv;
 
-  touch_io_time();
-  floppy_select(&floppy, true);
-  floppy_motor_on(&floppy);
+  if (!drive_status("Drive select", floppy_select(&floppy, true)))
+    return;
+  if (!drive_status("Motor start", floppy_motor_on(&floppy))) {
+    drive_status("Drive deselect", floppy_select(&floppy, false));
+    return;
+  }
 
   printf("  Measuring 5 index periods...\n");
 
   uint32_t periods[5];
   int got = 0;
-  bool prev = gpio_get(floppy.pins.index);
+  bool prev = gpio_get(drive_pins.index);
   absolute_time_t last = {0};
   bool have_last = false;
   absolute_time_t deadline = make_timeout_time_ms(3000);
@@ -2760,9 +2410,9 @@ static void cmd_rpm(int argc, char **argv) {
   while (got < 5) {
     if (absolute_time_diff_us(get_absolute_time(), deadline) <= 0) {
       printf("  TIMEOUT: no index pulses. Disk inserted? Motor spinning?\n");
-      return;
+      goto cleanup;
     }
-    bool now = gpio_get(floppy.pins.index);
+    bool now = gpio_get(drive_pins.index);
     if (now && !prev) {
       absolute_time_t t = get_absolute_time();
       if (have_last) {
@@ -2777,407 +2427,220 @@ static void cmd_rpm(int argc, char **argv) {
   uint32_t sum = 0, min = ~0u, max = 0;
   for (int i = 0; i < 5; i++) {
     sum += periods[i];
-    if (periods[i] < min) min = periods[i];
-    if (periods[i] > max) max = periods[i];
+    if (periods[i] < min)
+      min = periods[i];
+    if (periods[i] > max)
+      max = periods[i];
   }
   uint32_t avg = sum / 5;
   uint32_t rpm_x10 = avg ? 600000000u / avg : 0;
   int32_t dev_pm = avg ? (int32_t)(((int64_t)avg - 200000) * 1000 / 200000) : 0;
   int32_t dev_abs = dev_pm < 0 ? -dev_pm : dev_pm;
 
-  printf("  Period:    avg %lu us (min %lu, max %lu, spread %lu)\n", avg, min, max, max - min);
-  printf("  Speed:     %lu.%lu RPM (nominal 300.0)\n", rpm_x10 / 10, rpm_x10 % 10);
-  printf("  Deviation: %s%ld.%ld%%\n", dev_pm < 0 ? "-" : "+", dev_abs / 10, dev_abs % 10);
+  printf("  Period:    avg %lu us (min %lu, max %lu, spread %lu)\n", avg, min,
+         max, max - min);
+  printf("  Speed:     %lu.%lu RPM (nominal 300.0)\n", rpm_x10 / 10,
+         rpm_x10 % 10);
+  printf("  Deviation: %s%ld.%ld%%\n", dev_pm < 0 ? "-" : "+", dev_abs / 10,
+         dev_abs % 10);
   if (dev_abs > 50) {
-    printf("  WARNING: more than 5%% off nominal -- writes may be unreliable\n");
+    printf(
+        "  WARNING: more than 5%% off nominal -- writes may be unreliable\n");
   } else if (dev_abs > 15) {
     printf("  NOTE: more than 1.5%% off nominal, within decoder tolerance\n");
   } else {
     printf("  Spindle speed OK\n");
   }
-}
 
-static void cmd_selftest4(int argc, char **argv) {
-  (void)argc; (void)argv;
-
-  printf("This will FORMAT the disk and test fsck against an abandoned write and physical FAT corruption.\n");
-  printf("Continue? [y/N] ");
-
-  char line[CMD_BUF_SIZE];
-  cli_readline(line, sizeof(line));
-  if (line[0] != 'y' && line[0] != 'Y') {
-    printf("Cancelled.\n");
-    return;
-  }
-
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-
-  setup_io();
-  f12_err_t err = f12_format(&fs, "FSCKTEST", false);
-  if (err != F12_OK) {
-    printf("Format failed: %s\n", f12_strerror(err));
-    return;
-  }
-  err = do_mount();
-  if (err != F12_OK) {
-    printf("Mount failed: %s\n", f12_strerror(err));
-    return;
-  }
-  mounted = true;
-  floppy_stats_reset(&floppy);
-
-  int pass = 0;
-  int fail = 0;
-  struct { const char *name; uint32_t size; int id; } files[] = {
-    {"KEEP1.BIN", 3000, 8001},
-    {"KEEP2.BIN", 8000, 8002},
-    {"KEEP3.BIN", 20000, 8003},
-  };
-
-  printf("\n--- Phase 1: Baseline Files ---\n");
-  for (int i = 0; i < 3; i++) {
-    uint32_t written = 0;
-    f12_err_t close_err = F12_OK;
-    bool ok = write_pattern_file_chunked(files[i].name, files[i].id, files[i].size,
-                                         512, &written, &close_err);
-    char tag[64];
-    snprintf(tag, sizeof(tag), "write %s", files[i].name);
-    check(ok && written == files[i].size && close_err == F12_OK, tag, &pass, &fail);
-  }
-
-  uint16_t free_before = count_free_clusters();
-  printf("  Free before leak: %u clusters\n", free_before);
-
-  printf("\n--- Phase 2: Simulated Power Cut Mid-Write ---\n");
-  f12_file_t *ghost = f12_open(&fs, "GHOST.BIN", "w");
-  check(ghost != NULL, "open GHOST.BIN for write", &pass, &fail);
-  if (ghost) {
-    fill_pattern(self_buf, 8999, 30000);
-    int n = f12_write(ghost, self_buf, 30000);
-    check(n == 30000, "stream 30000 bytes to disk", &pass, &fail);
-    fat12_abort_write(&fs.fat);
-    ghost->mode = F12_MODE_CLOSED;
-    printf("  power cut simulated: writer abandoned, close never ran\n");
-  }
-
-  printf("\n--- Phase 3: Abandoned Write Leaks Nothing ---\n");
-  fat12_fsck_t report;
-  check(f12_fsck(&fs, &report, false) == F12_OK, "fsck check runs", &pass, &fail);
-  print_fsck_report(&report);
-  check(!fsck_dirty(&report), "no leak after abandoned write", &pass, &fail);
-  check(f12_stat(&fs, "GHOST.BIN", &(f12_stat_t){0}) == F12_ERR_NOT_FOUND,
-        "GHOST.BIN has no dirent", &pass, &fail);
-  check(count_free_clusters() == free_before, "free clusters unchanged", &pass, &fail);
-
-  printf("\n--- Phase 4: Physical FAT Corruption ---\n");
-  f12_unmount(&fs);
-  mounted = false;
-  track_t *t = &fs.fat.write_track;
-  memset(t, 0, sizeof(*t));
-  t->track = 0;
-  t->side = 0;
-  check(floppy_read_track(&floppy, t) == FLOPPY_OK, "read FAT track from media", &pass, &fail);
-  t->sectors[1].data[150] = 0x65;
-  t->sectors[1].data[151] = 0xF0;
-  t->sectors[1].data[152] = 0xFF;
-  check(floppy_write_track(&floppy, t) == FLOPPY_OK,
-        "write orphan chain 100->101->EOF into FAT1 on media", &pass, &fail);
-
-  err = do_mount();
-  check(err == F12_OK, "remount damaged disk", &pass, &fail);
-  if (err != F12_OK) return;
-  mounted = true;
-
-  printf("\n--- Phase 5: Detect ---\n");
-  check(f12_fsck(&fs, &report, false) == F12_OK, "fsck check runs", &pass, &fail);
-  print_fsck_report(&report);
-  check(report.lost_clusters == 2, "orphan chain detected on real media", &pass, &fail);
-  check(report.fat_mismatch, "FAT copy mismatch detected", &pass, &fail);
-  check(report.freed == 0, "check mode modifies nothing", &pass, &fail);
-
-  printf("\n--- Phase 6: Repair ---\n");
-  check(f12_fsck(&fs, &report, true) == F12_OK && report.freed == 2,
-        "fsck fix frees the orphan chain", &pass, &fail);
-  check(report.repaired_fat2, "FAT2 rewritten from FAT1", &pass, &fail);
-  check(f12_fsck(&fs, &report, false) == F12_OK && !fsck_dirty(&report),
-        "fsck clean after fix", &pass, &fail);
-  check(count_free_clusters() == free_before, "free clusters fully restored", &pass, &fail);
-
-  printf("\n--- Phase 7: Survivors Intact After Remount ---\n");
-  f12_unmount(&fs);
-  mounted = false;
-  err = do_mount();
-  check(err == F12_OK, "remount", &pass, &fail);
-  if (err == F12_OK) {
-    mounted = true;
-    check(f12_fsck(&fs, &report, false) == F12_OK && !fsck_dirty(&report),
-          "fsck clean after remount", &pass, &fail);
-    for (int i = 0; i < 3; i++) {
-      char tag[64];
-      snprintf(tag, sizeof(tag), "verify %s", files[i].name);
-      check(verify_pattern_file_chunked(files[i].name, files[i].id, files[i].size, 512, NULL),
-            tag, &pass, &fail);
-    }
-  }
-
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-
-  floppy_stats_t drive_stats = floppy_stats(&floppy);
-  printf("\n--- Drive Stats ---\n");
-  print_drive_stats(&drive_stats);
-
-  printf("\n=== Selftest4 Complete ===\n");
-  printf("  Checks: %d passed, %d failed\n", pass, fail);
-  printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
+cleanup:
+  drive_idle();
 }
 
 static void cmd_crashtest(int argc, char **argv) {
-  (void)argc; (void)argv;
+  (void)argc;
+  (void)argv;
 
-  printf("This will FORMAT the disk, then overwrite TARGET.BIN forever.\n");
-  printf("PULL THE POWER mid-write whenever you like, then reboot and run 'crashcheck'.\n");
+  printf("This will format the disk and overwrite TARGET.BIN until power is "
+         "cut.\n");
   printf("Continue? [y/N] ");
 
-  char line[CMD_BUF_SIZE];
-  cli_readline(line, sizeof(line));
-  if (line[0] != 'y' && line[0] != 'Y') {
-    printf("Cancelled.\n");
+  if (!cli_confirm())
+    return;
+
+  f12_err_t unmount_error = unmount_filesystem();
+  if (unmount_error != F12_OK) {
+    printf("Cannot start test: %s\n", f12_strerror(unmount_error));
     return;
   }
 
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-
-  setup_io();
-  f12_err_t err = f12_format(&fs, "CRASH", false);
-  if (err != F12_OK) {
-    printf("Format failed: %s\n", f12_strerror(err));
+  f12_err_t error = do_format("CRASH", false);
+  if (error != F12_OK) {
+    printf("Format failed: %s\n", f12_strerror(error));
     return;
   }
-  err = do_mount();
-  if (err != F12_OK) {
-    printf("Mount failed: %s\n", f12_strerror(err));
+  error = do_mount();
+  if (error != F12_OK) {
+    printf("Mount failed: %s\n", f12_strerror(error));
     return;
   }
-  mounted = true;
 
-  selftest3_state_t state;
+  crash_state_t state;
   memset(&state, 0, sizeof(state));
-  memcpy(state.magic, SELFTEST3_STATE_MAGIC, sizeof(state.magic));
-  state.version = SELFTEST3_STATE_VERSION;
-  state.stage = SELFTEST3_STAGE_CRASH_READY;
-  state.byte_id = 9000;
-  state.byte_size = 4096;
-  state.target_id = 9200;
-  state.target_size = 16384;
+  memcpy(state.magic, CRASH_STATE_MAGIC, sizeof(state.magic));
+  state.version = CRASH_STATE_VERSION;
+  state.stable_id = 9000;
+  state.stable_size = 8u * DISK_SECTOR_SIZE;
+  state.target_old_id = 9200;
+  state.target_new_id = 9201;
+  state.target_size = 32u * DISK_SECTOR_SIZE;
   state.filler_id = 9100;
-  state.cluster_size = fs_cluster_size();
 
   uint32_t written = 0;
-  f12_err_t close_err = F12_OK;
-  if (!write_pattern_file_chunked(SELFTEST3_BYTE_FILE, (int)state.byte_id, state.byte_size,
-                                  512, &written, &close_err) ||
-      written != state.byte_size || close_err != F12_OK) {
-    printf("BYTEIO.BIN write failed\n");
-    goto out;
+  f12_err_t close_error = F12_OK;
+  if (!write_pattern_file_chunked(CRASH_STABLE_FILE, state.stable_id,
+                                  state.stable_size, DISK_SECTOR_SIZE, &written,
+                                  &close_error) ||
+      written != state.stable_size) {
+    printf("Stable-file write failed: %s\n", f12_strerror(close_error));
+    goto cleanup;
+  }
+  if (!write_pattern_file_chunked(CRASH_TARGET_FILE, state.target_old_id,
+                                  state.target_size, DISK_SECTOR_SIZE, &written,
+                                  &close_error) ||
+      written != state.target_size) {
+    printf("Baseline target write failed: %s\n", f12_strerror(close_error));
+    goto cleanup;
   }
 
-  uint16_t free_cl = count_free_clusters();
-  if (free_cl <= 64) {
-    printf("Not enough free space\n");
-    goto out;
+  uint16_t available = 0;
+  error = f12_free_count(&fs, &available);
+  uint32_t target_clusters =
+      (state.target_size + CLUSTER_SIZE - 1u) / CLUSTER_SIZE;
+  if (error != F12_OK) {
+    printf("Free-space query failed: %s\n", f12_strerror(error));
+    goto cleanup;
   }
-  state.filler_size = (uint32_t)(free_cl - 64) * state.cluster_size;
-  if (!write_pattern_file_chunked(SELFTEST3_FILLER_FILE, (int)state.filler_id, state.filler_size,
-                                  4096, &written, &close_err) ||
-      written != state.filler_size || close_err != F12_OK) {
-    printf("FILLER.BIN write failed\n");
-    goto out;
+  if (available <= target_clusters + 1u) {
+    printf("Disk has %u free clusters; the test requires more than %lu.\n",
+           available, (unsigned long)(target_clusters + 1u));
+    goto cleanup;
+  }
+  state.filler_size =
+      ((uint32_t)available - target_clusters - 1u) * CLUSTER_SIZE;
+  if (!crash_state_store(&state)) {
+    printf("Crash-state write failed.\n");
+    goto cleanup;
+  }
+  if (!write_pattern_file_chunked(CRASH_FILLER_FILE, state.filler_id,
+                                  state.filler_size, 8u * DISK_SECTOR_SIZE,
+                                  &written, &close_error) ||
+      written != state.filler_size) {
+    printf("Filler write failed: %s\n", f12_strerror(close_error));
+    goto cleanup;
   }
 
-  if (!selftest3_store_state(&state)) {
-    printf("State file write failed\n");
-    goto out;
-  }
-
-  printf("  Prepared: BYTEIO.BIN (%lu), FILLER.BIN (%lu), 64 clusters free\n",
-         state.byte_size, state.filler_size);
-  printf("  Overwriting TARGET.BIN (%lu bytes) forever.\n", state.target_size);
-  printf("  PULL POWER ANYTIME. Any key aborts cleanly.\n\n");
+  printf("Prepared stable=%lu, target=%lu, filler=%lu bytes.\n",
+         (unsigned long)state.stable_size, (unsigned long)state.target_size,
+         (unsigned long)state.filler_size);
+  printf("Pull power during an overwrite. Press any key after a completed "
+         "round to stop.\n");
 
   for (uint32_t round = 1;; round++) {
-    bool ok = write_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)state.target_id,
-                                         state.target_size, 512, &written, &close_err);
-    if (!ok || written != state.target_size || close_err != F12_OK) {
-      printf("  round %lu: write failed (%s)\n", round, f12_strerror(close_err));
-      goto out;
+    uint32_t pattern = (round & 1u) ? state.target_new_id : state.target_old_id;
+    bool ok = write_pattern_file_chunked(CRASH_TARGET_FILE, pattern,
+                                         state.target_size, DISK_SECTOR_SIZE,
+                                         &written, &close_error);
+    if (!ok || written != state.target_size) {
+      printf("Round %lu failed: %s\n", (unsigned long)round,
+             f12_strerror(close_error));
+      goto cleanup;
     }
-    printf("  round %lu done -- pull power now or any key to abort\n", round);
-
+    printf("Round %lu committed.\n", (unsigned long)round);
     if (getchar_timeout_us(0) != PICO_ERROR_TIMEOUT) {
-      printf("  Aborted cleanly. Run 'crashcheck' anyway to confirm clean state.\n");
-      goto out;
+      printf("Stopped after a complete commit.\n");
+      goto cleanup;
     }
   }
 
-out:
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-  floppy_motor_off(&floppy);
-  floppy_select(&floppy, false);
+cleanup:
+  error = unmount_filesystem();
+  if (error != F12_OK)
+    printf("Filesystem cleanup failed: %s\n", f12_strerror(error));
+  drive_idle();
 }
 
 static void cmd_crashcheck(int argc, char **argv) {
-  (void)argc; (void)argv;
+  (void)argc;
+  (void)argv;
 
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
+  f12_err_t unmount_error = unmount_filesystem();
+  if (unmount_error != F12_OK) {
+    printf("Cannot remount: %s\n", f12_strerror(unmount_error));
+    return;
   }
 
   int pass = 0;
   int fail = 0;
-
-  printf("\n--- Phase 1: Mount After Crash ---\n");
-  f12_err_t err = do_mount();
-  check(err == F12_OK, "disk mounts after power cut", &pass, &fail);
-  if (err != F12_OK) {
+  f12_err_t cleanup_error;
+  f12_err_t error = do_mount();
+  check(error == F12_OK, "disk mounts after power cut", &pass, &fail);
+  if (error != F12_OK) {
     printf("Run 'crashtest' first.\n");
-    return;
-  }
-  mounted = true;
-
-  selftest3_state_t state;
-  if (!selftest3_load_state(&state) || state.stage != SELFTEST3_STAGE_CRASH_READY) {
-    printf("No crashtest state on this disk. Run 'crashtest' first.\n");
-    goto out;
+    goto cleanup;
   }
 
-  printf("\n--- Phase 2: Damage Report ---\n");
+  crash_state_t state;
+  bool state_valid = crash_state_load(&state);
+  check(state_valid, "crash state is exact and checksummed", &pass, &fail);
+  if (!state_valid)
+    goto cleanup;
+
   fat12_fsck_t report;
-  check(f12_fsck(&fs, &report, false) == F12_OK, "fsck check runs", &pass, &fail);
+  error = f12_fsck(&fs, &report, false);
+  check(error == F12_OK, "fsck check completes", &pass, &fail);
+  if (error != F12_OK)
+    goto cleanup;
   print_fsck_report(&report);
-  if (fsck_dirty(&report)) {
-    printf("  Power cut landed mid-write: filesystem dirty (expected)\n");
-  } else {
-    printf("  Power cut landed between writes: filesystem already clean\n");
+
+  error = f12_fsck(&fs, &report, true);
+  check(error == F12_OK, "fsck repair completes", &pass, &fail);
+  if (error != F12_OK)
+    goto cleanup;
+  error = f12_fsck(&fs, &report, false);
+  check(error == F12_OK && !fsck_dirty(&report), "fsck repair converges", &pass,
+        &fail);
+  if (error != F12_OK || fsck_dirty(&report))
+    goto cleanup;
+
+  check(verify_pattern_file_chunked(CRASH_STABLE_FILE, state.stable_id,
+                                    state.stable_size, DISK_SECTOR_SIZE, NULL),
+        "stable file is exact", &pass, &fail);
+  check(verify_pattern_file_chunked(CRASH_FILLER_FILE, state.filler_id,
+                                    state.filler_size, 8u * DISK_SECTOR_SIZE,
+                                    NULL),
+        "filler file is exact", &pass, &fail);
+
+  bool old_exact =
+      verify_pattern_file_chunked(CRASH_TARGET_FILE, state.target_old_id,
+                                  state.target_size, DISK_SECTOR_SIZE, NULL);
+  bool new_exact =
+      verify_pattern_file_chunked(CRASH_TARGET_FILE, state.target_new_id,
+                                  state.target_size, DISK_SECTOR_SIZE, NULL);
+  check(old_exact != new_exact, "target is exactly one recorded generation",
+        &pass, &fail);
+
+cleanup:
+  cleanup_error = unmount_filesystem();
+  if (cleanup_error != F12_OK) {
+    printf("Filesystem cleanup failed: %s\n", f12_strerror(cleanup_error));
+    fail++;
   }
-
-  printf("\n--- Phase 3: Repair And Converge ---\n");
-  check(f12_fsck(&fs, &report, true) == F12_OK, "fsck fix runs", &pass, &fail);
-  check(f12_fsck(&fs, &report, false) == F12_OK && !fsck_dirty(&report),
-        "fsck clean after fix", &pass, &fail);
-
-  printf("\n--- Phase 4: Stable Files Survived ---\n");
-  check(verify_pattern_file_chunked(SELFTEST3_BYTE_FILE, (int)state.byte_id,
-                                    state.byte_size, 512, NULL),
-        "BYTEIO.BIN intact", &pass, &fail);
-  check(verify_pattern_file_chunked(SELFTEST3_FILLER_FILE, (int)state.filler_id,
-                                    state.filler_size, 4096, NULL),
-        "FILLER.BIN intact", &pass, &fail);
-
-  printf("\n--- Phase 5: Crash Victim ---\n");
-  if (verify_pattern_file_chunked(SELFTEST3_TARGET_FILE, (int)state.target_id,
-                                  state.target_size, 512, NULL)) {
-    check(true, "TARGET.BIN intact (old content preserved through crash)", &pass, &fail);
-  } else {
-    printf("  TARGET.BIN damaged: cut landed in the dirent commit window\n");
-    printf("  (rare and expected occasionally; stable files above are the real test)\n");
-  }
-
-out:
-  if (mounted) {
-    f12_unmount(&fs);
-    mounted = false;
-  }
-  floppy_motor_off(&floppy);
-  floppy_select(&floppy, false);
+  if (!drive_idle())
+    fail++;
 
   printf("\n=== Crashcheck Complete ===\n");
   printf("  Checks: %d passed, %d failed\n", pass, fail);
   printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
-}
-
-static void floppy_play_note(uint16_t freq, uint16_t ms) {
-  if (freq == 0) {
-    sleep_ms(ms);
-    return;
-  }
-  uint32_t period = 1000000 / freq;
-  uint32_t end = to_ms_since_boot(get_absolute_time()) + ms;
-  uint8_t pos = floppy.track;
-  bool inward = (pos < 40);
-
-  while (to_ms_since_boot(get_absolute_time()) < end) {
-    if (pos >= 78) inward = false;
-    if (pos <= 1) inward = true;
-
-    floppy_pin_oc(floppy.pins.direction, inward ? 0 : 1);
-    floppy_pin_oc(floppy.pins.step, 0);
-    sleep_us(1);
-    floppy_pin_oc(floppy.pins.step, 1);
-
-    if (inward) pos++; else pos--;
-
-    uint32_t delay = period > 5 ? period - 5 : 1;
-    sleep_us(delay);
-  }
-  floppy.track = pos;
-}
-
-static const struct { uint16_t freq; uint16_t ms; } imperial_march[] = {
-  {392, 550}, {0, 30}, {392, 550}, {0, 30}, {392, 550}, {0, 30},
-  {311, 412}, {466, 138}, {0, 30},
-  {392, 550}, {0, 30},
-  {311, 412}, {466, 138}, {0, 30},
-  {392, 1100}, {0, 80},
-
-  {587, 550}, {0, 30}, {587, 550}, {0, 30}, {587, 550}, {0, 30},
-  {622, 412}, {466, 138}, {0, 30},
-  {370, 550}, {0, 30},
-  {311, 412}, {466, 138}, {0, 30},
-  {392, 1100}, {0, 80},
-
-  {784, 550}, {0, 30}, {392, 412}, {392, 138}, {0, 30},
-  {784, 550}, {0, 30},
-  {740, 412}, {698, 138}, {659, 138}, {622, 138},
-  {659, 275}, {0, 138},
-  {415, 275}, {587, 550}, {0, 30},
-  {554, 412}, {523, 138}, {466, 138}, {440, 138},
-  {466, 275}, {0, 138},
-  {311, 275}, {370, 550}, {0, 30},
-  {311, 412}, {370, 138},
-  {466, 550}, {0, 30}, {392, 412}, {466, 138},
-  {587, 1100},
-
-  {0, 0}
-};
-
-static void cmd_starwars(int argc, char **argv) {
-  (void)argc; (void)argv;
-
-  floppy_select(&floppy, true);
-  floppy_motor_on(&floppy);
-  floppy_seek(&floppy, 40);
-
-  printf("  Playing Imperial March...\n");
-
-  for (int i = 0; imperial_march[i].freq || imperial_march[i].ms; i++) {
-    floppy_play_note(imperial_march[i].freq, imperial_march[i].ms);
-  }
-
-  floppy.track0_confirmed = false;
-  printf("  Done.\n");
 }
 
 static diskdump_stats_t run_diskdump(bool verbose) {
@@ -3186,31 +2649,34 @@ static diskdump_stats_t run_diskdump(bool verbose) {
 
   int total_valid = 0;
   int total_invalid = 0;
-  uint32_t disk_checksum = 0;
-  sector_t sector;
+  uint32_t disk_checksum = 5381u;
+  uint8_t sector[DISK_SECTOR_SIZE];
+  uint32_t generation;
+  if (!drive_generation(&generation))
+    return stats;
 
-  floppy_stats_reset(&floppy);
+  if (!drive_status("Statistics reset", floppy_stats_reset(&floppy))) {
+    return stats;
+  }
 
   if (verbose) {
     printf("  %-8s %-6s %-10s %-10s\n", "TRACK", "SIDE", "DECODED", "ERRORS");
     printf("  %-8s %-6s %-10s %-10s\n", "-----", "----", "-------", "------");
   }
 
-  for (int track = 0; track < FLOPPY_TRACKS; track++) {
-    for (int side = 0; side < 2; side++) {
+  for (uint8_t track = 0; track < DISK_CYLINDERS; track++) {
+    for (uint8_t side = 0; side < DISK_HEADS; side++) {
       int decoded = 0;
       int errors = 0;
 
-      for (int s = 1; s <= SECTORS_PER_TRACK; s++) {
-        sector.track = track;
-        sector.side = side;
-        sector.sector_n = s;
-        sector.valid = false;
-
-        floppy_status_t st = floppy_read_sector(&floppy, &sector);
-        if (st == FLOPPY_OK && sector.valid) {
+      for (uint8_t sector_number = 0; sector_number < DISK_SECTORS_PER_TRACK;
+           sector_number++) {
+        block_status_t status = floppy_read_sector(&floppy, generation, track,
+                                                   side, sector_number, sector);
+        if (status == BLOCK_OK) {
           decoded++;
-          disk_checksum ^= checksum_buf(sector.data, SECTOR_SIZE);
+          disk_checksum =
+              checksum_extend(disk_checksum, sector, DISK_SECTOR_SIZE);
         } else {
           errors++;
         }
@@ -3219,9 +2685,9 @@ static diskdump_stats_t run_diskdump(bool verbose) {
       total_valid += decoded;
       total_invalid += errors;
 
-      if (verbose || decoded != SECTORS_PER_TRACK || errors != 0) {
-        printf("  T%02d      %d      %2d/%-2d      %d\n",
-               track, side, decoded, SECTORS_PER_TRACK, errors);
+      if (verbose || decoded != DISK_SECTORS_PER_TRACK || errors != 0) {
+        printf("  T%02u      %u      %2d/%-2u      %d\n", track, side, decoded,
+               DISK_SECTORS_PER_TRACK, errors);
       }
     }
   }
@@ -3229,9 +2695,12 @@ static diskdump_stats_t run_diskdump(bool verbose) {
   stats.total_valid = total_valid;
   stats.total_invalid = total_invalid;
   stats.checksum = disk_checksum;
-  stats.retries = floppy_stats(&floppy);
+  if (!drive_status("Statistics query",
+                    floppy_stats(&floppy, &stats.retries))) {
+    stats.total_invalid++;
+  }
 
-  printf("\n  Total decoded: %d / 2880\n", total_valid);
+  printf("\n  Total decoded: %d / %u\n", total_valid, DISK_SECTOR_COUNT);
   printf("  Errors:        %d\n", total_invalid);
   printf("  Disk checksum: 0x%08lX\n", disk_checksum);
   print_drive_stats(&stats.retries);
@@ -3241,137 +2710,184 @@ static diskdump_stats_t run_diskdump(bool verbose) {
 
 static void cmd_diskdump(int argc, char **argv) {
   bool verbose = true;
-  if (argc >= 2 && strcasecmp(argv[1], "quiet") == 0) {
+  if (argc == 2) {
+    if (!text_equal_case(argv[1], "quiet")) {
+      printf("Disk-dump mode must be 'quiet'.\n");
+      return;
+    }
     verbose = false;
   }
   run_diskdump(verbose);
 }
 
 static void cmd_mfmscan(int argc, char **argv) {
-  (void)argc; (void)argv;
+  (void)argc;
+  (void)argv;
 
   track_stats_t stats;
 
-  struct { int track; int side; const char *label; } targets[] = {
-    {0,  0, "Track 0 (outermost)"},
-    {39, 0, "Track 39 (mid-outer)"},
-    {79, 0, "Track 79 (innermost)"},
+  struct {
+    uint8_t track;
+    uint8_t side;
+    const char *label;
+  } targets[] = {
+      {0, 0, "outermost"},
+      {(DISK_CYLINDERS / 2u) - 1u, 0, "middle"},
+      {DISK_CYLINDERS - 1u, 0, "innermost"},
   };
 
-  for (int t = 0; t < 3; t++) {
-    printf("\n  === %s ===\n", targets[t].label);
+  for (size_t t = 0; t < sizeof(targets) / sizeof(targets[0]); t++) {
+    printf("\n  === %s cylinder %u ===\n", targets[t].label, targets[t].track);
     read_track_stats(targets[t].track, targets[t].side, &stats);
 
     printf("    Pulses:   %lu total\n", stats.total_pulses);
     printf("    Short:    %lu (%.1f%%)\n", stats.short_count,
-           stats.total_pulses ? stats.short_count * 100.0 / stats.total_pulses : 0);
+           stats.total_pulses ? stats.short_count * 100.0 / stats.total_pulses
+                              : 0);
     printf("    Medium:   %lu (%.1f%%)\n", stats.medium_count,
-           stats.total_pulses ? stats.medium_count * 100.0 / stats.total_pulses : 0);
+           stats.total_pulses ? stats.medium_count * 100.0 / stats.total_pulses
+                              : 0);
     printf("    Long:     %lu (%.1f%%)\n", stats.long_count,
-           stats.total_pulses ? stats.long_count * 100.0 / stats.total_pulses : 0);
+           stats.total_pulses ? stats.long_count * 100.0 / stats.total_pulses
+                              : 0);
     printf("    Invalid:  %lu (%.1f%%)\n", stats.invalid_count,
-           stats.total_pulses ? stats.invalid_count * 100.0 / stats.total_pulses : 0);
+           stats.total_pulses ? stats.invalid_count * 100.0 / stats.total_pulses
+                              : 0);
     printf("    Syncs:    %lu\n", stats.syncs);
     printf("    Records:  %lu\n", stats.sector_records);
-    printf("    Unique:   %lu / %d\n", stats.unique_sectors, SECTORS_PER_TRACK);
+    printf("    Unique:   %lu / %d\n", stats.unique_sectors,
+           DISK_SECTORS_PER_TRACK);
     printf("    CRC err:  %lu\n", stats.crc_errors);
     printf("    Adaptive: T2_max=%d  T3_max=%d\n", stats.T2_max, stats.T3_max);
     print_histogram(&stats);
   }
 
   printf("\n  === Per-Track Summary (side 0) ===\n");
-  printf("  %-6s %-8s %-8s %-8s %-8s %-5s %-5s %-5s\n",
-         "TRACK", "SHORT", "MEDIUM", "LONG", "INVALID", "UNIQ", "REC", "CRC");
-  printf("  %-6s %-8s %-8s %-8s %-8s %-5s %-5s %-5s\n",
-         "-----", "------", "------", "------", "-------", "----", "---", "---");
+  printf("  %-6s %-8s %-8s %-8s %-8s %-5s %-5s %-5s\n", "TRACK", "SHORT",
+         "MEDIUM", "LONG", "INVALID", "UNIQ", "REC", "CRC");
+  printf("  %-6s %-8s %-8s %-8s %-8s %-5s %-5s %-5s\n", "-----", "------",
+         "------", "------", "-------", "----", "---", "---");
 
-  int total_sectors = 0;
-  int total_crc = 0;
+  uint32_t total_sectors = 0;
+  uint32_t total_crc = 0;
 
-  for (int track = 0; track < FLOPPY_TRACKS; track++) {
+  for (uint8_t track = 0; track < DISK_CYLINDERS; track++) {
     read_track_stats(track, 0, &stats);
-    printf("  T%02d    %-8lu %-8lu %-8lu %-8lu %-5lu %-5lu %-5lu\n",
-           track, stats.short_count, stats.medium_count,
-           stats.long_count, stats.invalid_count,
-           stats.unique_sectors, stats.sector_records, stats.crc_errors);
+    printf("  T%02u    %-8lu %-8lu %-8lu %-8lu %-5lu %-5lu %-5lu\n", track,
+           stats.short_count, stats.medium_count, stats.long_count,
+           stats.invalid_count, stats.unique_sectors, stats.sector_records,
+           stats.crc_errors);
     total_sectors += stats.unique_sectors;
     total_crc += stats.crc_errors;
   }
 
-  printf("\n  Side 0 total: %d unique sectors decoded, %d CRC errors\n", total_sectors, total_crc);
+  printf("\n  Head 0 total: %lu unique sectors decoded, %lu CRC errors\n",
+         (unsigned long)total_sectors, (unsigned long)total_crc);
 }
 
 static void cmd_version(int argc, char **argv) {
-  (void)argc; (void)argv;
-#if PICO_RP2040
+  (void)argc;
+  (void)argv;
+#if defined(PICO_RP2040) && PICO_RP2040
   const char *board = "RP2040 (Pico)";
-#else
+#elif defined(PICO_RP2350) && PICO_RP2350
   const char *board = "RP2350 (Pico 2)";
+#else
+#error unsupported Raspberry Pi silicon
 #endif
   printf("Pico Floppy %s\n", FW_VERSION);
-  printf("  build:     %s %s\n", __DATE__, __TIME__);
   printf("  board:     %s\n", board);
-  printf("  sys clock: %lu MHz\n", (unsigned long)(clock_get_hz(clk_sys) / 1000000));
+  printf("  sys clock: %lu MHz\n",
+         (unsigned long)(clock_get_hz(clk_sys) / 1000000));
 }
 
 static void cmd_reboot(int argc, char **argv) {
-  (void)argc; (void)argv;
+  (void)argc;
+  (void)argv;
+  f12_err_t error = unmount_filesystem();
+  if (error != F12_OK) {
+    printf("Reboot refused: %s\n", f12_strerror(error));
+    return;
+  }
+  block_status_t drive_error = floppy_deinit(&floppy);
+  if (drive_error != BLOCK_OK) {
+    printf("Reboot refused: %s\n", block_status_text(drive_error));
+    return;
+  }
   printf("Rebooting...\n");
   sleep_ms(100);
   watchdog_reboot(0, 0, 0);
-  for (;;) tight_loop_contents();
+  for (;;)
+    tight_loop_contents();
 }
 
-// ============== Main ==============
-
 int main(void) {
-#if PICO_RP2040
-  // Overclock to 144MHz so PIO dividers are exact integers:
-  // read PIO: 144/72 = 2.0, write PIO: 144/24 = 6.0
-  // Avoids massive jitter from fractional divider with div_int=1
-  set_sys_clock_khz(144000, true);
+#if defined(PICO_RP2040) && PICO_RP2040
+  const uint32_t target_clock_khz = 72000u;
+#elif defined(PICO_RP2350) && PICO_RP2350
+  const uint32_t target_clock_khz = 144000u;
+#else
+#error unsupported Raspberry Pi silicon
 #endif
+  bool clock_ready = set_sys_clock_khz(target_clock_khz, true);
   stdio_init_all();
   sleep_ms(2000);
 
   printf("\r\n\r\n=== Pico Floppy Shell ===\r\n");
+  if (!clock_ready || clock_get_hz(clk_sys) != target_clock_khz * 1000u) {
+    printf(
+        "Clock initialization failed: requested %lu kHz, running %lu kHz\r\n",
+        (unsigned long)target_clock_khz,
+        (unsigned long)(clock_get_hz(clk_sys) / 1000u));
+    for (;;)
+      tight_loop_contents();
+  }
   cmd_version(0, NULL);
 
-  floppy = (floppy_t){
-    .pins = {
-      .index         = 14,
-      .track0        = 5,
-      .write_protect = 4,
-      .read_data     = 3,
-      .disk_change   = 1,
-      .drive_select  = 12,  // floppy pin 12 (DRVSB)
-      .motor_enable  = 10,  // floppy pin 16 (MOTEB)
-      .direction     = 9,
-      .step          = 8,
-      .write_data    = 7,
-      .write_gate    = 6,
-      .side_select   = 2,
-      .density       = 15,
-    }
-  };
+  block_status_t drive_error = floppy_init(&floppy, drive_pins);
+  if (drive_error != BLOCK_OK) {
+    printf("Drive initialization failed: %s\r\n",
+           block_status_text(drive_error));
+    for (;;)
+      tight_loop_contents();
+  }
 
-  floppy_init(&floppy);
-  floppy_set_density(&floppy, true);
+  f12_err_t init_error = f12_init(&fs, floppy_device(&floppy));
+  if (init_error != F12_OK) {
+    printf("Filesystem initialization failed: %s\r\n",
+           f12_strerror(init_error));
+    block_status_t cleanup_error = floppy_deinit(&floppy);
+    if (cleanup_error != BLOCK_OK) {
+      printf("Drive cleanup failed: %s\r\n", block_status_text(cleanup_error));
+    }
+    for (;;)
+      tight_loop_contents();
+  }
 
   printf("Drive initialized (HD mode)\r\n");
   printf("Type 'help' for commands, 'mount' when disk is ready.\r\n\r\n");
-
-  mounted = false;
 
   char *argv[MAX_ARGS];
 
   for (;;) {
     print_prompt();
-    int len = cli_readline(cmd_buf, CMD_BUF_SIZE);
-    if (len == 0) continue;
+    int len = cli_readline(cmd_buf);
+    if (len == CLI_INPUT_CANCELLED)
+      continue;
+    if (len == CLI_INPUT_OVERFLOW) {
+      printf("Command line too long.\n");
+      continue;
+    }
+    if (len == 0)
+      continue;
 
     int argc = tokenize(cmd_buf, argv, MAX_ARGS);
-    if (argc == 0) continue;
+    if (argc < 0) {
+      printf("Too many arguments.\n");
+      continue;
+    }
+    if (argc == 0)
+      continue;
 
     const cmd_entry_t *cmd = find_command(argv[0]);
     if (!cmd) {
@@ -3379,9 +2895,22 @@ int main(void) {
       continue;
     }
 
-    if (cmd->needs_mount && !mounted) {
-      printf("Not mounted. Use 'mount' first.\n");
+    if (argc < cmd->min_args || argc > cmd->max_args) {
+      print_usage(cmd);
       continue;
+    }
+
+    if (cmd->needs_mount) {
+      bool mounted;
+      f12_err_t error = f12_is_mounted(&fs, &mounted);
+      if (error != F12_OK) {
+        printf("Filesystem state check failed: %s\n", f12_strerror(error));
+        continue;
+      }
+      if (!mounted) {
+        printf("Not mounted. Use 'mount' first.\n");
+        continue;
+      }
     }
 
     cmd->fn(argc, argv);

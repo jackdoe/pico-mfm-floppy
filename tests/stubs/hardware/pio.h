@@ -9,6 +9,7 @@ typedef struct {
   int id;
   volatile uint32_t txf[4];
   volatile uint32_t rxf[4];
+  volatile uint32_t fdebug;
 } pio_hw_t;
 typedef pio_hw_t *PIO;
 
@@ -22,6 +23,10 @@ typedef struct { int dummy; } pio_program_t;
 enum pio_fifo_join { PIO_FIFO_JOIN_RX = 0, PIO_FIFO_JOIN_TX = 1 };
 typedef struct { int dummy; } pio_sm_config;
 
+#define PIO_TEST_STUB 1
+#define PIO_FDEBUG_RXSTALL_LSB 0u
+#define PIO_FDEBUG_TXSTALL_LSB 24u
+
 static inline pio_sm_config pio_get_default_config(uint offset) { (void)offset; pio_sm_config c = {0}; return c; }
 static inline void sm_config_set_jmp_pin(pio_sm_config *c, uint pin) { (void)c; (void)pin; }
 static inline void sm_config_set_in_pins(pio_sm_config *c, uint pin) { (void)c; (void)pin; }
@@ -30,10 +35,19 @@ static inline void sm_config_set_out_shift(pio_sm_config *c, bool right, bool au
 static inline void sm_config_set_in_shift(pio_sm_config *c, bool right, bool autopush, uint bits) { (void)c; (void)right; (void)autopush; (void)bits; }
 static inline void sm_config_set_fifo_join(pio_sm_config *c, enum pio_fifo_join join) { (void)c; (void)join; }
 static inline void sm_config_set_clkdiv(pio_sm_config *c, float div) { (void)c; (void)div; }
+static inline void sm_config_set_clkdiv_int_frac(pio_sm_config *c, uint16_t integer,
+                                                 uint8_t fraction) {
+  (void)c;
+  (void)integer;
+  (void)fraction;
+}
 
-uint pio_add_program(PIO pio, const pio_program_t *program);
-uint pio_claim_unused_sm(PIO pio, bool required);
-void pio_sm_init(PIO pio, uint sm, uint offset, const pio_sm_config *config);
+bool pio_can_add_program(PIO pio, const pio_program_t *program);
+int pio_add_program(PIO pio, const pio_program_t *program);
+void pio_remove_program(PIO pio, const pio_program_t *program, uint loaded_offset);
+int pio_claim_unused_sm(PIO pio, bool required);
+void pio_sm_unclaim(PIO pio, uint sm);
+int pio_sm_init(PIO pio, uint sm, uint offset, const pio_sm_config *config);
 void pio_sm_exec(PIO pio, uint sm, uint instr);
 void pio_sm_restart(PIO pio, uint sm);
 void pio_sm_clear_fifos(PIO pio, uint sm);
@@ -41,6 +55,7 @@ void pio_sm_set_enabled(PIO pio, uint sm, bool enabled);
 void pio_sm_set_pins_with_mask(PIO pio, uint sm, uint32_t values, uint32_t mask);
 void pio_sm_set_consecutive_pindirs(PIO pio, uint sm, uint pin, uint count, bool is_out);
 void pio_gpio_init(PIO pio, uint pin);
+uint pio_get_gpio_base(PIO pio);
 bool pio_sm_is_rx_fifo_empty(PIO pio, uint sm);
 bool pio_sm_is_tx_fifo_empty(PIO pio, uint sm);
 uint32_t pio_sm_get_blocking(PIO pio, uint sm);
@@ -49,8 +64,8 @@ void pio_sm_put_blocking(PIO pio, uint sm, uint32_t data);
 extern PIO pio0;
 extern PIO pio1;
 
-static inline uint pio_encode_jmp(uint addr) { return addr; }
-static inline uint pio_encode_set(uint dest, uint value) { (void)dest; return value; }
+static inline uint pio_encode_jmp(uint addr) { return 0x10000u | addr; }
+static inline uint pio_encode_set(uint dest, uint value) { (void)dest; return 0x20000u | value; }
 enum { pio_x = 0 };
 
 #endif

@@ -2,25 +2,34 @@
 #include <string.h>
 
 void pio_emu_init(pio_emu_t *emu) {
+    if (!emu) return;
     memset(emu, 0, sizeof(*emu));
     emu->in_shift_right = true;
     emu->out_shift_right = true;
 }
 
-void pio_emu_load(pio_emu_t *emu, const uint16_t *program, uint8_t len,
+bool pio_emu_load(pio_emu_t *emu, const uint16_t *program, uint8_t len,
                   uint8_t wrap_target, uint8_t wrap) {
+    if (!emu || !program || len == 0 || len > PIO_EMU_MAX_PROGRAM ||
+        wrap_target >= len || wrap >= len || wrap_target > wrap) {
+        if (emu) emu->fault = true;
+        return false;
+    }
     memcpy(emu->program, program, len * sizeof(uint16_t));
     emu->program_len = len;
     emu->wrap_target = wrap_target;
     emu->wrap = wrap;
     emu->pc = 0;
+    emu->fault = false;
+    return true;
 }
 
-static void pio_emu_rx_push(pio_emu_t *emu, uint32_t value) {
-    if (emu->rx_count >= PIO_EMU_FIFO_DEPTH) return;
-    int idx = (emu->rx_head + emu->rx_count) % PIO_EMU_FIFO_DEPTH;
+static bool pio_emu_rx_push(pio_emu_t *emu, uint32_t value) {
+    if (emu->rx_count >= PIO_EMU_FIFO_DEPTH) return false;
+    uint8_t idx = (uint8_t)((emu->rx_head + emu->rx_count) % PIO_EMU_FIFO_DEPTH);
     emu->rx_fifo[idx] = value;
     emu->rx_count++;
+    return true;
 }
 
 static bool pio_emu_tx_pop(pio_emu_t *emu, uint32_t *value) {
@@ -37,16 +46,20 @@ static void pio_emu_do_in(pio_emu_t *emu, uint32_t value, uint8_t bit_count) {
     value &= mask;
 
     if (emu->in_shift_right) {
-        emu->isr >>= bit_count;
-        emu->isr |= value << (32 - bit_count);
+        emu->isr = bit_count == 32 ? value
+                                   : (emu->isr >> bit_count) |
+                                         (value << (32u - bit_count));
     } else {
-        emu->isr <<= bit_count;
-        emu->isr |= value;
+        emu->isr = bit_count == 32 ? value : (emu->isr << bit_count) | value;
     }
     emu->isr_shift_count += bit_count;
 
     if (emu->autopush_threshold > 0 && emu->isr_shift_count >= emu->autopush_threshold) {
-        pio_emu_rx_push(emu, emu->isr);
+        if (!pio_emu_rx_push(emu, emu->isr)) {
+            emu->fault = true;
+            emu->stalled = true;
+            return;
+        }
         emu->isr = 0;
         emu->isr_shift_count = 0;
     }
@@ -58,10 +71,10 @@ static uint32_t pio_emu_do_out(pio_emu_t *emu, uint8_t bit_count) {
 
     if (emu->out_shift_right) {
         value = emu->osr & ((bit_count == 32) ? 0xFFFFFFFF : ((1u << bit_count) - 1));
-        emu->osr >>= bit_count;
+        emu->osr = bit_count == 32 ? 0 : emu->osr >> bit_count;
     } else {
         value = emu->osr >> (32 - bit_count);
-        emu->osr <<= bit_count;
+        emu->osr = bit_count == 32 ? 0 : emu->osr << bit_count;
     }
     emu->osr_shift_count += bit_count;
 
@@ -76,12 +89,16 @@ static uint32_t pio_emu_do_out(pio_emu_t *emu, uint8_t bit_count) {
     return value;
 }
 
-void pio_emu_step(pio_emu_t *emu) {
+bool pio_emu_step(pio_emu_t *emu) {
+    if (!emu || emu->fault || emu->program_len == 0 || emu->pc >= emu->program_len) {
+        if (emu) emu->fault = true;
+        return false;
+    }
     emu->cycle_count++;
 
     if (emu->delay_remaining > 0) {
         emu->delay_remaining--;
-        return;
+        return true;
     }
 
     emu->stalled = false;
@@ -108,6 +125,10 @@ void pio_emu_step(pio_emu_t *emu) {
         case JMP_NOT_OSRE: take = (emu->osr_shift_count < (emu->autopull_threshold ? emu->autopull_threshold : 32)); break;
         }
         if (take) {
+            if (arg2 >= emu->program_len) {
+                emu->fault = true;
+                return false;
+            }
             emu->pc = arg2;
             advance_pc = false;
         }
@@ -125,6 +146,7 @@ void pio_emu_step(pio_emu_t *emu) {
         case IN_OSR:  value = emu->osr; break;
         }
         pio_emu_do_in(emu, value, arg2);
+        if (emu->fault) return false;
         break;
     }
 
@@ -136,7 +158,14 @@ void pio_emu_step(pio_emu_t *emu) {
         case OUT_Y:       emu->y = value; break;
         case OUT_NULL:    break;
         case OUT_PINDIRS: break;
-        case OUT_PC:      emu->pc = value; advance_pc = false; break;
+        case OUT_PC:
+            if (value >= emu->program_len) {
+                emu->fault = true;
+                return false;
+            }
+            emu->pc = (uint8_t)value;
+            advance_pc = false;
+            break;
         case OUT_ISR:     emu->isr = value; break;
         case OUT_EXEC:    break;
         }
@@ -145,7 +174,7 @@ void pio_emu_step(pio_emu_t *emu) {
 
     case PIO_OP_PUSH_PULL: {
         bool is_pull = (arg1 >> 2) & 1;
-        bool block = (arg1 >> 1) & 1;
+        bool block = arg1 & 1;
         if (is_pull) {
             uint32_t tx_val;
             if (pio_emu_tx_pop(emu, &tx_val)) {
@@ -158,7 +187,10 @@ void pio_emu_step(pio_emu_t *emu) {
             }
         } else {
             if (emu->rx_count < PIO_EMU_FIFO_DEPTH) {
-                pio_emu_rx_push(emu, emu->isr);
+                if (!pio_emu_rx_push(emu, emu->isr)) {
+                    emu->fault = true;
+                    return false;
+                }
                 emu->isr = 0;
                 emu->isr_shift_count = 0;
             } else if (block) {
@@ -184,7 +216,8 @@ void pio_emu_step(pio_emu_t *emu) {
     }
 
     default:
-        break;
+        emu->fault = true;
+        return false;
     }
 
     if (advance_pc) {
@@ -196,20 +229,23 @@ void pio_emu_step(pio_emu_t *emu) {
     }
 
     emu->delay_remaining = delay;
+    return true;
 }
 
-void pio_emu_run(pio_emu_t *emu, uint32_t cycles) {
+bool pio_emu_run(pio_emu_t *emu, uint32_t cycles) {
+    if (!emu) return false;
     for (uint32_t i = 0; i < cycles && !emu->stalled; i++) {
-        pio_emu_step(emu);
+        if (!pio_emu_step(emu)) return false;
     }
+    return !emu->fault;
 }
 
 bool pio_emu_rx_empty(pio_emu_t *emu) {
-    return emu->rx_count == 0;
+    return !emu || emu->rx_count == 0;
 }
 
 uint32_t pio_emu_rx_get(pio_emu_t *emu) {
-    if (emu->rx_count == 0) return 0;
+    if (!emu || emu->rx_count == 0) return 0;
     uint32_t val = emu->rx_fifo[emu->rx_head];
     emu->rx_head = (emu->rx_head + 1) % PIO_EMU_FIFO_DEPTH;
     emu->rx_count--;
@@ -217,12 +253,12 @@ uint32_t pio_emu_rx_get(pio_emu_t *emu) {
 }
 
 bool pio_emu_tx_full(pio_emu_t *emu) {
-    return emu->tx_count >= PIO_EMU_FIFO_DEPTH;
+    return !emu || emu->tx_count >= PIO_EMU_FIFO_DEPTH;
 }
 
 void pio_emu_tx_put(pio_emu_t *emu, uint32_t data) {
-    if (emu->tx_count >= PIO_EMU_FIFO_DEPTH) return;
-    int idx = (emu->tx_head + emu->tx_count) % PIO_EMU_FIFO_DEPTH;
+    if (!emu || emu->tx_count >= PIO_EMU_FIFO_DEPTH) return;
+    uint8_t idx = (uint8_t)((emu->tx_head + emu->tx_count) % PIO_EMU_FIFO_DEPTH);
     emu->tx_fifo[idx] = data;
     emu->tx_count++;
 }

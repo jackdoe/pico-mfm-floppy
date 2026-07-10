@@ -1,23 +1,39 @@
-#!/bin/sh
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-./test_lru
-./test_mfm
-./test_fat12
-./test_f12
-./test_robustness
-./test_fuzz "$@"
-./test_flux_sim
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fixture="${SCP_FIXTURE:-$script_dir/../system-shock-multilingual-floppy-ibm-pc/disk1.scp}"
+if [[ ! -s "$fixture" ]]; then
+    printf 'Required SCP fixture missing or empty: %s\n' "$fixture" >&2
+    exit 1
+fi
 
-SCP_DIR="../../system-shock-multilingual-floppy-ibm-pc"
-for disk in "$SCP_DIR"/disk*.scp; do
-    [ -f "$disk" ] && ./test_scp_fat12 "$disk"
-done
+export SCP_FIXTURE="$fixture"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    export ASAN_OPTIONS="${ASAN_OPTIONS:-halt_on_error=1:abort_on_error=1}"
+else
+    export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=1:halt_on_error=1:abort_on_error=1}"
+    export LSAN_OPTIONS="${LSAN_OPTIONS:-exitcode=23}"
+fi
+export UBSAN_OPTIONS="${UBSAN_OPTIONS:-halt_on_error=1:print_stacktrace=1}"
 
-./test_scp_roundtrip "$@"
-./test_pio_sim
-./test_pio_emu
-./test_write_verify
-./test_floppy_underrun
-./test_floppy_timeouts
-./test_e2e_corruption
+if [[ -n "${TEST_BUILD_DIR:-}" ]]; then
+    build_dir="$TEST_BUILD_DIR"
+elif [[ -f "$PWD/CTestTestfile.cmake" ]]; then
+    build_dir="$PWD"
+else
+    build_dir="$script_dir/build"
+fi
+
+if [[ ! -f "$build_dir/CTestTestfile.cmake" ]]; then
+    printf 'CTest build directory not found: %s\n' "$build_dir" >&2
+    exit 1
+fi
+
+listing="$(ctest --test-dir "$build_dir" -N)"
+if [[ ! "$listing" =~ Total\ Tests:\ ([1-9][0-9]*) ]]; then
+    printf 'No tests registered in %s\n' "$build_dir" >&2
+    exit 1
+fi
+
+exec ctest --test-dir "$build_dir" --output-on-failure "$@"

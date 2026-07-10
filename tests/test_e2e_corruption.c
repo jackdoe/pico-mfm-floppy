@@ -1,309 +1,612 @@
 #include "test.h"
 #include "pio_sim.h"
-#include "../src/floppy.h"
 #include "../src/f12.h"
 #include "../src/fat12.h"
-#include "../src/mfm_encode.h"
-
-#define SCP_PATH "../../system-shock-multilingual-floppy-ibm-pc/disk1.scp"
+#include "../src/floppy.h"
 
 floppy_t *pio_sim_floppy_ref;
+
+typedef enum {
+  FILE_ANY_NONEMPTY,
+  FILE_MULTICLUSTER,
+  FILE_DATA_TRACK,
+} file_requirement_t;
+
+typedef struct {
+  char name[FAT12_FILENAME_LEN + FAT12_EXTENSION_LEN + 2u];
+  fat12_dirent_t entry;
+  uint16_t index;
+  uint16_t first_lba;
+  uint8_t cylinder;
+  uint8_t head;
+} fixture_file_t;
 
 static pio_sim_drive_t baseline;
 static pio_sim_drive_t live;
 static floppy_t floppy;
+static f12_t filesystem;
+static bool floppy_initialized;
 
-static uint8_t *load_file(const char *path, size_t *size) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    *size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    uint8_t *buf = malloc(*size);
-    if (!buf) { fclose(f); return NULL; }
-    fread(buf, 1, *size, f);
-    fclose(f);
-    return buf;
+static uint16_t load_le16(const uint8_t *data) {
+  return (uint16_t)((uint16_t)data[0] | ((uint16_t)data[1] << 8u));
 }
 
-static void clone_drive(const pio_sim_drive_t *src, pio_sim_drive_t *dst) {
-    pio_sim_init(dst);
-    for (int t = 0; t < 80; t++) {
-        for (int s = 0; s < 2; s++) {
-            const pio_sim_track_t *st = &src->tracks[t][s];
-            if (st->count == 0) continue;
-            dst->tracks[t][s].deltas = malloc(st->count * sizeof(uint16_t));
-            dst->tracks[t][s].count = st->count;
-            memcpy(dst->tracks[t][s].deltas, st->deltas, st->count * sizeof(uint16_t));
-        }
+static uint32_t load_le32(const uint8_t *data) {
+  return (uint32_t)data[0] | ((uint32_t)data[1] << 8u) |
+         ((uint32_t)data[2] << 16u) | ((uint32_t)data[3] << 24u);
+}
+
+static void store_le16(uint8_t *data, uint16_t value) {
+  data[0] = (uint8_t)value;
+  data[1] = (uint8_t)(value >> 8u);
+}
+
+static uint8_t *load_file(const char *path, size_t *size) {
+  if (!path || !size) return NULL;
+  *size = 0;
+  FILE *file = fopen(path, "rb");
+  if (!file) return NULL;
+  if (fseek(file, 0, SEEK_END) != 0) {
+    if (fclose(file) != 0) return NULL;
+    return NULL;
+  }
+  long end = ftell(file);
+  if (end <= 0 || fseek(file, 0, SEEK_SET) != 0) {
+    if (fclose(file) != 0) return NULL;
+    return NULL;
+  }
+  size_t length = (size_t)end;
+  if ((long)length != end) {
+    if (fclose(file) != 0) return NULL;
+    return NULL;
+  }
+  uint8_t *data = malloc(length);
+  if (!data) {
+    if (fclose(file) != 0) return NULL;
+    return NULL;
+  }
+  size_t read = fread(data, 1, length, file);
+  bool closed = fclose(file) == 0;
+  if (read != length || !closed) {
+    free(data);
+    return NULL;
+  }
+  *size = length;
+  return data;
+}
+
+static bool clone_drive(const pio_sim_drive_t *source,
+                        pio_sim_drive_t *destination) {
+  if (!source || !destination) return false;
+  pio_sim_init(destination);
+  for (uint8_t cylinder = 0; cylinder < DISK_CYLINDERS; cylinder++) {
+    for (uint8_t head = 0; head < DISK_HEADS; head++) {
+      const pio_sim_track_t *input = &source->tracks[cylinder][head];
+      pio_sim_track_t *output = &destination->tracks[cylinder][head];
+      if (input->count == 0) continue;
+      if (!input->deltas || input->count > PIO_SIM_MAX_FLUX) {
+        pio_sim_free(destination);
+        return false;
+      }
+      size_t bytes = (size_t)input->count * sizeof(*output->deltas);
+      output->deltas = malloc(bytes);
+      if (!output->deltas) {
+        pio_sim_free(destination);
+        return false;
+      }
+      memcpy(output->deltas, input->deltas, bytes);
+      output->count = input->count;
     }
+  }
+  return true;
+}
+
+static floppy_pins_t test_pins(void) {
+  return (floppy_pins_t){
+      .index = 1,
+      .track0 = 2,
+      .write_protect = 3,
+      .read_data = 4,
+      .disk_change = 5,
+      .drive_select = 6,
+      .motor_enable = 7,
+      .direction = 8,
+      .step = 9,
+      .write_data = 10,
+      .write_gate = 11,
+      .side_select = 12,
+      .density = 13,
+  };
 }
 
 static void setup_floppy(void) {
-    memset(&floppy, 0, sizeof(floppy));
-    floppy.pins.index = 1;
-    floppy.pins.track0 = 2;
-    floppy.pins.write_protect = 3;
-    floppy.pins.read_data = 4;
-    floppy.pins.disk_change = 5;
-    floppy.pins.drive_select = 6;
-    floppy.pins.motor_enable = 7;
-    floppy.pins.direction = 8;
-    floppy.pins.step = 9;
-    floppy.pins.write_data = 10;
-    floppy.pins.write_gate = 11;
-    floppy.pins.side_select = 12;
-    floppy.pins.density = 13;
-
-    pio_sim_floppy_ref = &floppy;
-    floppy_init(&floppy);
+  pio_sim_floppy_ref = &floppy;
+  ASSERT_EQ(floppy_init(&floppy, test_pins()), BLOCK_OK);
+  floppy_initialized = true;
 }
 
 static void reset_to_baseline(void) {
+  if (floppy_initialized) {
+    ASSERT_EQ(floppy_deinit(&floppy), BLOCK_OK);
+    floppy_initialized = false;
+  }
+  pio_sim_free(&live);
+  ASSERT(clone_drive(&baseline, &live));
+  pio_sim_install(&live);
+  setup_floppy();
+}
+
+static void mount_filesystem(void) {
+  ASSERT_EQ(f12_init(&filesystem, floppy_device(&floppy)), F12_OK);
+  ASSERT_EQ(f12_mount(&filesystem), F12_OK);
+}
+
+static void assert_mounted(bool expected) {
+  bool mounted = !expected;
+  ASSERT_EQ(f12_is_mounted(&filesystem, &mounted), F12_OK);
+  ASSERT_EQ(mounted, expected);
+}
+
+static void assert_no_defects(const fat12_fsck_t *report) {
+  ASSERT_NOT_NULL(report);
+  ASSERT_EQ(report->lost_clusters, 0);
+  ASSERT_EQ(report->crosslinked, 0);
+  ASSERT_EQ(report->loops, 0);
+  ASSERT_EQ(report->broken_chains, 0);
+  ASSERT_EQ(report->size_mismatches, 0);
+  ASSERT_EQ(report->truncated_files, 0);
+  ASSERT_EQ(report->removed_directories, 0);
+  ASSERT_EQ(report->duplicate_names, 0);
+  ASSERT_EQ(report->removed_duplicates, 0);
+  ASSERT_EQ(report->freed_tails, 0);
+  ASSERT_EQ(report->freed, 0);
+  ASSERT(!report->fat_markers_invalid);
+  ASSERT(!report->fat_ambiguous);
+  ASSERT(!report->repair_pending);
+  ASSERT(!report->incomplete);
+}
+
+static void assert_clean_fsck(const fat12_fsck_t *report) {
+  assert_no_defects(report);
+  ASSERT_EQ(report->fat1_score, 0);
+  ASSERT_EQ(report->fat2_score, 0);
+  ASSERT_EQ(report->authoritative_fat, 1);
+  ASSERT(!report->fat_mismatch);
+  ASSERT(!report->repaired_fat1);
+  ASSERT(!report->repaired_fat2);
+}
+
+static void format_name(const fat12_dirent_t *entry, char output[13]) {
+  size_t length = FAT12_FILENAME_LEN;
+  while (length > 0 && entry->name[length - 1u] == ' ') length--;
+  memcpy(output, entry->name, length);
+  size_t extension = FAT12_EXTENSION_LEN;
+  while (extension > 0 && entry->ext[extension - 1u] == ' ') extension--;
+  if (extension != 0) {
+    output[length++] = '.';
+    memcpy(output + length, entry->ext, extension);
+    length += extension;
+  }
+  output[length] = '\0';
+}
+
+static bool regular_nonempty(const fat12_dirent_t *entry) {
+  return fat12_entry_valid(entry) && entry->size != 0 &&
+         (entry->attr & (FAT12_ATTR_DIRECTORY | FAT12_ATTR_VOLUME_ID)) == 0 &&
+         entry->start_cluster >= 2u &&
+         entry->start_cluster < FAT12_CLUSTER_LIMIT;
+}
+
+static fat12_err_t find_fixture_file(file_requirement_t requirement,
+                                     fixture_file_t *selected) {
+  if (!selected) return FAT12_ERR_INVALID;
+  memset(selected, 0, sizeof(*selected));
+  for (uint16_t index = 0; index < FAT12_ROOT_ENTRIES; index++) {
+    fat12_dirent_t entry;
+    fat12_err_t error =
+        fat12_read_root_entry(&filesystem.fat, index, &entry);
+    if (error != FAT12_OK) return error;
+    if (fat12_entry_is_end(&entry)) return FAT12_ERR_NOT_FOUND;
+    if (!regular_nonempty(&entry)) continue;
+    uint32_t first_lba_value = FAT12_DATA_START +
+        ((uint32_t)entry.start_cluster - 2u) * FAT12_MAX_CLUSTER_SECTORS;
+    if (first_lba_value >= DISK_SECTOR_COUNT) continue;
+    uint16_t first_lba = (uint16_t)first_lba_value;
+    uint8_t cylinder;
+    uint8_t head;
+    uint8_t sector;
+    if (!disk_lba_to_chs(first_lba, &cylinder, &head, &sector)) continue;
+    uint16_t track;
+    if (!disk_ch_to_track(cylinder, head, &track)) continue;
+    uint32_t clusters = entry.size / DISK_SECTOR_SIZE +
+        (entry.size % DISK_SECTOR_SIZE != 0 ? 1u : 0u);
+    if (requirement == FILE_MULTICLUSTER) {
+      if (clusters < 2u) continue;
+      uint16_t next;
+      error = fat12_get_entry(&filesystem.fat, entry.start_cluster, &next);
+      if (error != FAT12_OK) return error;
+      if (fat12_is_eof(next) || next < 2u || next >= FAT12_CLUSTER_LIMIT) {
+        continue;
+      }
+    }
+    uint16_t first_data_track = (uint16_t)(
+        (FAT12_DATA_START + DISK_SECTORS_PER_TRACK - 1u) /
+        DISK_SECTORS_PER_TRACK);
+    if (requirement == FILE_DATA_TRACK && track < first_data_track) continue;
+    fat12_file_t reader;
+    error = fat12_open(&filesystem.fat, &entry, &reader);
+    if (error != FAT12_OK) continue;
+    selected->entry = entry;
+    selected->index = index;
+    selected->first_lba = first_lba;
+    selected->cylinder = cylinder;
+    selected->head = head;
+    format_name(&entry, selected->name);
+    return FAT12_OK;
+  }
+  return FAT12_ERR_NOT_FOUND;
+}
+
+static void read_file_exact(const fixture_file_t *selected, uint8_t *data) {
+  ASSERT_NOT_NULL(selected);
+  ASSERT_NOT_NULL(data);
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&filesystem, selected->name, F12_OPEN_READ, &file),
+            F12_OK);
+  size_t total = 0;
+  size_t size = selected->entry.size;
+  while (total < size) {
+    f12_result_t result = f12_read(&file, data + total, size - total);
+    ASSERT_EQ(result.error, F12_OK);
+    ASSERT(result.count > 0);
+    ASSERT(result.count <= size - total);
+    total += result.count;
+  }
+  uint8_t byte = 0;
+  f12_result_t end = f12_read(&file, &byte, sizeof(byte));
+  ASSERT_EQ(end.error, F12_END);
+  ASSERT_EQ(end.count, 0);
+  ASSERT_EQ(f12_close(&file), F12_OK);
+}
+
+static block_status_t read_canonical_track(uint16_t lba, track_t *track,
+                                           uint8_t *sector) {
+  if (!track || !sector) return BLOCK_ERR_INVALID;
+  uint8_t cylinder;
+  uint8_t head;
+  if (!disk_lba_to_chs(lba, &cylinder, &head, sector)) {
+    return BLOCK_ERR_INVALID;
+  }
+  block_device_t device = floppy_device(&floppy);
+  uint32_t generation;
+  block_status_t status =
+      device.media_generation(device.ctx, &generation);
+  if (status != BLOCK_OK) return status;
+  memset(track, 0, sizeof(*track));
+  status = device.read_track(device.ctx, generation, cylinder, head, track);
+  if (status != BLOCK_OK) return status;
+  if (track->cylinder != cylinder || track->head != head ||
+      track->valid != DISK_TRACK_VALID) {
+    return BLOCK_ERR_CORRUPT;
+  }
+  return BLOCK_OK;
+}
+
+static void replace_canonical_track(const track_t *track) {
+  ASSERT_NOT_NULL(track);
+  ASSERT(pio_sim_replace_track(&live, track));
+}
+
+static void corrupt_fat_entry(uint16_t fat_start, uint16_t cluster) {
+  size_t offset = (size_t)cluster + (size_t)cluster / 2u;
+  size_t first_sector_offset = offset / DISK_SECTOR_SIZE;
+  size_t second_sector_offset = (offset + 1u) / DISK_SECTOR_SIZE;
+  ASSERT(first_sector_offset < FAT12_SECTORS_PER_FAT);
+  ASSERT(second_sector_offset < FAT12_SECTORS_PER_FAT);
+  size_t first_lba_value = (size_t)fat_start + first_sector_offset;
+  size_t second_lba_value = (size_t)fat_start + second_sector_offset;
+  ASSERT(first_lba_value < DISK_SECTOR_COUNT);
+  ASSERT(second_lba_value < DISK_SECTOR_COUNT);
+  uint16_t first_lba = (uint16_t)first_lba_value;
+  uint16_t second_lba = (uint16_t)second_lba_value;
+  track_t tracks[2];
+  uint8_t sectors[2];
+  ASSERT_EQ(read_canonical_track(first_lba, &tracks[0], &sectors[0]),
+            BLOCK_OK);
+  uint8_t second_track = 0;
+  uint8_t second_cylinder;
+  uint8_t second_head;
+  uint8_t ignored_sector;
+  ASSERT(disk_lba_to_chs(second_lba, &second_cylinder, &second_head,
+                         &ignored_sector));
+  if (tracks[0].cylinder != second_cylinder ||
+      tracks[0].head != second_head) {
+    second_track = 1;
+    ASSERT_EQ(read_canonical_track(second_lba, &tracks[1], &sectors[1]),
+              BLOCK_OK);
+  } else {
+    sectors[1] = ignored_sector;
+  }
+  size_t first_byte = offset % DISK_SECTOR_SIZE;
+  size_t second_byte = (offset + 1u) % DISK_SECTOR_SIZE;
+  uint8_t *low = &tracks[0].data[sectors[0]][first_byte];
+  uint8_t *high = &tracks[second_track].data[sectors[1]][second_byte];
+  if ((cluster & 1u) != 0) {
+    *low = (uint8_t)((*low & 0x0Fu) | 0xF0u);
+    *high = 0xFFu;
+  } else {
+    *low = 0xFFu;
+    *high = (uint8_t)((*high & 0xF0u) | 0x0Fu);
+  }
+  replace_canonical_track(&tracks[0]);
+  if (second_track != 0) replace_canonical_track(&tracks[1]);
+}
+
+static void corrupt_root_start_cluster(const fixture_file_t *selected) {
+  uint32_t byte_offset = (uint32_t)selected->index * FAT12_DIR_ENTRY_SIZE;
+  uint32_t root_start = FAT12_RESERVED_SECTORS +
+      FAT12_NUM_FATS * FAT12_SECTORS_PER_FAT;
+  uint32_t lba_value = root_start + byte_offset / DISK_SECTOR_SIZE;
+  ASSERT(lba_value < DISK_SECTOR_COUNT);
+  uint16_t lba = (uint16_t)lba_value;
+  uint8_t sector;
+  track_t track;
+  ASSERT_EQ(read_canonical_track(lba, &track, &sector), BLOCK_OK);
+  size_t offset = byte_offset % DISK_SECTOR_SIZE;
+  uint8_t *raw = track.data[sector] + offset;
+  ASSERT_MEM_EQ(raw, selected->entry.name, FAT12_FILENAME_LEN);
+  ASSERT_MEM_EQ(raw + FAT12_FILENAME_LEN, selected->entry.ext,
+                FAT12_EXTENSION_LEN);
+  size_t cluster_offset = offsetof(fat12_dirent_t, start_cluster);
+  size_t size_offset = offsetof(fat12_dirent_t, size);
+  ASSERT_EQ(load_le16(raw + cluster_offset), selected->entry.start_cluster);
+  ASSERT_EQ(load_le32(raw + size_offset), selected->entry.size);
+  store_le16(raw + cluster_offset, 0);
+  replace_canonical_track(&track);
+}
+
+static void lose_data_track(const fixture_file_t *selected) {
+  track_t track;
+  uint8_t sector;
+  ASSERT_EQ(read_canonical_track(selected->first_lba, &track, &sector),
+            BLOCK_OK);
+  ASSERT_EQ(track.cylinder, selected->cylinder);
+  ASSERT_EQ(track.head, selected->head);
+  ASSERT(sector < DISK_SECTORS_PER_TRACK);
+  replace_canonical_track(&track);
+  pio_sim_track_t *flux =
+      &live.tracks[selected->cylinder][selected->head];
+  ASSERT_NOT_NULL(flux->deltas);
+  ASSERT(flux->count > 0);
+  flux->count = 0;
+  if (live.head_track == selected->cylinder &&
+      live.head_side == selected->head) {
+    live.read_buf = NULL;
+    live.read_count = 0;
+    live.read_pos = 0;
+  }
+}
+
+TEST(test_clean_fixture_contract) {
+  reset_to_baseline();
+  mount_filesystem();
+  assert_mounted(true);
+
+  fat12_fsck_t report;
+  ASSERT_EQ(f12_fsck(&filesystem, &report, false), F12_OK);
+  assert_clean_fsck(&report);
+  ASSERT(report.files > 0);
+
+  f12_dir_t directory;
+  ASSERT_EQ(f12_opendir(&filesystem, "/", &directory), F12_OK);
+  size_t entries = 0;
+  for (;;) {
+    f12_stat_t stat;
+    f12_err_t error = f12_readdir(&directory, &stat);
+    if (error == F12_END) break;
+    ASSERT_EQ(error, F12_OK);
+    ASSERT(stat.name[0] != '\0');
+    entries++;
+  }
+  ASSERT(entries > 0);
+  ASSERT_EQ(f12_closedir(&directory), F12_OK);
+
+  fixture_file_t selected;
+  ASSERT_EQ(find_fixture_file(FILE_MULTICLUSTER, &selected), FAT12_OK);
+  ASSERT_EQ(find_fixture_file(FILE_DATA_TRACK, &selected), FAT12_OK);
+  ASSERT_EQ(f12_unmount(&filesystem), F12_OK);
+  assert_mounted(false);
+}
+
+static void test_fat_mirror_recovery(uint16_t damaged_fat,
+                                     uint8_t authority) {
+  reset_to_baseline();
+  mount_filesystem();
+  fixture_file_t selected;
+  ASSERT_EQ(find_fixture_file(FILE_MULTICLUSTER, &selected), FAT12_OK);
+  uint16_t next;
+  ASSERT_EQ(fat12_get_entry(&filesystem.fat, selected.entry.start_cluster,
+                            &next), FAT12_OK);
+  ASSERT(!fat12_is_eof(next));
+  uint8_t *expected = malloc(selected.entry.size);
+  uint8_t *actual = malloc(selected.entry.size);
+  ASSERT_NOT_NULL(expected);
+  ASSERT_NOT_NULL(actual);
+  read_file_exact(&selected, expected);
+  ASSERT_EQ(f12_unmount(&filesystem), F12_OK);
+
+  corrupt_fat_entry(damaged_fat, selected.entry.start_cluster);
+  ASSERT_EQ(f12_mount(&filesystem), F12_OK);
+  assert_mounted(true);
+
+  fat12_fsck_t report;
+  ASSERT_EQ(f12_fsck(&filesystem, &report, false), F12_OK);
+  assert_no_defects(&report);
+  ASSERT(report.fat_mismatch);
+  ASSERT_EQ(report.authoritative_fat, authority);
+  if (authority == 1u) {
+    ASSERT_EQ(report.fat1_score, 0);
+    ASSERT_EQ(report.fat2_score, 2);
+  } else {
+    ASSERT_EQ(report.fat1_score, 2);
+    ASSERT_EQ(report.fat2_score, 0);
+  }
+
+  read_file_exact(&selected, actual);
+  ASSERT_MEM_EQ(actual, expected, selected.entry.size);
+
+  ASSERT_EQ(f12_fsck(&filesystem, &report, true), F12_OK);
+  assert_no_defects(&report);
+  ASSERT(report.fat_mismatch);
+  ASSERT_EQ(report.authoritative_fat, authority);
+  ASSERT_EQ(report.repaired_fat1, authority == 2u);
+  ASSERT_EQ(report.repaired_fat2, authority == 1u);
+  ASSERT_EQ(f12_unmount(&filesystem), F12_OK);
+
+  ASSERT_EQ(f12_mount(&filesystem), F12_OK);
+  ASSERT_EQ(f12_fsck(&filesystem, &report, false), F12_OK);
+  assert_clean_fsck(&report);
+  read_file_exact(&selected, actual);
+  ASSERT_MEM_EQ(actual, expected, selected.entry.size);
+  ASSERT_EQ(f12_unmount(&filesystem), F12_OK);
+  free(actual);
+  free(expected);
+}
+
+TEST(test_fat1_damage_selects_and_repairs_fat2) {
+  test_fat_mirror_recovery(FAT12_FAT1_START, 2u);
+}
+
+TEST(test_fat2_damage_selects_and_repairs_fat1) {
+  test_fat_mirror_recovery(FAT12_FAT2_START, 1u);
+}
+
+TEST(test_data_track_loss_has_exact_bounded_failure) {
+  reset_to_baseline();
+  mount_filesystem();
+  fixture_file_t selected;
+  ASSERT_EQ(find_fixture_file(FILE_DATA_TRACK, &selected), FAT12_OK);
+  ASSERT_EQ(f12_unmount(&filesystem), F12_OK);
+
+  lose_data_track(&selected);
+  ASSERT_EQ(f12_mount(&filesystem), F12_OK);
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&filesystem, selected.name, F12_OPEN_READ, &file),
+            F12_OK);
+  uint8_t sector[DISK_SECTOR_SIZE];
+  f12_result_t result = f12_read(&file, sector, sizeof(sector));
+  ASSERT_EQ(result.error, F12_ERR_TIMEOUT);
+  ASSERT_EQ(result.count, 0);
+  uint32_t offset = UINT32_MAX;
+  ASSERT_EQ(f12_tell(&file, &offset), F12_OK);
+  ASSERT_EQ(offset, 0);
+  ASSERT_EQ(f12_close(&file), F12_OK);
+  ASSERT_EQ(f12_unmount(&filesystem), F12_OK);
+}
+
+TEST(test_invalid_boot_sector_is_rejected) {
+  reset_to_baseline();
+  mount_filesystem();
+  ASSERT_EQ(f12_unmount(&filesystem), F12_OK);
+
+  track_t track;
+  uint8_t sector;
+  ASSERT_EQ(read_canonical_track(0, &track, &sector), BLOCK_OK);
+  track.data[sector][FAT12_BOOT_SIG_OFFSET] = 0;
+  track.data[sector][FAT12_BOOT_SIG_OFFSET + 1u] = 0;
+  replace_canonical_track(&track);
+
+  ASSERT_EQ(f12_mount(&filesystem), F12_ERR_INVALID);
+  assert_mounted(false);
+}
+
+TEST(test_invalid_root_start_cluster_is_repaired) {
+  reset_to_baseline();
+  mount_filesystem();
+  fixture_file_t selected;
+  ASSERT_EQ(find_fixture_file(FILE_ANY_NONEMPTY, &selected), FAT12_OK);
+  uint32_t clusters = selected.entry.size / DISK_SECTOR_SIZE +
+      (selected.entry.size % DISK_SECTOR_SIZE != 0 ? 1u : 0u);
+  ASSERT(clusters > 0);
+  ASSERT_EQ(f12_unmount(&filesystem), F12_OK);
+
+  corrupt_root_start_cluster(&selected);
+  ASSERT_EQ(f12_mount(&filesystem), F12_OK);
+
+  fat12_fsck_t report;
+  ASSERT_EQ(f12_fsck(&filesystem, &report, false), F12_OK);
+  ASSERT_EQ(report.broken_chains, 1);
+  ASSERT_EQ(report.size_mismatches, 1);
+  ASSERT_EQ(report.lost_clusters, clusters);
+  ASSERT_EQ(report.crosslinked, 0);
+  ASSERT_EQ(report.loops, 0);
+  ASSERT(!report.fat_mismatch);
+  ASSERT(!report.incomplete);
+
+  f12_file_t file;
+  ASSERT_EQ(f12_open(&filesystem, selected.name, F12_OPEN_READ, &file),
+            F12_ERR_CORRUPT);
+  ASSERT_EQ(f12_fsck(&filesystem, &report, true), F12_OK);
+  ASSERT_EQ(report.broken_chains, 1);
+  ASSERT_EQ(report.size_mismatches, 1);
+  ASSERT_EQ(report.lost_clusters, clusters);
+  ASSERT_EQ(report.truncated_files, 1);
+  ASSERT_EQ(report.freed, clusters);
+  ASSERT(!report.repair_pending);
+  ASSERT(!report.incomplete);
+  ASSERT_EQ(f12_unmount(&filesystem), F12_OK);
+
+  ASSERT_EQ(f12_mount(&filesystem), F12_OK);
+  ASSERT_EQ(f12_fsck(&filesystem, &report, false), F12_OK);
+  assert_clean_fsck(&report);
+  f12_stat_t stat;
+  ASSERT_EQ(f12_stat(&filesystem, selected.name, &stat), F12_OK);
+  ASSERT_EQ(stat.size, 0);
+  ASSERT_EQ(f12_open(&filesystem, selected.name, F12_OPEN_READ, &file),
+            F12_OK);
+  uint8_t byte = 0;
+  f12_result_t result = f12_read(&file, &byte, sizeof(byte));
+  ASSERT_EQ(result.error, F12_END);
+  ASSERT_EQ(result.count, 0);
+  ASSERT_EQ(f12_close(&file), F12_OK);
+  ASSERT_EQ(f12_unmount(&filesystem), F12_OK);
+}
+
+int main(int argc, char **argv) {
+  if (argc != 3 || strcmp(argv[1], "--fixture") != 0) {
+    fprintf(stderr, "usage: %s --fixture PATH\n", argv[0]);
+    return 2;
+  }
+  size_t fixture_size;
+  uint8_t *fixture = load_file(argv[2], &fixture_size);
+  if (!fixture) {
+    fprintf(stderr, "cannot read required SCP fixture: %s\n", argv[2]);
+    return 1;
+  }
+  pio_sim_init(&baseline);
+  pio_sim_init(&live);
+  if (!pio_sim_load_scp(&baseline, fixture, fixture_size)) {
+    fprintf(stderr, "invalid SCP fixture: %s\n", argv[2]);
     pio_sim_free(&live);
-    clone_drive(&baseline, &live);
-    pio_sim_install(&live);
-    setup_floppy();
-}
-
-static uint32_t lcg(uint32_t *seed) {
-    *seed = *seed * 1103515245u + 12345u;
-    return *seed;
-}
-
-static void corrupt_track_random(uint8_t cyl, uint8_t side, uint32_t bytes_to_flip, uint32_t seed) {
-    pio_sim_track_t *t = &live.tracks[cyl][side];
-    if (t->count == 0) return;
-    for (uint32_t i = 0; i < bytes_to_flip; i++) {
-        uint32_t pos = lcg(&seed) % t->count;
-        t->deltas[pos] ^= (lcg(&seed) & 0x7F) + 1;
-    }
-}
-
-static void wipe_track(uint8_t cyl, uint8_t side) {
-    pio_sim_track_t *t = &live.tracks[cyl][side];
-    for (uint32_t i = 0; i < t->count; i++) t->deltas[i] = 60;
-}
-
-static f12_io_t make_io(void) {
-    return (f12_io_t){
-        .read = floppy_io_read,
-        .write = floppy_io_write,
-        .disk_changed = floppy_io_disk_changed,
-        .write_protected = floppy_io_write_protected,
-        .ctx = &floppy,
-    };
-}
-
-TEST(test_e2e_clean_baseline_mounts) {
-    reset_to_baseline();
-
-    f12_t fs;
-    memset(&fs, 0, sizeof(fs));
-    ASSERT_EQ(f12_mount(&fs, make_io()), F12_OK);
-    ASSERT(!fs.fat.fat_mismatch);
-
-    f12_dir_t dir;
-    ASSERT_EQ(f12_opendir(&fs, "/", &dir), F12_OK);
-    int count = 0;
-    f12_stat_t stat;
-    while (f12_readdir(&dir, &stat) == F12_OK) count++;
-    f12_closedir(&dir);
-    ASSERT(count > 0);
-
-    f12_unmount(&fs);
-}
-
-TEST(test_e2e_corrupted_data_track_doesnt_crash_mount) {
-    reset_to_baseline();
-
-    corrupt_track_random(40, 0, 5000, 0xDEADBEEF);
-    corrupt_track_random(60, 1, 5000, 0xCAFEBABE);
-
-    f12_t fs;
-    memset(&fs, 0, sizeof(fs));
-    f12_err_t err = f12_mount(&fs, make_io());
-    ASSERT_EQ(err, F12_OK);
-
-    f12_dir_t dir;
-    ASSERT_EQ(f12_opendir(&fs, "/", &dir), F12_OK);
-    int count = 0;
-    f12_stat_t stat;
-    while (f12_readdir(&dir, &stat) == F12_OK) count++;
-    f12_closedir(&dir);
-    printf("\n  Listed %d files with corrupted data tracks\n  ", count);
-    ASSERT(count > 0);
-
-    f12_unmount(&fs);
-}
-
-TEST(test_e2e_corrupted_track0_side0_breaks_mount) {
-    reset_to_baseline();
-
-    wipe_track(0, 0);
-
-    f12_t fs;
-    memset(&fs, 0, sizeof(fs));
-    f12_err_t err = f12_mount(&fs, make_io());
-    ASSERT(err != F12_OK);
-    ASSERT(!fs.mounted);
-    printf("\n  mount on wiped track 0 side 0: err=%d\n  ", err);
-}
-
-TEST(test_e2e_corrupted_fat_region_detected) {
-    reset_to_baseline();
-
-    corrupt_track_random(0, 0, 200, 0x12345678);
-
-    f12_t fs;
-    memset(&fs, 0, sizeof(fs));
-    f12_err_t err = f12_mount(&fs, make_io());
-    if (err == F12_OK) {
-        printf("\n  mount succeeded; fat_mismatch=%d\n  ", fs.fat.fat_mismatch);
-        f12_unmount(&fs);
-    } else {
-        printf("\n  mount rejected corrupted FAT region: err=%d\n  ", err);
-    }
-}
-
-TEST(test_e2e_corrupted_data_file_read_handled) {
-    reset_to_baseline();
-
-    f12_t fs;
-    memset(&fs, 0, sizeof(fs));
-    ASSERT_EQ(f12_mount(&fs, make_io()), F12_OK);
-
-    f12_stat_t stat;
-    if (f12_stat(&fs, "README.SS", &stat) != F12_OK) {
-        f12_unmount(&fs);
-        printf("\n  no README.SS on disk; skipping\n  ");
-        return;
-    }
-    f12_unmount(&fs);
-
-    for (int t = 0; t < 80; t++) {
-        for (int s = 0; s < 2; s++) {
-            corrupt_track_random(t, s, 30, (uint32_t)(0xA5A5A5A5u + t * 13 + s));
-        }
-    }
-
-    memset(&fs, 0, sizeof(fs));
-    f12_err_t err = f12_mount(&fs, make_io());
-    if (err != F12_OK) {
-        printf("\n  heavy corruption broke mount (%d) — acceptable\n  ", err);
-        return;
-    }
-
-    f12_file_t *f = f12_open(&fs, "README.SS", "r");
-    if (!f) {
-        printf("\n  could not open file under heavy corruption: errno=%d\n  ", f12_errno(&fs));
-        f12_unmount(&fs);
-        return;
-    }
-
-    uint32_t total = 0;
-    uint8_t buf[512];
-    int n;
-    int reads = 0;
-    while ((n = f12_read(f, buf, sizeof(buf))) > 0 && reads < 1000) {
-        total += n;
-        reads++;
-    }
-    printf("\n  read %u/%u bytes (n=%d errno=%d) under heavy corruption\n  ",
-           total, stat.size, n, f12_errno(&fs));
-    ASSERT(n >= -1);
-
-    f12_close(f);
-    f12_unmount(&fs);
-}
-
-TEST(test_e2e_corrupted_root_dir_listing_safe) {
-    reset_to_baseline();
-
-    corrupt_track_random(0, 1, 1500, 0xFEEDFACE);
-
-    f12_t fs;
-    memset(&fs, 0, sizeof(fs));
-    f12_err_t err = f12_mount(&fs, make_io());
-    if (err != F12_OK) {
-        printf("\n  corrupted root dir track broke mount (err=%d)\n  ", err);
-        return;
-    }
-
-    f12_dir_t dir;
-    f12_err_t r = f12_opendir(&fs, "/", &dir);
-    if (r == F12_OK) {
-        f12_stat_t stat;
-        int seen = 0;
-        while (f12_readdir(&dir, &stat) == F12_OK && seen < 256) {
-            seen++;
-        }
-        f12_closedir(&dir);
-        printf("\n  listed %d entries with corrupted root dir track\n  ", seen);
-    }
-
-    f12_unmount(&fs);
-}
-
-TEST(test_e2e_random_corruption_no_crash_sweep) {
-    uint32_t seeds[] = { 1, 2, 3, 0x42424242, 0xDEAD0000 };
-    for (size_t s = 0; s < sizeof(seeds) / sizeof(seeds[0]); s++) {
-        reset_to_baseline();
-
-        uint32_t seed = seeds[s];
-        for (int t = 0; t < 80; t++) {
-            for (int side = 0; side < 2; side++) {
-                if ((lcg(&seed) & 0xF) == 0) {
-                    corrupt_track_random(t, side, 20 + (lcg(&seed) & 0xFF),
-                                          seeds[s] + t * 31 + side);
-                }
-            }
-        }
-
-        f12_t fs;
-        memset(&fs, 0, sizeof(fs));
-        f12_err_t err = f12_mount(&fs, make_io());
-        if (err == F12_OK) {
-            f12_dir_t dir;
-            if (f12_opendir(&fs, "/", &dir) == F12_OK) {
-                f12_stat_t stat;
-                int n = 0;
-                while (f12_readdir(&dir, &stat) == F12_OK && n < 256) n++;
-                f12_closedir(&dir);
-            }
-            f12_unmount(&fs);
-        }
-    }
-    printf("\n  swept %zu corruption seeds without crash\n  ",
-           sizeof(seeds) / sizeof(seeds[0]));
-}
-
-int main(void) {
-    size_t scp_size;
-    uint8_t *scp_data = load_file(SCP_PATH, &scp_size);
-    if (!scp_data) {
-        printf("=== E2E Corruption Tests: SKIPPED (no SCP file) ===\n");
-        return 0;
-    }
-
-    pio_sim_init(&baseline);
-    pio_sim_load_scp(&baseline, scp_data, scp_size);
-    pio_sim_init(&live);
-
-    printf("=== End-to-End Corruption Tests ===\n");
-    printf("Inject flux corruption through floppy.c -> mfm_decode.c -> fat12.c -> f12.c\n\n");
-
-    RUN_TEST(test_e2e_clean_baseline_mounts);
-    RUN_TEST(test_e2e_corrupted_data_track_doesnt_crash_mount);
-    RUN_TEST(test_e2e_corrupted_track0_side0_breaks_mount);
-    RUN_TEST(test_e2e_corrupted_fat_region_detected);
-    RUN_TEST(test_e2e_corrupted_data_file_read_handled);
-    RUN_TEST(test_e2e_corrupted_root_dir_listing_safe);
-    RUN_TEST(test_e2e_random_corruption_no_crash_sweep);
-
     pio_sim_free(&baseline);
-    pio_sim_free(&live);
-    free(scp_data);
+    free(fixture);
+    return 1;
+  }
 
-    TEST_RESULTS();
+  printf("=== End-to-End Corruption Contracts ===\n\n");
+  RUN_TEST(test_clean_fixture_contract);
+  RUN_TEST(test_fat1_damage_selects_and_repairs_fat2);
+  RUN_TEST(test_fat2_damage_selects_and_repairs_fat1);
+  RUN_TEST(test_data_track_loss_has_exact_bounded_failure);
+  RUN_TEST(test_invalid_boot_sector_is_rejected);
+  RUN_TEST(test_invalid_root_start_cluster_is_repaired);
+
+  if (floppy_initialized) {
+    ASSERT_EQ(floppy_deinit(&floppy), BLOCK_OK);
+    floppy_initialized = false;
+  }
+  pio_sim_free(&live);
+  pio_sim_free(&baseline);
+  free(fixture);
+  TEST_RESULTS();
 }

@@ -1,357 +1,185 @@
 #include "test.h"
 #include "scp_disk.h"
-#include "../src/fat12.h"
 #include "../src/f12.h"
-#include "../src/crc.h"
+#include <errno.h>
 
-#define SCP_PATH "../../system-shock-multilingual-floppy-ibm-pc/disk1.scp"
+static uint8_t *fixture_data;
+static size_t fixture_size;
+static scp_disk_t fixture_disk;
+static uint8_t image[DISK_SECTOR_COUNT][DISK_SECTOR_SIZE];
+static bool coverage[DISK_SECTOR_COUNT];
 
-static uint8_t *load_file(const char *path, size_t *size) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    *size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    uint8_t *buf = malloc(*size);
-    if (!buf) { fclose(f); return NULL; }
-    fread(buf, 1, *size, f);
-    fclose(f);
-    return buf;
+static uint8_t *load_fixture(const char *path, size_t *size) {
+  *size = 0;
+  FILE *file = fopen(path, "rb");
+  if (!file) return NULL;
+  if (fseek(file, 0, SEEK_END) != 0) {
+    fclose(file);
+    return NULL;
+  }
+  long length = ftell(file);
+  if (length <= 0 || fseek(file, 0, SEEK_SET) != 0) {
+    fclose(file);
+    return NULL;
+  }
+  uint8_t *data = malloc((size_t)length);
+  if (!data) {
+    fclose(file);
+    return NULL;
+  }
+  size_t read = fread(data, 1, (size_t)length, file);
+  bool closed = fclose(file) == 0;
+  if (read != (size_t)length || !closed) {
+    free(data);
+    return NULL;
+  }
+  *size = (size_t)length;
+  return data;
 }
 
-static uint8_t *scp_file = NULL;
-static size_t scp_size = 0;
-static scp_disk_t scp_disk;
+static uint32_t checksum(const uint8_t *data, size_t size) {
+  uint32_t value = 5381u;
+  for (size_t i = 0; i < size; i++) value = value * 33u + data[i];
+  return value;
+}
 
-static uint8_t disk_image[2880][512];
-static bool sector_decoded[2880];
-
-static void decode_full_disk(void) {
-    flux_sim_t sim;
-    flux_sim_open_scp(&sim, scp_file, scp_size);
-
-    memset(sector_decoded, 0, sizeof(sector_decoded));
-
-    for (int track = 0; track < 80; track++) {
-        for (int side = 0; side < 2; side++) {
-            for (int rev = 0; rev < scp_disk.num_revolutions; rev++) {
-                if (!flux_sim_seek(&sim, track, side, rev)) continue;
-
-                mfm_t mfm;
-                mfm_init(&mfm);
-                sector_t out;
-                uint16_t delta;
-
-                while (flux_sim_next(&sim, &delta)) {
-                    if (mfm_feed(&mfm, delta, &out)) {
-                        if (out.valid && out.track == track && out.side == side &&
-                            out.sector_n >= 1 && out.sector_n <= SECTORS_PER_TRACK) {
-                            int lba = (track * 2 + side) * SECTORS_PER_TRACK + (out.sector_n - 1);
-                            if (!sector_decoded[lba]) {
-                                memcpy(disk_image[lba], out.data, 512);
-                                sector_decoded[lba] = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+static f12_result_t read_all(f12_file_t *file, uint8_t *data, size_t size) {
+  f12_result_t total = {.error = F12_OK, .count = 0};
+  while (total.count < size) {
+    f12_result_t part = f12_read(file, data + total.count, size - total.count);
+    total.count += part.count;
+    if (part.error != F12_OK) {
+      total.error = part.error;
+      return total;
     }
-
-    flux_sim_close(&sim);
-}
-
-static uint32_t checksum_buf(const uint8_t *buf, size_t len) {
-    uint32_t sum = 0;
-    for (size_t i = 0; i < len; i++) {
-        sum = (sum << 5) + sum + buf[i];
+    if (part.count == 0) {
+      total.error = F12_ERR_IO;
+      return total;
     }
-    return sum;
+  }
+  return total;
 }
 
-TEST(test_decode_all_sectors) {
-    decode_full_disk();
-
-    int decoded = 0;
-    for (int i = 0; i < 2880; i++) {
-        if (sector_decoded[i]) decoded++;
+TEST(test_decode_every_sector) {
+  memset(image, 0, sizeof(image));
+  memset(coverage, 0, sizeof(coverage));
+  for (uint8_t cylinder = 0; cylinder < DISK_CYLINDERS; cylinder++) {
+    for (uint8_t head = 0; head < DISK_HEADS; head++) {
+      track_t track;
+      block_status_t status = scp_disk_read_track(
+          &fixture_disk, 1u, cylinder, head, &track);
+      ASSERT_EQ(status, BLOCK_OK);
+      ASSERT_EQ(track.cylinder, cylinder);
+      ASSERT_EQ(track.head, head);
+      ASSERT_EQ(track.valid, DISK_TRACK_VALID);
+      for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
+        uint16_t lba;
+        ASSERT(disk_chs_to_lba(cylinder, head, sector, &lba));
+        memcpy(image[lba], track.data[sector], DISK_SECTOR_SIZE);
+        coverage[lba] = true;
+      }
     }
-
-    printf("\n  Decoded %d/2880 sectors from flux\n  ", decoded);
-    ASSERT_EQ(decoded, 2880);
+  }
+  for (uint16_t lba = 0; lba < DISK_SECTOR_COUNT; lba++) {
+    ASSERT(coverage[lba]);
+  }
 }
 
-TEST(test_boot_sector_validity) {
-    uint8_t *boot = disk_image[0];
-
-    ASSERT_EQ(boot[0], 0xEB);
-    ASSERT_EQ(boot[510], 0x55);
-    ASSERT_EQ(boot[511], 0xAA);
-
-    uint16_t bps = boot[11] | (boot[12] << 8);
-    uint8_t spc = boot[13];
-    uint16_t reserved = boot[14] | (boot[15] << 8);
-    uint8_t fats = boot[16];
-    uint16_t root_entries = boot[17] | (boot[18] << 8);
-    uint16_t total = boot[19] | (boot[20] << 8);
-    uint8_t media = boot[21];
-    uint16_t spf = boot[22] | (boot[23] << 8);
-    uint16_t spt = boot[24] | (boot[25] << 8);
-    uint16_t heads = boot[26] | (boot[27] << 8);
-
-    printf("\n  Boot sector:\n");
-    printf("    Bytes/sector:     %d\n", bps);
-    printf("    Sectors/cluster:  %d\n", spc);
-    printf("    Reserved sectors: %d\n", reserved);
-    printf("    FATs:             %d\n", fats);
-    printf("    Root entries:     %d\n", root_entries);
-    printf("    Total sectors:    %d\n", total);
-    printf("    Media descriptor: 0x%02X\n", media);
-    printf("    Sectors/FAT:      %d\n", spf);
-    printf("    Sectors/track:    %d\n", spt);
-    printf("    Heads:            %d\n", heads);
-    printf("  ");
-
-    ASSERT_EQ(bps, 512);
-    ASSERT_EQ(total, 2880);
-    ASSERT_EQ(media, 0xF0);
-    ASSERT_EQ(spt, 18);
-    ASSERT_EQ(heads, 2);
+TEST(test_fixed_geometry_fat12_image) {
+  const uint8_t *boot = image[0];
+  ASSERT_EQ(boot[FAT12_BOOT_SIG_OFFSET], 0x55);
+  ASSERT_EQ(boot[FAT12_BOOT_SIG_OFFSET + 1u], 0xAA);
+  ASSERT_EQ(boot[21], FAT12_MEDIA_DESCRIPTOR);
+  ASSERT_EQ(boot[24], DISK_SECTORS_PER_TRACK);
+  ASSERT_EQ(boot[26], DISK_HEADS);
+  for (uint16_t sector = 0; sector < FAT12_SECTORS_PER_FAT; sector++) {
+    ASSERT_MEM_EQ(image[FAT12_RESERVED_SECTORS + sector],
+                  image[FAT12_RESERVED_SECTORS + FAT12_SECTORS_PER_FAT + sector],
+                  DISK_SECTOR_SIZE);
+  }
+  uint32_t value = 0;
+  for (uint16_t lba = 0; lba < DISK_SECTOR_COUNT; lba++) {
+    value ^= checksum(image[lba], DISK_SECTOR_SIZE);
+  }
+  ASSERT(value != 0);
 }
 
-TEST(test_fat_tables_match) {
-    uint16_t spf = disk_image[0][22] | (disk_image[0][23] << 8);
-    uint16_t fat1_start = 1;
-    uint16_t fat2_start = 1 + spf;
+TEST(test_f12_reads_fixture_consistently) {
+  f12_t fs;
+  ASSERT_EQ(f12_init(&fs, scp_disk_device(&fixture_disk)), F12_OK);
+  ASSERT_EQ(f12_mount(&fs), F12_OK);
 
-    int mismatches = 0;
-    for (int i = 0; i < spf; i++) {
-        if (memcmp(disk_image[fat1_start + i], disk_image[fat2_start + i], 512) != 0) {
-            mismatches++;
-        }
-    }
+  fat12_fsck_t report;
+  ASSERT_EQ(f12_fsck(&fs, &report, false), F12_OK);
+  ASSERT_EQ(report.crosslinked, 0);
+  ASSERT_EQ(report.loops, 0);
 
-    printf("\n  FAT1 (sectors %d-%d) vs FAT2 (sectors %d-%d): %d mismatches\n  ",
-           fat1_start, fat1_start + spf - 1,
-           fat2_start, fat2_start + spf - 1,
-           mismatches);
-    ASSERT_EQ(mismatches, 0);
-}
-
-TEST(test_fat12_reads_match_raw) {
-    fat12_io_t io = {
-        .read = scp_disk_read,
-        .write = scp_disk_write,
-        .ctx = &scp_disk,
-    };
-
-    fat12_t fat;
-    fat12_init(&fat, io);
-
-    int checked = 0;
-    int match = 0;
-
-    for (uint16_t i = 0; i < fat.bpb.root_entries; i++) {
-        fat12_dirent_t entry;
-        if (fat12_read_root_entry(&fat, i, &entry) != FAT12_OK) break;
-        if (fat12_entry_is_end(&entry)) break;
-        if (!fat12_entry_valid(&entry)) continue;
-        if (entry.attr & 0x18) continue;
-        if (entry.size == 0) continue;
-
-        fat12_file_t file;
-        fat12_open(&fat, &entry, &file);
-
-        uint8_t *buf = malloc(entry.size);
-        uint32_t total = 0;
-        int n;
-        while ((n = fat12_read(&file, buf + total, 512)) > 0) {
-            total += n;
-        }
-
-        uint16_t cluster = entry.start_cluster;
-        uint32_t offset = 0;
-        bool data_match = true;
-
-        while (cluster >= 2 && !fat12_is_eof(cluster) && offset < total) {
-            uint16_t lba = fat.data_start_sector + (cluster - 2);
-            uint16_t chunk = total - offset;
-            if (chunk > 512) chunk = 512;
-
-            if (memcmp(buf + offset, disk_image[lba], chunk) != 0) {
-                data_match = false;
-            }
-
-            offset += 512;
-            uint16_t next;
-            fat12_get_entry(&fat, cluster, &next);
-            cluster = next;
-        }
-
-        checked++;
-        if (data_match && total == entry.size) match++;
-
-        free(buf);
-    }
-
-    printf("\n  FAT12 file reads vs raw sectors: %d/%d match\n  ", match, checked);
-    ASSERT_EQ(match, checked);
-}
-
-typedef struct {
-    char name[13];
-    uint32_t size;
-    uint32_t checksum;
-} file_record_t;
-
-TEST(test_f12_list_all_files) {
-    f12_io_t io = {
-        .read = scp_disk_read,
-        .write = scp_disk_write,
-        .disk_changed = NULL,
-        .write_protected = scp_disk_write_protected,
-        .ctx = &scp_disk,
-    };
-
-    f12_t fs;
-    memset(&fs, 0, sizeof(fs));
-    f12_err_t err = f12_mount(&fs, io);
-    ASSERT_EQ(err, F12_OK);
-
-    printf("\n  Files on System Shock Disk 1:\n");
-    printf("  %-12s %10s %10s\n", "NAME", "SIZE", "CHECKSUM");
-    printf("  %-12s %10s %10s\n", "----", "----", "--------");
-
-    f12_dir_t dir;
-    f12_opendir(&fs, "/", &dir);
-
-    int file_count = 0;
-    uint32_t total_bytes = 0;
+  f12_dir_t dir;
+  ASSERT_EQ(f12_opendir(&fs, "/", &dir), F12_OK);
+  size_t files = 0;
+  size_t bytes = 0;
+  for (;;) {
     f12_stat_t stat;
+    f12_err_t error = f12_readdir(&dir, &stat);
+    if (error == F12_END) break;
+    ASSERT_EQ(error, F12_OK);
+    if ((stat.attr & FAT12_ATTR_DIRECTORY) != 0 || stat.size == 0) continue;
 
-    while (f12_readdir(&dir, &stat) == F12_OK) {
-        if (stat.is_dir) continue;
+    uint8_t *first = malloc(stat.size);
+    uint8_t *second = malloc(stat.size);
+    ASSERT(first != NULL);
+    ASSERT(second != NULL);
+    f12_file_t file;
+    ASSERT_EQ(f12_open(&fs, stat.name, F12_OPEN_READ, &file), F12_OK);
+    f12_result_t result = read_all(&file, first, stat.size);
+    ASSERT_EQ(result.error, F12_OK);
+    ASSERT_EQ(result.count, stat.size);
+    ASSERT_EQ(f12_close(&file), F12_OK);
+    ASSERT_EQ(f12_open(&fs, stat.name, F12_OPEN_READ, &file), F12_OK);
+    result = read_all(&file, second, stat.size);
+    ASSERT_EQ(result.error, F12_OK);
+    ASSERT_EQ(result.count, stat.size);
+    ASSERT_EQ(f12_close(&file), F12_OK);
+    ASSERT_MEM_EQ(first, second, stat.size);
+    ASSERT_EQ(checksum(first, stat.size), checksum(second, stat.size));
+    free(first);
+    free(second);
+    files++;
+    bytes += stat.size;
+  }
+  ASSERT_EQ(f12_closedir(&dir), F12_OK);
+  ASSERT(files > 0);
+  ASSERT(bytes > 0);
 
-        f12_file_t *f = f12_open(&fs, stat.name, "r");
-        ASSERT(f != NULL);
-
-        uint8_t *buf = malloc(stat.size + 1);
-        uint32_t total = 0;
-        int n;
-        while ((n = f12_read(f, buf + total, 512)) > 0) {
-            total += n;
-        }
-        f12_close(f);
-
-        ASSERT_EQ(total, stat.size);
-
-        uint32_t cksum = checksum_buf(buf, total);
-        printf("  %-12s %10u 0x%08X\n", stat.name, total, cksum);
-
-        free(buf);
-        file_count++;
-        total_bytes += total;
-    }
-    f12_closedir(&dir);
-
-    printf("  ---\n");
-    printf("  %d files, %u bytes total\n  ", file_count, total_bytes);
-    ASSERT(file_count > 0);
-
-    f12_unmount(&fs);
+  f12_file_t writer;
+  ASSERT_EQ(f12_open(&fs, "WRITE.BIN", F12_OPEN_WRITE, &writer),
+            F12_ERR_WRITE_PROTECTED);
+  ASSERT_EQ(f12_unmount(&fs), F12_OK);
 }
 
-TEST(test_f12_read_consistency) {
-    f12_io_t io = {
-        .read = scp_disk_read,
-        .write = scp_disk_write,
-        .disk_changed = NULL,
-        .write_protected = scp_disk_write_protected,
-        .ctx = &scp_disk,
-    };
+int main(int argc, char **argv) {
+  if (argc != 3 || strcmp(argv[1], "--fixture") != 0) {
+    fprintf(stderr, "Usage: %s --fixture PATH\n", argv[0]);
+    return 2;
+  }
+  fixture_data = load_fixture(argv[2], &fixture_size);
+  if (!fixture_data) {
+    fprintf(stderr, "Cannot read required SCP fixture %s: %s\n",
+            argv[2], strerror(errno));
+    return 1;
+  }
+  if (!scp_disk_init(&fixture_disk, fixture_data, fixture_size)) {
+    fprintf(stderr, "Invalid SCP fixture: %s\n", argv[2]);
+    free(fixture_data);
+    return 1;
+  }
 
-    f12_t fs;
-    memset(&fs, 0, sizeof(fs));
-    f12_mount(&fs, io);
-
-    f12_dir_t dir;
-    f12_opendir(&fs, "/", &dir);
-
-    f12_stat_t stat;
-    int verified = 0;
-
-    while (f12_readdir(&dir, &stat) == F12_OK) {
-        if (stat.is_dir || stat.size == 0) continue;
-
-        uint8_t *buf1 = malloc(stat.size);
-        uint8_t *buf2 = malloc(stat.size);
-
-        f12_file_t *f1 = f12_open(&fs, stat.name, "r");
-        uint32_t t1 = 0;
-        int n;
-        while ((n = f12_read(f1, buf1 + t1, 512)) > 0) t1 += n;
-        f12_close(f1);
-
-        f12_file_t *f2 = f12_open(&fs, stat.name, "r");
-        uint32_t t2 = 0;
-        while ((n = f12_read(f2, buf2 + t2, 512)) > 0) t2 += n;
-        f12_close(f2);
-
-        ASSERT_EQ(t1, stat.size);
-        ASSERT_EQ(t2, stat.size);
-        ASSERT_MEM_EQ(buf1, buf2, stat.size);
-
-        free(buf1);
-        free(buf2);
-        verified++;
-    }
-    f12_closedir(&dir);
-
-    printf("\n  %d files read twice and verified identical\n  ", verified);
-    ASSERT(verified > 0);
-
-    f12_unmount(&fs);
-}
-
-TEST(test_disk_image_checksum) {
-    uint32_t cksum = 0;
-    for (int i = 0; i < 2880; i++) {
-        cksum ^= checksum_buf(disk_image[i], 512);
-    }
-
-    printf("\n  Full disk image checksum: 0x%08X\n  ", cksum);
-    ASSERT(cksum != 0);
-}
-
-int main(int argc, char *argv[]) {
-    const char *scp_path = SCP_PATH;
-    if (argc > 1) scp_path = argv[1];
-
-    scp_file = load_file(scp_path, &scp_size);
-    if (!scp_file) {
-        printf("=== SCP+FAT12 Tests: SKIPPED (no SCP file at %s) ===\n", scp_path);
-        return 0;
-    }
-
-    scp_disk_init(&scp_disk, scp_file, scp_size);
-
-    printf("=== SCP+FAT12 End-to-End Tests ===\n");
-    printf("File: %s (%.1f MB)\n\n", scp_path, scp_size / 1048576.0);
-
-    printf("--- Raw Decode ---\n");
-    RUN_TEST(test_decode_all_sectors);
-    RUN_TEST(test_boot_sector_validity);
-    RUN_TEST(test_fat_tables_match);
-    RUN_TEST(test_disk_image_checksum);
-
-    printf("\n--- FAT12 Layer ---\n");
-    RUN_TEST(test_fat12_reads_match_raw);
-
-    printf("\n--- F12 High-Level API ---\n");
-    RUN_TEST(test_f12_list_all_files);
-    RUN_TEST(test_f12_read_consistency);
-
-    free(scp_file);
-
-    TEST_RESULTS();
+  printf("=== SCP FAT12 Contract Tests ===\n");
+  printf("Fixture: %s (%zu bytes)\n\n", argv[2], fixture_size);
+  RUN_TEST(test_decode_every_sector);
+  RUN_TEST(test_fixed_geometry_fat12_image);
+  RUN_TEST(test_f12_reads_fixture_consistently);
+  scp_disk_deinit(&fixture_disk);
+  free(fixture_data);
+  TEST_RESULTS();
 }

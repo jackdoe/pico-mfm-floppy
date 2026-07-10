@@ -12,6 +12,7 @@ typedef struct {
   bool read_increment;
   bool write_increment;
   bool ring_write;
+  bool high_priority;
   uint ring_bits;
   uint dreq;
 } dma_channel_config;
@@ -48,7 +49,13 @@ static inline void channel_config_set_dreq(dma_channel_config *c, uint dreq) {
   c->dreq = dreq;
 }
 
+static inline void channel_config_set_high_priority(dma_channel_config *c,
+                                                    bool high_priority) {
+  c->high_priority = high_priority;
+}
+
 int dma_claim_unused_channel(bool required);
+void dma_channel_unclaim(uint channel);
 void dma_channel_configure(uint channel, const dma_channel_config *config,
                            volatile void *write_addr, const volatile void *read_addr,
                            uint transfer_count, bool trigger);

@@ -4,66 +4,76 @@
 
 floppy_t *pio_sim_floppy_ref;
 
-static pio_sim_drive_t sim_drive;
+static pio_sim_drive_t drive;
 static floppy_t floppy;
 
+static floppy_pins_t test_pins(void) {
+  return (floppy_pins_t){
+      .index = 1, .track0 = 2, .write_protect = 3, .read_data = 4,
+      .disk_change = 5, .drive_select = 6, .motor_enable = 7,
+      .direction = 8, .step = 9, .write_data = 10, .write_gate = 11,
+      .side_select = 12, .density = 13,
+  };
+}
+
+static uint32_t generation(void) {
+  uint32_t value;
+  ASSERT_EQ(floppy_media_generation(&floppy, &value), BLOCK_OK);
+  return value;
+}
+
 static void setup_floppy(void) {
-  memset(&sim_drive, 0, sizeof(sim_drive));
-  pio_sim_init(&sim_drive);
-  pio_sim_install(&sim_drive);
-
+  floppy_deinit(&floppy);
+  pio_sim_free(&drive);
+  pio_sim_init(&drive);
+  drive.write_revolution_override = 4800000u;
+  pio_sim_install(&drive);
   memset(&floppy, 0, sizeof(floppy));
-  floppy.pins.index = 1;
-  floppy.pins.track0 = 2;
-  floppy.pins.write_protect = 3;
-  floppy.pins.read_data = 4;
-  floppy.pins.disk_change = 5;
-  floppy.pins.drive_select = 6;
-  floppy.pins.motor_enable = 7;
-  floppy.pins.direction = 8;
-  floppy.pins.step = 9;
-  floppy.pins.write_data = 10;
-  floppy.pins.write_gate = 11;
-  floppy.pins.side_select = 12;
-  floppy.pins.density = 13;
-
   pio_sim_floppy_ref = &floppy;
-  floppy_init(&floppy);
+  ASSERT_EQ(floppy_init(&floppy, test_pins()), BLOCK_OK);
 }
 
 static void fill_track(track_t *track) {
   memset(track, 0, sizeof(*track));
-  track->track = 0;
-  track->side = 0;
-
-  for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-    sector_t *sector = &track->sectors[i];
-    sector->track = 0;
-    sector->side = 0;
-    sector->sector_n = i + 1;
-    sector->size_code = 2;
-    sector->valid = true;
-    memset(sector->data, i, sizeof(sector->data));
+  track->cylinder = 0;
+  track->head = 0;
+  track->valid = DISK_TRACK_VALID;
+  for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
+    memset(track->data[sector], sector * 13u, DISK_SECTOR_SIZE);
   }
 }
 
-TEST(test_write_track_times_out_on_tx_underrun) {
+TEST(test_tx_starvation_after_gate_is_explicit_underrun) {
   setup_floppy();
-  sim_drive.tx_stall = true;
-
+  drive.tx_force_underrun = true;
+  drive.tx_force_underrun_repeat = true;
   track_t track;
   fill_track(&track);
+  uint32_t expected_generation = generation();
+  ASSERT_EQ(floppy_write_track(&floppy, expected_generation, &track), BLOCK_ERR_UNDERRUN);
+  ASSERT(drive.write_gate_assertions > 0);
+  ASSERT_EQ(drive.write_gate_assertions, drive.write_gate_deassertions);
+  ASSERT(!drive.write_gate_active);
+  ASSERT_EQ(floppy.stats.underruns, 3);
+}
 
-  ASSERT_EQ(floppy_write_track(&floppy, &track), FLOPPY_ERR_TIMEOUT);
-  ASSERT_EQ(sim_drive.write_capture_count, 0);
-
-  pio_sim_free(&sim_drive);
+TEST(test_dma_stall_before_gate_is_timeout) {
+  setup_floppy();
+  drive.tx_stall = true;
+  track_t track;
+  fill_track(&track);
+  ASSERT_EQ(floppy_write_track(&floppy, generation(), &track),
+            BLOCK_ERR_TIMEOUT);
+  ASSERT_EQ(drive.write_gate_assertions, 0);
+  ASSERT_EQ(drive.write_capture_count, 0);
 }
 
 int main(void) {
-  printf("=== Floppy TX Underrun Tests ===\n\n");
-
-  RUN_TEST(test_write_track_times_out_on_tx_underrun);
-
+  pio_sim_init(&drive);
+  printf("=== Floppy TX Starvation Tests ===\n\n");
+  RUN_TEST(test_tx_starvation_after_gate_is_explicit_underrun);
+  RUN_TEST(test_dma_stall_before_gate_is_timeout);
+  ASSERT_EQ(floppy_deinit(&floppy), BLOCK_OK);
+  pio_sim_free(&drive);
   TEST_RESULTS();
 }

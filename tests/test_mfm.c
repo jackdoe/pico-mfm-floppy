@@ -1,627 +1,518 @@
 #include "test.h"
-#include "../src/floppy.h"
 #include "../src/crc.h"
 #include "../src/mfm_decode.h"
 #include "../src/mfm_encode.h"
+#include <string.h>
 
-uint16_t pulse_to_delta(uint8_t pulse) {
-    return pulse + MFM_PIO_OVERHEAD;
+static uint16_t pulse_delta(uint8_t pulse) {
+  return pulse + MFM_PIO_OVERHEAD;
 }
 
-uint16_t pulse_to_delta_jitter(uint8_t pulse, uint32_t *seed) {
-    *seed = *seed * 1103515245 + 12345;
-    int jitter = ((*seed >> 16) % 11) - 5;
-    return pulse + MFM_PIO_OVERHEAD + jitter;
+static void encode_address(mfm_encode_t *encoder, uint8_t cylinder, uint8_t head,
+                           uint8_t sector, uint8_t size_code, bool bad_crc) {
+  uint8_t address[] = {MFM_ADDR_MARK, cylinder, head, sector, size_code};
+  uint16_t crc = crc16_mfm(address, sizeof(address));
+  if (bad_crc) crc ^= 1u;
+  uint8_t crc_bytes[] = {crc >> 8, crc & 0xFF};
+  mfm_encode_sync(encoder);
+  mfm_encode_bytes(encoder, address, sizeof(address));
+  mfm_encode_bytes(encoder, crc_bytes, sizeof(crc_bytes));
 }
 
-TEST(test_encoder_basic) {
-    uint8_t buf[1024];
-    mfm_encode_t enc;
-    mfm_encode_init(&enc, buf, sizeof(buf));
+static void encode_data(mfm_encode_t *encoder, uint8_t mark, const uint8_t *data,
+                        size_t size, bool bad_crc) {
+  uint16_t crc = crc16(data, size, crc16_mfm(&mark, 1));
+  if (bad_crc) crc ^= 1u;
+  uint8_t crc_bytes[] = {crc >> 8, crc & 0xFF};
+  mfm_encode_sync(encoder);
+  mfm_encode_bytes(encoder, &mark, 1);
+  mfm_encode_bytes(encoder, data, size);
+  mfm_encode_bytes(encoder, crc_bytes, sizeof(crc_bytes));
+}
 
-    enc.prev_bit = 1;
-    uint8_t data = 0xFB;
-    mfm_encode_bytes(&enc, &data, 1);
+static bool decode_all(mfm_t *decoder, const uint8_t *pulses, size_t count,
+                       mfm_sector_t *sector) {
+  bool found = false;
+  for (size_t i = 0; i < count; i++) {
+    if (mfm_feed(decoder, pulse_delta(pulses[i]), sector)) found = true;
+  }
+  return found;
+}
 
-    printf("\n  Encoded 0xFB: %zu pulses\n  ", enc.pos);
-
-    ASSERT(enc.pos > 0);
-    ASSERT(enc.pos <= 8);
+static void fill_track(track_t *track, uint8_t cylinder, uint8_t head, uint32_t seed) {
+  memset(track, 0, sizeof(*track));
+  track->cylinder = cylinder;
+  track->head = head;
+  track->valid = DISK_TRACK_VALID;
+  for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
+    for (size_t byte = 0; byte < DISK_SECTOR_SIZE; byte++) {
+      seed = seed * 1664525u + 1013904223u;
+      track->data[sector][byte] = seed >> 24;
+    }
+  }
 }
 
 TEST(test_encoder_sync) {
-    uint8_t buf[1024];
-    mfm_encode_t enc;
-    mfm_encode_init(&enc, buf, sizeof(buf));
-
-    mfm_encode_sync(&enc);
-
-    printf("\n  Sync produced %zu pulses\n  ", enc.pos);
-
-    ASSERT(enc.pos > 100);
-
-    size_t sync_start = enc.pos - 15;
-    ASSERT_EQ(buf[sync_start + 0], MFM_PULSE_MEDIUM);
-    ASSERT_EQ(buf[sync_start + 1], MFM_PULSE_LONG);
-    ASSERT_EQ(buf[sync_start + 2], MFM_PULSE_MEDIUM);
-    ASSERT_EQ(buf[sync_start + 3], MFM_PULSE_LONG);
-    ASSERT_EQ(buf[sync_start + 4], MFM_PULSE_MEDIUM);
-    ASSERT_EQ(buf[sync_start + 5], MFM_PULSE_SHORT);
-    ASSERT_EQ(buf[sync_start + 6], MFM_PULSE_LONG);
-    ASSERT_EQ(buf[sync_start + 7], MFM_PULSE_MEDIUM);
-    ASSERT_EQ(buf[sync_start + 8], MFM_PULSE_LONG);
-    ASSERT_EQ(buf[sync_start + 9], MFM_PULSE_MEDIUM);
-    ASSERT_EQ(buf[sync_start + 10], MFM_PULSE_SHORT);
-    ASSERT_EQ(buf[sync_start + 11], MFM_PULSE_LONG);
-    ASSERT_EQ(buf[sync_start + 12], MFM_PULSE_MEDIUM);
-    ASSERT_EQ(buf[sync_start + 13], MFM_PULSE_LONG);
-    ASSERT_EQ(buf[sync_start + 14], MFM_PULSE_MEDIUM);
+  uint8_t pulses[1024];
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  mfm_encode_sync(&encoder);
+  ASSERT(encoder.pos > 100);
+  static const uint8_t expected[] = {
+      MFM_PULSE_MEDIUM, MFM_PULSE_LONG, MFM_PULSE_MEDIUM,
+      MFM_PULSE_LONG, MFM_PULSE_MEDIUM, MFM_PULSE_SHORT,
+      MFM_PULSE_LONG, MFM_PULSE_MEDIUM, MFM_PULSE_LONG,
+      MFM_PULSE_MEDIUM, MFM_PULSE_SHORT, MFM_PULSE_LONG,
+      MFM_PULSE_MEDIUM, MFM_PULSE_LONG, MFM_PULSE_MEDIUM,
+  };
+  ASSERT_MEM_EQ(&pulses[encoder.pos - sizeof(expected)], expected, sizeof(expected));
 }
 
 TEST(test_crc) {
-    uint8_t data[] = {0xFE, 0x00, 0x00, 0x01, 0x02};
-
-    uint16_t crc = crc16_mfm(data, 5);
-
-    uint16_t manual_crc = 0xFFFF;
-    manual_crc = crc16_update(manual_crc, 0xA1);
-    manual_crc = crc16_update(manual_crc, 0xA1);
-    manual_crc = crc16_update(manual_crc, 0xA1);
-    for (int i = 0; i < 5; i++) {
-        manual_crc = crc16_update(manual_crc, data[i]);
-    }
-
-    printf("\n  CRC: %04X, Manual CRC: %04X\n  ", crc, manual_crc);
-
-    ASSERT_EQ(crc, manual_crc);
+  uint8_t address[] = {MFM_ADDR_MARK, 0, 0, 1, MFM_SIZE_CODE};
+  uint16_t manual = 0xFFFF;
+  manual = crc16_update(manual, 0xA1);
+  manual = crc16_update(manual, 0xA1);
+  manual = crc16_update(manual, 0xA1);
+  for (size_t i = 0; i < sizeof(address); i++) manual = crc16_update(manual, address[i]);
+  ASSERT_EQ(crc16_mfm(address, sizeof(address)), manual);
 }
 
-TEST(test_roundtrip_sync) {
-    uint8_t buf[1024];
-    mfm_encode_t enc;
-    mfm_encode_init(&enc, buf, sizeof(buf));
-
-    mfm_encode_sync(&enc);
-
-    mfm_t mfm;
-    sector_t sector;
-    mfm_init(&mfm);
-
-    for (size_t i = 0; i < enc.pos; i++) {
-        mfm_feed(&mfm, pulse_to_delta(buf[i]), &sector);
-    }
-
-    printf("\n  Syncs found: %u\n  ", mfm.syncs_found);
-
-    ASSERT_EQ(mfm.syncs_found, 1);
+TEST(test_roundtrip_sector) {
+  uint8_t pulses[16384];
+  uint8_t data[DISK_SECTOR_SIZE];
+  for (size_t i = 0; i < sizeof(data); i++) data[i] = (i * 37u + 11u) & 0xFFu;
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  mfm_encode_sector(&encoder, 10, 1, 6, data);
+  mfm_encode_gap(&encoder, 10);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  ASSERT(decode_all(&decoder, pulses, encoder.pos, &sector));
+  ASSERT_EQ(sector.cylinder, 10);
+  ASSERT_EQ(sector.head, 1);
+  ASSERT_EQ(sector.sector, 6);
+  ASSERT_MEM_EQ(sector.data, data, sizeof(data));
+  ASSERT_EQ(decoder.crc_errors, 0);
+  ASSERT_EQ(decoder.format_errors, 0);
 }
 
-TEST(test_roundtrip_address_record) {
-    uint8_t buf[2048];
-    mfm_encode_t enc;
-    mfm_encode_init(&enc, buf, sizeof(buf));
-
-    uint8_t addr[5] = {0xFE, 0x05, 0x01, 0x03, 0x02};
-    uint16_t crc = crc16_mfm(addr, 5);
-    uint8_t crc_bytes[2] = {crc >> 8, crc & 0xFF};
-
-    mfm_encode_sync(&enc);
-    mfm_encode_bytes(&enc, addr, 5);
-    mfm_encode_bytes(&enc, crc_bytes, 2);
-
-    mfm_encode_gap(&enc, 4);
-
-    printf("\n  Encoded %zu pulses\n  ", enc.pos);
-
-    mfm_t mfm;
-    sector_t sector;
-    mfm_init(&mfm);
-
-    for (size_t i = 0; i < enc.pos; i++) {
-        mfm_feed(&mfm, pulse_to_delta(buf[i]), &sector);
-    }
-
-    printf("  Syncs: %u, CRC errors: %u, have_addr: %d\n  ",
-           mfm.syncs_found, mfm.crc_errors, mfm.have_pending_addr);
-
-    ASSERT_EQ(mfm.syncs_found, 1);
-    ASSERT_EQ(mfm.crc_errors, 0);
-    ASSERT(mfm.have_pending_addr);
-    ASSERT_EQ(mfm.pending_track, 5);
-    ASSERT_EQ(mfm.pending_side, 1);
-    ASSERT_EQ(mfm.pending_sector, 3);
-    ASSERT_EQ(mfm.pending_size_code, 2);
-}
-
-TEST(test_roundtrip_full_sector) {
-    uint8_t buf[16384];
-    mfm_encode_t enc;
-    mfm_encode_init(&enc, buf, sizeof(buf));
-
-    sector_t src = {.track = 10, .side = 0, .sector_n = 7};
-    for (int i = 0; i < 512; i++) {
-        src.data[i] = i & 0xFF;
-    }
-
-    mfm_encode_sector(&enc, &src);
-    mfm_encode_gap(&enc, 10);
-
-    printf("\n  Encoded sector: %zu pulses\n  ", enc.pos);
-
-    mfm_t mfm;
-    sector_t sector;
-    mfm_init(&mfm);
-
-    bool got_sector = false;
-    for (size_t i = 0; i < enc.pos; i++) {
-        if (mfm_feed(&mfm, pulse_to_delta(buf[i]), &sector)) {
-            got_sector = true;
-            break;
-        }
-    }
-
-    printf("  Syncs: %u, CRC errors: %u, got_sector: %d\n  ",
-           mfm.syncs_found, mfm.crc_errors, got_sector);
-
-    ASSERT(got_sector);
-    ASSERT(sector.valid);
-    ASSERT_EQ(sector.track, 10);
-    ASSERT_EQ(sector.side, 0);
-    ASSERT_EQ(sector.sector_n, 7);
-    ASSERT_EQ(sector_size(&sector), 512);
-
-    for (int i = 0; i < 512; i++) {
-        if (sector.data[i] != (i & 0xFF)) {
-            printf("  Data mismatch at %d: expected %02X, got %02X\n  ",
-                   i, i & 0xFF, sector.data[i]);
-            ASSERT(0);
-        }
-    }
-}
-
-TEST(test_roundtrip_all_zeros) {
-    uint8_t buf[16384];
-    mfm_encode_t enc;
-    mfm_encode_init(&enc, buf, sizeof(buf));
-
-    sector_t src = {.track = 0, .side = 0, .sector_n = 1};
-    memset(src.data, 0, SECTOR_SIZE);
-
-    mfm_encode_sector(&enc, &src);
-    mfm_encode_gap(&enc, 10);
-
-    mfm_t mfm;
-    sector_t sector;
-    mfm_init(&mfm);
-
-    bool got_sector = false;
-    for (size_t i = 0; i < enc.pos; i++) {
-        if (mfm_feed(&mfm, pulse_to_delta(buf[i]), &sector)) {
-            got_sector = true;
-            break;
-        }
-    }
-
-    ASSERT(got_sector);
-    ASSERT(sector.valid);
-    ASSERT_EQ(mfm.crc_errors, 0);
-
-    for (int i = 0; i < 512; i++) {
-        ASSERT_EQ(sector.data[i], 0);
-    }
-}
-
-TEST(test_roundtrip_all_ones) {
-    uint8_t buf[16384];
-    mfm_encode_t enc;
-    mfm_encode_init(&enc, buf, sizeof(buf));
-
-    sector_t src = {.track = 0, .side = 0, .sector_n = 1};
-    memset(src.data, 0xFF, SECTOR_SIZE);
-
-    mfm_encode_sector(&enc, &src);
-    mfm_encode_gap(&enc, 10);
-
-    mfm_t mfm;
-    sector_t sector;
-    mfm_init(&mfm);
-
-    bool got_sector = false;
-    for (size_t i = 0; i < enc.pos; i++) {
-        if (mfm_feed(&mfm, pulse_to_delta(buf[i]), &sector)) {
-            got_sector = true;
-            break;
-        }
-    }
-
-    ASSERT(got_sector);
-    ASSERT(sector.valid);
-
-    for (int i = 0; i < 512; i++) {
-        ASSERT_EQ(sector.data[i], 0xFF);
-    }
-}
-
-TEST(test_roundtrip_alternating_aa) {
-    uint8_t buf[16384];
-    mfm_encode_t enc;
-    mfm_encode_init(&enc, buf, sizeof(buf));
-
-    sector_t src = {.track = 0, .side = 0, .sector_n = 1};
-    memset(src.data, 0xAA, SECTOR_SIZE);
-
-    mfm_encode_sector(&enc, &src);
-    mfm_encode_gap(&enc, 10);
-
-    mfm_t mfm;
-    sector_t sector;
-    mfm_init(&mfm);
-
-    bool got_sector = false;
-    for (size_t i = 0; i < enc.pos; i++) {
-        if (mfm_feed(&mfm, pulse_to_delta(buf[i]), &sector)) {
-            got_sector = true;
-            break;
-        }
-    }
-
-    ASSERT(got_sector);
-    ASSERT(sector.valid);
-
-    for (int i = 0; i < 512; i++) {
-        ASSERT_EQ(sector.data[i], 0xAA);
-    }
-}
-
-TEST(test_roundtrip_alternating_55) {
-    uint8_t buf[16384];
-    mfm_encode_t enc;
-    mfm_encode_init(&enc, buf, sizeof(buf));
-
-    sector_t src = {.track = 0, .side = 0, .sector_n = 1};
-    memset(src.data, 0x55, SECTOR_SIZE);
-
-    mfm_encode_sector(&enc, &src);
-    mfm_encode_gap(&enc, 10);
-
-    mfm_t mfm;
-    sector_t sector;
-    mfm_init(&mfm);
-
-    bool got_sector = false;
-    for (size_t i = 0; i < enc.pos; i++) {
-        if (mfm_feed(&mfm, pulse_to_delta(buf[i]), &sector)) {
-            got_sector = true;
-            break;
-        }
-    }
-
-    ASSERT(got_sector);
-    ASSERT(sector.valid);
-
-    for (int i = 0; i < 512; i++) {
-        ASSERT_EQ(sector.data[i], 0x55);
-    }
-}
-
-TEST(test_roundtrip_random) {
-    uint8_t buf[16384];
-    mfm_encode_t enc;
-    mfm_encode_init(&enc, buf, sizeof(buf));
-
-    sector_t src = {.track = 0x10, .side = 1, .sector_n = 5};
-    uint32_t seed = 12345;
-    for (int i = 0; i < 512; i++) {
-        seed = seed * 1103515245 + 12345;
-        src.data[i] = (seed >> 16) & 0xFF;
-    }
-
-    mfm_encode_sector(&enc, &src);
-    mfm_encode_gap(&enc, 10);
-
-    mfm_t mfm;
-    sector_t sector;
-    mfm_init(&mfm);
-
-    bool got_sector = false;
-    for (size_t i = 0; i < enc.pos; i++) {
-        if (mfm_feed(&mfm, pulse_to_delta(buf[i]), &sector)) {
-            got_sector = true;
-            break;
-        }
-    }
-
-    ASSERT(got_sector);
-    ASSERT(sector.valid);
-    ASSERT_EQ(sector.track, 0x10);
-    ASSERT_EQ(sector.side, 1);
-    ASSERT_EQ(sector.sector_n, 5);
-
-    seed = 12345;
-    for (int i = 0; i < 512; i++) {
-        seed = seed * 1103515245 + 12345;
-        uint8_t expected = (seed >> 16) & 0xFF;
-        if (sector.data[i] != expected) {
-            printf("  Mismatch at %d: expected %02X, got %02X\n  ",
-                   i, expected, sector.data[i]);
-            ASSERT(0);
-        }
-    }
-}
-
-TEST(test_roundtrip_multiple_sectors) {
-    uint8_t buf[65536];
-    mfm_encode_t enc;
-    mfm_encode_init(&enc, buf, sizeof(buf));
-
-    for (int sec = 1; sec <= 3; sec++) {
-        sector_t src = {.track = 0, .side = 0, .sector_n = sec};
-        memset(src.data, sec * 0x11, SECTOR_SIZE);
-        mfm_encode_sector(&enc, &src);
-        mfm_encode_gap(&enc, 54);
-    }
-
-    mfm_t mfm;
-    sector_t sector;
-    mfm_init(&mfm);
-
-    int sectors_found = 0;
-    for (size_t i = 0; i < enc.pos; i++) {
-        if (mfm_feed(&mfm, pulse_to_delta(buf[i]), &sector)) {
-            sectors_found++;
-            ASSERT(sector.valid);
-            ASSERT_EQ(sector.data[0], sector.sector_n * 0x11);
-        }
-    }
-
-    ASSERT_EQ(sectors_found, 3);
-    ASSERT_EQ(mfm.crc_errors, 0);
+TEST(test_roundtrip_patterns) {
+  static const uint8_t patterns[] = {0x00, 0xFF, 0xAA, 0x55, 0x81, 0x7E};
+  for (size_t pattern = 0; pattern < sizeof(patterns); pattern++) {
+    uint8_t pulses[16384];
+    uint8_t data[DISK_SECTOR_SIZE];
+    memset(data, patterns[pattern], sizeof(data));
+    mfm_encode_t encoder;
+    mfm_encode_init(&encoder, pulses, sizeof(pulses));
+    mfm_encode_sector(&encoder, 0, 0, 0, data);
+    mfm_encode_gap(&encoder, 10);
+    mfm_t decoder;
+    mfm_sector_t sector;
+    mfm_init(&decoder);
+    ASSERT(decode_all(&decoder, pulses, encoder.pos, &sector));
+    ASSERT_MEM_EQ(sector.data, data, sizeof(data));
+  }
 }
 
 TEST(test_roundtrip_with_jitter) {
-    uint8_t buf[16384];
-    mfm_encode_t enc;
-    mfm_encode_init(&enc, buf, sizeof(buf));
-
-    sector_t src = {.track = 0, .side = 0, .sector_n = 1};
-    for (int i = 0; i < 512; i++) {
-        src.data[i] = i & 0xFF;
-    }
-
-    mfm_encode_sector(&enc, &src);
-    mfm_encode_gap(&enc, 10);
-
-    mfm_t mfm;
-    sector_t sector;
-    mfm_init(&mfm);
-
-    uint32_t jitter_seed = 54321;
-    bool got_sector = false;
-    for (size_t i = 0; i < enc.pos; i++) {
-        uint16_t delta = pulse_to_delta_jitter(buf[i], &jitter_seed);
-        if (mfm_feed(&mfm, delta, &sector)) {
-            got_sector = true;
-            break;
-        }
-    }
-
-    ASSERT(got_sector);
-    ASSERT(sector.valid);
-
-    for (int i = 0; i < 512; i++) {
-        ASSERT_EQ(sector.data[i], i & 0xFF);
-    }
-}
-
-TEST(test_roundtrip_stress_patterns) {
-    uint8_t patterns[][8] = {
-        {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
-        {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
-        {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA},
-        {0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55},
-        {0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF},
-        {0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F, 0xF0, 0x0F},
-        {0x80, 0x01, 0x80, 0x01, 0x80, 0x01, 0x80, 0x01},
-        {0x7F, 0xFE, 0x7F, 0xFE, 0x7F, 0xFE, 0x7F, 0xFE},
-    };
-
-    for (int p = 0; p < 8; p++) {
-        uint8_t buf[16384];
-        mfm_encode_t enc;
-        mfm_encode_init(&enc, buf, sizeof(buf));
-
-        sector_t src = {.track = 0, .side = 0, .sector_n = 1};
-        for (int i = 0; i < 512; i++) {
-            src.data[i] = patterns[p][i % 8];
-        }
-
-        mfm_encode_sector(&enc, &src);
-        mfm_encode_gap(&enc, 10);
-
-        mfm_t mfm;
-        sector_t sector;
-        mfm_init(&mfm);
-
-        bool got_sector = false;
-        for (size_t i = 0; i < enc.pos; i++) {
-            if (mfm_feed(&mfm, pulse_to_delta(buf[i]), &sector)) {
-                got_sector = true;
-                break;
-            }
-        }
-
-        ASSERT(got_sector);
-        ASSERT(sector.valid);
-
-        for (int i = 0; i < 512; i++) {
-            if (sector.data[i] != patterns[p][i % 8]) {
-                printf("  Pattern %d mismatch at %d: expected %02X, got %02X\n  ",
-                       p, i, patterns[p][i % 8], sector.data[i]);
-                ASSERT(0);
-            }
-        }
-    }
+  uint8_t pulses[16384];
+  uint8_t data[DISK_SECTOR_SIZE];
+  for (size_t i = 0; i < sizeof(data); i++) data[i] = (uint8_t)i;
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  mfm_encode_sector(&encoder, 3, 0, 12, data);
+  mfm_encode_gap(&encoder, 10);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  uint32_t seed = 0x12345678u;
+  bool found = false;
+  for (size_t i = 0; i < encoder.pos; i++) {
+    seed = seed * 1103515245u + 12345u;
+    int jitter = (int)((seed >> 16) % 11u) - 5;
+    uint16_t delta = (uint16_t)((int)pulse_delta(pulses[i]) + jitter);
+    if (mfm_feed(&decoder, delta, &sector)) found = true;
+  }
+  ASSERT(found);
+  ASSERT_MEM_EQ(sector.data, data, sizeof(data));
 }
 
 TEST(test_roundtrip_full_track) {
-    uint8_t buf[200000];
-    mfm_encode_t enc;
-    mfm_encode_init(&enc, buf, sizeof(buf));
-
-    track_t trk = {.track = 5, .side = 1};
-    for (int s = 0; s < SECTORS_PER_TRACK; s++) {
-        trk.sectors[s].track = 5;
-        trk.sectors[s].side = 1;
-        trk.sectors[s].sector_n = s + 1;
-        trk.sectors[s].valid = true;
-        for (int i = 0; i < SECTOR_SIZE; i++) {
-            trk.sectors[s].data[i] = (s << 4) | (i & 0x0F);
-        }
-    }
-
-    size_t track_size = mfm_encode_track(&enc, &trk);
-    printf("\n  Track size: %zu pulses\n  ", track_size);
-
-    mfm_t mfm;
-    sector_t sector;
-    mfm_init(&mfm);
-
-    int sectors_found = 0;
-    uint8_t found_sectors[18] = {0};
-
-    for (size_t i = 0; i < enc.pos; i++) {
-        if (mfm_feed(&mfm, pulse_to_delta(buf[i]), &sector)) {
-            if (sector.valid && sector.sector_n >= 1 && sector.sector_n <= 18) {
-                found_sectors[sector.sector_n - 1] = 1;
-                sectors_found++;
-
-                int s = sector.sector_n - 1;
-                for (int j = 0; j < 512; j++) {
-                    uint8_t expected = (s << 4) | (j & 0x0F);
-                    if (sector.data[j] != expected) {
-                        printf("  Sector %d byte %d: expected %02X, got %02X\n  ",
-                               sector.sector_n, j, expected, sector.data[j]);
-                        ASSERT(0);
-                    }
-                }
-            }
-        }
-    }
-
-    ASSERT_EQ(sectors_found, 18);
-    ASSERT_EQ(mfm.crc_errors, 0);
-
-    for (int i = 0; i < 18; i++) {
-        ASSERT(found_sectors[i]);
-    }
+  static uint8_t pulses[200000];
+  track_t track;
+  fill_track(&track, 5, 1, 0xC0FFEEu);
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  mfm_encode_track(&encoder, &track);
+  ASSERT(!encoder.overflow);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  uint32_t seen = 0;
+  for (size_t i = 0; i < encoder.pos; i++) {
+    if (!mfm_feed(&decoder, pulse_delta(pulses[i]), &sector)) continue;
+    ASSERT_EQ(sector.cylinder, track.cylinder);
+    ASSERT_EQ(sector.head, track.head);
+    ASSERT_MEM_EQ(sector.data, track.data[sector.sector], DISK_SECTOR_SIZE);
+    seen |= 1u << sector.sector;
+  }
+  ASSERT_EQ(seen, DISK_TRACK_VALID);
+  ASSERT_EQ(decoder.sectors_read, DISK_SECTORS_PER_TRACK);
 }
 
-static void reference_precomp(uint8_t *buf, size_t len, uint8_t track) {
-    if (len < 3) return;
-    int shift = MFM_PRECOMP_SHIFT + (track - MFM_PRECOMP_START_TRACK) / 13;
-    for (size_t i = 1; i < len - 1; i++) {
-        if (buf[i] != MFM_PULSE_SHORT) continue;
-        bool prev_long = (buf[i - 1] == MFM_PULSE_LONG);
-        bool next_long = (buf[i + 1] == MFM_PULSE_LONG);
-        if (prev_long && next_long) continue;
-        if (prev_long) buf[i] -= shift;
-        else if (next_long) buf[i] += shift;
-    }
+TEST(test_deleted_data_mark_f8) {
+  uint8_t pulses[16384];
+  uint8_t data[DISK_SECTOR_SIZE];
+  memset(data, 0x77, sizeof(data));
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  encode_address(&encoder, 3, 0, 2, MFM_SIZE_CODE, false);
+  mfm_encode_gap(&encoder, 22);
+  encode_data(&encoder, MFM_DELETED_MARK, data, sizeof(data), false);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  ASSERT(decode_all(&decoder, pulses, encoder.pos, &sector));
+  ASSERT_EQ(sector.sector, 1);
+  ASSERT_MEM_EQ(sector.data, data, sizeof(data));
 }
 
-static void build_random_track(track_t *trk, uint8_t track, uint32_t seed) {
-    memset(trk, 0, sizeof(*trk));
-    trk->track = track;
-    trk->side = 1;
-    for (int s = 0; s < SECTORS_PER_TRACK; s++) {
-        trk->sectors[s].track = track;
-        trk->sectors[s].side = 1;
-        trk->sectors[s].sector_n = s + 1;
-        trk->sectors[s].valid = true;
-        for (int i = 0; i < SECTOR_SIZE; i++) {
-            seed = seed * 1664525u + 1013904223u;
-            trk->sectors[s].data[i] = seed >> 24;
-        }
-    }
+TEST(test_legacy_fa_mark_rejected) {
+  uint8_t pulses[16384];
+  uint8_t data[DISK_SECTOR_SIZE] = {0};
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  encode_address(&encoder, 0, 0, 1, MFM_SIZE_CODE, false);
+  mfm_encode_gap(&encoder, 22);
+  encode_data(&encoder, 0xFA, data, sizeof(data), false);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  ASSERT(!decode_all(&decoder, pulses, encoder.pos, &sector));
+  ASSERT(decoder.format_errors > 0);
+  ASSERT_EQ(decoder.record_state, MFM_EXPECT_ID);
 }
 
-TEST(test_streaming_precomp_matches_reference_post_pass) {
-    static uint8_t expected[200000], actual[200000];
-
-    for (int tn = MFM_PRECOMP_START_TRACK; tn < FLOPPY_TRACKS; tn += 13) {
-        track_t trk;
-        build_random_track(&trk, tn, 0xC0FFEE + tn);
-
-        mfm_encode_t e;
-        mfm_encode_init(&e, expected, sizeof(expected));
-        mfm_encode_gap(&e, 80);
-        for (int s = 0; s < SECTORS_PER_TRACK; s++) {
-            mfm_encode_sector(&e, &trk.sectors[s]);
-            mfm_encode_gap(&e, 54);
-        }
-        size_t raw_len = e.pos;
-        reference_precomp(expected, raw_len, tn);
-
-        mfm_encode_init(&e, actual, sizeof(actual));
-        size_t len = mfm_encode_track(&e, &trk);
-
-        ASSERT_EQ(len, raw_len);
-        ASSERT(memcmp(expected, actual, len) == 0);
+TEST(test_only_size_code_two_is_accepted) {
+  for (uint8_t size_code = 0; size_code < 4; size_code++) {
+    uint8_t pulses[4096];
+    mfm_encode_t encoder;
+    mfm_encode_init(&encoder, pulses, sizeof(pulses));
+    encode_address(&encoder, 0, 0, 1, size_code, false);
+    mfm_encode_gap(&encoder, 4);
+    mfm_t decoder;
+    mfm_sector_t sector;
+    mfm_init(&decoder);
+    ASSERT(!decode_all(&decoder, pulses, encoder.pos, &sector));
+    if (size_code == MFM_SIZE_CODE) {
+      ASSERT_EQ(decoder.record_state, MFM_EXPECT_DATA);
+    } else {
+      ASSERT_EQ(decoder.record_state, MFM_EXPECT_ID);
+      ASSERT(decoder.format_errors > 0);
     }
+  }
+}
+
+TEST(test_invalid_chrn_is_rejected) {
+  static const uint8_t address[][4] = {
+      {DISK_CYLINDERS, 0, 1, MFM_SIZE_CODE},
+      {0, DISK_HEADS, 1, MFM_SIZE_CODE},
+      {0, 0, 0, MFM_SIZE_CODE},
+      {0, 0, DISK_SECTORS_PER_TRACK + 1u, MFM_SIZE_CODE},
+  };
+  for (size_t i = 0; i < sizeof(address) / sizeof(address[0]); i++) {
+    uint8_t pulses[4096];
+    mfm_encode_t encoder;
+    mfm_encode_init(&encoder, pulses, sizeof(pulses));
+    encode_address(&encoder, address[i][0], address[i][1], address[i][2],
+                   address[i][3], false);
+    mfm_encode_gap(&encoder, 4);
+    mfm_t decoder;
+    mfm_sector_t sector;
+    mfm_init(&decoder);
+    ASSERT(!decode_all(&decoder, pulses, encoder.pos, &sector));
+    ASSERT_EQ(decoder.record_state, MFM_EXPECT_ID);
+    ASSERT(decoder.format_errors > 0);
+  }
+}
+
+TEST(test_address_crc_error_drops_record) {
+  uint8_t pulses[4096];
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  encode_address(&encoder, 0, 0, 1, MFM_SIZE_CODE, true);
+  mfm_encode_gap(&encoder, 4);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  ASSERT(!decode_all(&decoder, pulses, encoder.pos, &sector));
+  ASSERT_EQ(decoder.crc_errors, 1);
+  ASSERT_EQ(decoder.record_state, MFM_EXPECT_ID);
+}
+
+TEST(test_data_crc_error_is_not_emitted) {
+  uint8_t pulses[16384];
+  uint8_t data[DISK_SECTOR_SIZE];
+  memset(data, 0xA5, sizeof(data));
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  encode_address(&encoder, 0, 0, 1, MFM_SIZE_CODE, false);
+  mfm_encode_gap(&encoder, 22);
+  encode_data(&encoder, MFM_DATA_MARK, data, sizeof(data), true);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  ASSERT(!decode_all(&decoder, pulses, encoder.pos, &sector));
+  ASSERT_EQ(decoder.crc_errors, 1);
+  ASSERT_EQ(decoder.sectors_read, 0);
+  ASSERT_EQ(decoder.record_state, MFM_EXPECT_ID);
+}
+
+TEST(test_new_address_while_waiting_for_data_is_rejected) {
+  uint8_t pulses[8192];
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  encode_address(&encoder, 0, 0, 1, MFM_SIZE_CODE, false);
+  mfm_encode_gap(&encoder, 22);
+  encode_address(&encoder, 0, 0, 2, MFM_SIZE_CODE, false);
+  mfm_encode_gap(&encoder, 4);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  ASSERT(!decode_all(&decoder, pulses, encoder.pos, &sector));
+  ASSERT_EQ(decoder.record_state, MFM_EXPECT_ID);
+  ASSERT(decoder.format_errors > 0);
+}
+
+TEST(test_preamble_accumulator_resets_before_overflow) {
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  decoder.short_count = UINT16_MAX;
+  decoder.preamble_sum = UINT32_MAX - 10u;
+  ASSERT(!mfm_feed(&decoder, 48, &sector));
+  ASSERT_EQ(decoder.short_count, 1);
+  ASSERT_EQ(decoder.preamble_sum, 48);
+}
+
+TEST(test_invalid_pulse_drops_pending_address) {
+  uint8_t pulses[4096];
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  encode_address(&encoder, 0, 0, 1, MFM_SIZE_CODE, false);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  decode_all(&decoder, pulses, encoder.pos, &sector);
+  ASSERT_EQ(decoder.record_state, MFM_EXPECT_DATA);
+  ASSERT(!mfm_feed(&decoder, 0, &sector));
+  ASSERT_EQ(decoder.record_state, MFM_EXPECT_ID);
+  ASSERT_EQ(decoder.state, MFM_HUNT);
+}
+
+TEST(test_malformed_sync_drops_pending_address) {
+  uint8_t pulses[4096];
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  encode_address(&encoder, 0, 0, 1, MFM_SIZE_CODE, false);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  decode_all(&decoder, pulses, encoder.pos, &sector);
+  ASSERT_EQ(decoder.record_state, MFM_EXPECT_DATA);
+  for (unsigned i = 0; i < MFM_MIN_PREAMBLE; i++) {
+    ASSERT(!mfm_feed(&decoder, 48, &sector));
+  }
+  ASSERT(!mfm_feed(&decoder, 96, &sector));
+  ASSERT_EQ(decoder.record_state, MFM_EXPECT_ID);
+  ASSERT(decoder.format_errors > 0);
+}
+
+TEST(test_address_to_data_distance_is_bounded) {
+  uint8_t pulses[4096];
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  encode_address(&encoder, 0, 0, 1, MFM_SIZE_CODE, false);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  decode_all(&decoder, pulses, encoder.pos, &sector);
+  ASSERT_EQ(decoder.record_state, MFM_EXPECT_DATA);
+  for (unsigned i = 0; i <= MFM_ID_DATA_MAX_PULSES; i++) {
+    mfm_feed(&decoder, 48, &sector);
+  }
+  ASSERT_EQ(decoder.record_state, MFM_EXPECT_ID);
+  ASSERT(decoder.format_errors > 0);
+}
+
+TEST(test_data_without_address_is_rejected) {
+  uint8_t pulses[16384];
+  uint8_t data[DISK_SECTOR_SIZE] = {0};
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  encode_data(&encoder, MFM_DATA_MARK, data, sizeof(data), false);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  ASSERT(!decode_all(&decoder, pulses, encoder.pos, &sector));
+  ASSERT_EQ(decoder.record_state, MFM_EXPECT_ID);
+}
+
+TEST(test_encoder_buffer_overflow_stops) {
+  uint8_t buffer[10];
+  uint8_t data[DISK_SECTOR_SIZE] = {0};
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, buffer, sizeof(buffer));
+  mfm_encode_sector(&encoder, 0, 0, 0, data);
+  ASSERT_EQ(encoder.pos, sizeof(buffer));
+  ASSERT(encoder.overflow);
+  ASSERT(encoder.stopped);
+}
+
+TEST(test_encoder_rejects_invalid_inputs) {
+  uint8_t pulses[1024];
+  uint8_t data[DISK_SECTOR_SIZE] = {0};
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  mfm_encode_sector(&encoder, DISK_CYLINDERS, 0, 0, data);
+  ASSERT(encoder.stopped);
+
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  mfm_encode_sector(&encoder, 0, DISK_HEADS, 0, data);
+  ASSERT(encoder.stopped);
+
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  mfm_encode_sector(&encoder, 0, 0, DISK_SECTORS_PER_TRACK, data);
+  ASSERT(encoder.stopped);
+
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  mfm_encode_sector(&encoder, 0, 0, 0, NULL);
+  ASSERT(encoder.stopped);
+
+  mfm_encode_init(&encoder, NULL, sizeof(pulses));
+  ASSERT(encoder.stopped);
+  ASSERT(encoder.overflow);
+
+  mfm_encode_init_emit(&encoder, NULL, NULL);
+  ASSERT(encoder.stopped);
+
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  ASSERT_EQ(mfm_encode_track(&encoder, NULL), 0);
+  ASSERT(encoder.stopped);
+}
+
+static void reference_precomp(uint8_t *pulses, size_t count, uint8_t cylinder) {
+  int shift = MFM_PRECOMP_SHIFT + (cylinder - MFM_PRECOMP_START_TRACK) / 13;
+  for (size_t i = 1; i + 1 < count; i++) {
+    if (pulses[i] != MFM_PULSE_SHORT) continue;
+    bool previous_long = pulses[i - 1] == MFM_PULSE_LONG;
+    bool next_long = pulses[i + 1] == MFM_PULSE_LONG;
+    if (previous_long == next_long) continue;
+    pulses[i] += previous_long ? -shift : shift;
+  }
+}
+
+TEST(test_streaming_precomp_matches_reference) {
+  static uint8_t expected[200000];
+  static uint8_t actual[200000];
+  for (uint8_t cylinder = MFM_PRECOMP_START_TRACK; cylinder < DISK_CYLINDERS;
+       cylinder += 13) {
+    track_t track;
+    fill_track(&track, cylinder, 1, 0xBEEFu + cylinder);
+    mfm_encode_t encoder;
+    mfm_encode_init(&encoder, expected, sizeof(expected));
+    mfm_encode_gap(&encoder, 80);
+    for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
+      mfm_encode_sector(&encoder, cylinder, 1, sector, track.data[sector]);
+      mfm_encode_gap(&encoder, 54);
+    }
+    size_t count = encoder.pos;
+    reference_precomp(expected, count, cylinder);
+    mfm_encode_init(&encoder, actual, sizeof(actual));
+    ASSERT_EQ(mfm_encode_track(&encoder, &track), count);
+    ASSERT_MEM_EQ(actual, expected, count);
+  }
 }
 
 typedef struct {
-    uint8_t *buf;
-    size_t pos;
-} emit_capture_t;
+  uint8_t *pulses;
+  size_t count;
+  size_t limit;
+} capture_t;
 
-static void emit_capture(void *ctx, uint8_t pulse) {
-    emit_capture_t *c = (emit_capture_t *)ctx;
-    c->buf[c->pos++] = pulse;
+static bool capture_emit(void *ctx, uint8_t pulse) {
+  capture_t *capture = ctx;
+  if (capture->count == capture->limit) return false;
+  capture->pulses[capture->count++] = pulse;
+  return true;
 }
 
 TEST(test_emit_mode_matches_linear_mode) {
-    static uint8_t linear[200000], streamed[200000];
+  static uint8_t linear[200000];
+  static uint8_t streamed[200000];
+  track_t track;
+  fill_track(&track, 70, 1, 0x1234u);
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, linear, sizeof(linear));
+  size_t expected = mfm_encode_track(&encoder, &track);
+  capture_t capture = {.pulses = streamed, .limit = sizeof(streamed)};
+  mfm_encode_init_emit(&encoder, capture_emit, &capture);
+  size_t actual = mfm_encode_track(&encoder, &track);
+  ASSERT_EQ(actual, expected);
+  ASSERT_EQ(capture.count, expected);
+  ASSERT_MEM_EQ(streamed, linear, expected);
+}
 
-    int tracks[] = {5, 70};
-    for (unsigned i = 0; i < sizeof(tracks) / sizeof(tracks[0]); i++) {
-        track_t trk;
-        build_random_track(&trk, tracks[i], 0xBEEF + tracks[i]);
+TEST(test_emit_can_stop_encoder) {
+  uint8_t pulses[32];
+  uint8_t data[DISK_SECTOR_SIZE] = {0};
+  capture_t capture = {.pulses = pulses, .limit = sizeof(pulses)};
+  mfm_encode_t encoder;
+  mfm_encode_init_emit(&encoder, capture_emit, &capture);
+  mfm_encode_sector(&encoder, 0, 0, 0, data);
+  ASSERT(encoder.stopped);
+  ASSERT_EQ(encoder.pos, sizeof(pulses));
+  ASSERT_EQ(capture.count, sizeof(pulses));
+}
 
-        mfm_encode_t e;
-        mfm_encode_init(&e, linear, sizeof(linear));
-        size_t linear_len = mfm_encode_track(&e, &trk);
-
-        emit_capture_t cap = { .buf = streamed, .pos = 0 };
-        mfm_encode_init_emit(&e, emit_capture, &cap);
-        size_t streamed_len = mfm_encode_track(&e, &trk);
-
-        ASSERT_EQ(streamed_len, linear_len);
-        ASSERT_EQ(cap.pos, linear_len);
-        ASSERT(memcmp(linear, streamed, linear_len) == 0);
-    }
+TEST(test_decoder_null_inputs_fail_closed) {
+  mfm_init(NULL);
+  mfm_reset(NULL);
+  mfm_t decoder;
+  mfm_init(&decoder);
+  mfm_t before = decoder;
+  ASSERT(!mfm_feed(NULL, 48, NULL));
+  ASSERT(!mfm_feed(&decoder, 48, NULL));
+  ASSERT_MEM_EQ(&decoder, &before, sizeof(decoder));
 }
 
 int main(void) {
-    printf("=== MFM Encoder/Decoder Tests ===\n\n");
-
-    RUN_TEST(test_encoder_basic);
-    RUN_TEST(test_encoder_sync);
-    RUN_TEST(test_crc);
-    RUN_TEST(test_roundtrip_sync);
-    RUN_TEST(test_roundtrip_address_record);
-    RUN_TEST(test_roundtrip_full_sector);
-    RUN_TEST(test_roundtrip_all_zeros);
-    RUN_TEST(test_roundtrip_all_ones);
-    RUN_TEST(test_roundtrip_alternating_aa);
-    RUN_TEST(test_roundtrip_alternating_55);
-    RUN_TEST(test_roundtrip_random);
-    RUN_TEST(test_roundtrip_multiple_sectors);
-    RUN_TEST(test_roundtrip_with_jitter);
-    RUN_TEST(test_roundtrip_stress_patterns);
-    RUN_TEST(test_roundtrip_full_track);
-    RUN_TEST(test_streaming_precomp_matches_reference_post_pass);
-    RUN_TEST(test_emit_mode_matches_linear_mode);
-
-    TEST_RESULTS();
+  printf("=== MFM Encoder/Decoder Tests ===\n\n");
+  RUN_TEST(test_encoder_sync);
+  RUN_TEST(test_crc);
+  RUN_TEST(test_roundtrip_sector);
+  RUN_TEST(test_roundtrip_patterns);
+  RUN_TEST(test_roundtrip_with_jitter);
+  RUN_TEST(test_roundtrip_full_track);
+  RUN_TEST(test_deleted_data_mark_f8);
+  RUN_TEST(test_legacy_fa_mark_rejected);
+  RUN_TEST(test_only_size_code_two_is_accepted);
+  RUN_TEST(test_invalid_chrn_is_rejected);
+  RUN_TEST(test_address_crc_error_drops_record);
+  RUN_TEST(test_data_crc_error_is_not_emitted);
+  RUN_TEST(test_new_address_while_waiting_for_data_is_rejected);
+  RUN_TEST(test_preamble_accumulator_resets_before_overflow);
+  RUN_TEST(test_invalid_pulse_drops_pending_address);
+  RUN_TEST(test_malformed_sync_drops_pending_address);
+  RUN_TEST(test_address_to_data_distance_is_bounded);
+  RUN_TEST(test_data_without_address_is_rejected);
+  RUN_TEST(test_encoder_buffer_overflow_stops);
+  RUN_TEST(test_encoder_rejects_invalid_inputs);
+  RUN_TEST(test_streaming_precomp_matches_reference);
+  RUN_TEST(test_emit_mode_matches_linear_mode);
+  RUN_TEST(test_emit_can_stop_encoder);
+  RUN_TEST(test_decoder_null_inputs_fail_closed);
+  TEST_RESULTS();
 }

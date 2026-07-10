@@ -2,74 +2,93 @@
 #define SCP_DISK_H
 
 #include "flux_sim.h"
-#include "../src/floppy.h"
 #include "../src/mfm_decode.h"
-#include <stdlib.h>
 #include <string.h>
 
 typedef struct {
-    uint8_t *scp_data;
-    size_t scp_size;
-    uint8_t resolution;
-    uint8_t num_revolutions;
+    flux_sim_t sim;
+    bool initialized;
 } scp_disk_t;
 
-static bool scp_disk_read(void *ctx, sector_t *sector) {
-    scp_disk_t *disk = (scp_disk_t *)ctx;
+static block_status_t scp_disk_read_track(void *ctx, uint32_t expected_generation,
+                                          uint8_t cylinder, uint8_t head,
+                                          track_t *track) {
+    scp_disk_t *disk = ctx;
+    if (!disk || !disk->initialized || !track ||
+        !disk_ch_valid(cylinder, head)) return BLOCK_ERR_INVALID;
+    if (expected_generation != 1u) return BLOCK_ERR_MEDIA_CHANGED;
 
-    flux_sim_t sim;
-    if (!flux_sim_open_scp(&sim, disk->scp_data, disk->scp_size))
-        return false;
+    memset(track, 0, sizeof(*track));
+    track->cylinder = cylinder;
+    track->head = head;
 
-    sector->valid = false;
-
-    for (int rev = 0; rev < disk->num_revolutions; rev++) {
-        if (!flux_sim_seek(&sim, sector->track, sector->side, rev))
-            continue;
+    bool sought = false;
+    for (uint8_t rev = 0;
+         rev < disk->sim.num_revolutions && track->valid != DISK_TRACK_VALID;
+         rev++) {
+        if (!flux_sim_seek(&disk->sim, cylinder, head, rev)) continue;
+        sought = true;
 
         mfm_t mfm;
         mfm_init(&mfm);
-        sector_t out;
+        mfm_sector_t sector;
         uint16_t delta;
 
-        while (flux_sim_next(&sim, &delta)) {
-            if (mfm_feed(&mfm, delta, &out)) {
-                if (out.valid && out.sector_n == sector->sector_n &&
-                    out.track == sector->track && out.side == sector->side) {
-                    memcpy(sector->data, out.data, SECTOR_SIZE);
-                    sector->valid = true;
-                    sector->size_code = out.size_code;
-                    flux_sim_close(&sim);
-                    return true;
-                }
-            }
+        while (flux_sim_next(&disk->sim, &delta)) {
+            if (!mfm_feed(&mfm, delta, &sector)) continue;
+            if (sector.cylinder != cylinder || sector.head != head ||
+                sector.sector >= DISK_SECTORS_PER_TRACK) continue;
+            uint8_t index = sector.sector;
+            if (track_has(track, index)) continue;
+            memcpy(track->data[index], sector.data, DISK_SECTOR_SIZE);
+            track_mark(track, index);
         }
     }
 
-    flux_sim_close(&sim);
-    return true;
+    if (!sought) return BLOCK_ERR_CORRUPT;
+    return track->valid == DISK_TRACK_VALID ? BLOCK_OK : BLOCK_ERR_CRC;
 }
 
-static bool scp_disk_write(void *ctx, track_t *track) {
-    (void)ctx; (void)track;
-    return false;
+static block_status_t scp_disk_media_generation(void *ctx,
+                                                uint32_t *generation) {
+    scp_disk_t *disk = ctx;
+    if (!disk || !disk->initialized || !generation) return BLOCK_ERR_INVALID;
+    *generation = 1;
+    return BLOCK_OK;
 }
 
-static bool scp_disk_write_protected(void *ctx) {
-    (void)ctx;
-    return true;
+static block_status_t scp_disk_write_protected(void *ctx,
+                                               bool *write_protected) {
+    scp_disk_t *disk = ctx;
+    if (!disk || !disk->initialized || !write_protected) {
+        return BLOCK_ERR_INVALID;
+    }
+    *write_protected = true;
+    return BLOCK_OK;
 }
 
 static bool scp_disk_init(scp_disk_t *disk, uint8_t *data, size_t size) {
+    if (!disk || !data) return false;
     memset(disk, 0, sizeof(*disk));
-    if (size < 0x10) return false;
-    if (data[0] != 'S' || data[1] != 'C' || data[2] != 'P') return false;
-
-    disk->scp_data = data;
-    disk->scp_size = size;
-    disk->num_revolutions = data[5];
-    disk->resolution = data[9];
+    if (!flux_sim_open_scp(&disk->sim, data, size)) return false;
+    disk->initialized = true;
     return true;
+}
+
+static void scp_disk_deinit(scp_disk_t *disk) {
+    if (!disk || !disk->initialized) return;
+    flux_sim_close(&disk->sim);
+    disk->initialized = false;
+}
+
+static inline block_device_t scp_disk_device(scp_disk_t *disk) {
+    return (block_device_t){
+        .read_track = scp_disk_read_track,
+        .write_track = NULL,
+        .media_generation = scp_disk_media_generation,
+        .write_protected = scp_disk_write_protected,
+        .ctx = disk,
+    };
 }
 
 #endif

@@ -1,4 +1,5 @@
-#include <time.h>
+#include <errno.h>
+#include <limits.h>
 #include "test.h"
 #include "vdisk.h"
 #include "../src/crc.h"
@@ -7,6 +8,7 @@
 #include "../src/fat12.h"
 
 static uint32_t fuzz_seed = 0;
+static uint32_t initial_seed = 0;
 
 static uint32_t fuzz_rand(void) {
   fuzz_seed = fuzz_seed * 1103515245 + 12345;
@@ -22,7 +24,7 @@ static uint8_t fuzz_rand8(void) {
 }
 
 static uint16_t fuzz_rand16(void) {
-  return (fuzz_rand() << 8) | fuzz_rand8();
+  return (uint16_t)((fuzz_rand() << 8) | fuzz_rand8());
 }
 
 static int fuzz_tests_run = 0;
@@ -35,7 +37,7 @@ void fuzz_mfm_decoder_random_pulses(int iterations) {
     mfm_t m;
     mfm_init(&m);
 
-    sector_t out;
+    mfm_sector_t out;
     memset(&out, 0, sizeof(out));
 
     int pulse_count = 100 + (fuzz_rand() % 10000);
@@ -57,13 +59,13 @@ void fuzz_mfm_decoder_edge_pulses(int iterations) {
     0, 1, 34, 35, 36, 56, 57, 58, 81, 82, 83, 119, 120, 121,
     255, 256, 1000, 32767, 32768, 65534, 65535
   };
-  int num_edges = sizeof(edge_values) / sizeof(edge_values[0]);
+  size_t num_edges = sizeof(edge_values) / sizeof(edge_values[0]);
 
   for (int iter = 0; iter < iterations; iter++) {
     mfm_t m;
     mfm_init(&m);
 
-    sector_t out;
+    mfm_sector_t out;
     memset(&out, 0, sizeof(out));
 
     for (int i = 0; i < 1000; i++) {
@@ -84,7 +86,7 @@ void fuzz_mfm_decoder_state_transitions(int iterations) {
     mfm_t m;
     mfm_init(&m);
 
-    sector_t out;
+    mfm_sector_t out;
 
     for (int i = 0; i < 100; i++) {
       mfm_feed(&m, 47, &out);
@@ -113,8 +115,8 @@ void fuzz_mfm_encoder_random_data(int iterations) {
     mfm_encode_t enc;
     mfm_encode_init(&enc, pulse_buf, sizeof(pulse_buf));
 
-    int data_len = fuzz_rand() % sizeof(data_buf);
-    for (int i = 0; i < data_len; i++) {
+    size_t data_len = fuzz_rand() % sizeof(data_buf);
+    for (size_t i = 0; i < data_len; i++) {
       data_buf[i] = fuzz_rand8();
     }
 
@@ -139,16 +141,15 @@ void fuzz_mfm_encoder_tiny_buffer(int iterations) {
     mfm_encode_t enc;
     mfm_encode_init(&enc, tiny_buf, sizeof(tiny_buf));
 
-    sector_t s;
-    memset(&s, 0, sizeof(s));
-    s.track = fuzz_rand8();
-    s.side = fuzz_rand8();
-    s.sector_n = fuzz_rand8();
-    for (int i = 0; i < SECTOR_SIZE; i++) {
-      s.data[i] = fuzz_rand8();
+    uint8_t data[DISK_SECTOR_SIZE];
+    uint8_t cylinder = fuzz_rand8() % DISK_CYLINDERS;
+    uint8_t head = fuzz_rand8() % DISK_HEADS;
+    uint8_t sector = fuzz_rand8() % DISK_SECTORS_PER_TRACK;
+    for (size_t i = 0; i < DISK_SECTOR_SIZE; i++) {
+      data[i] = fuzz_rand8();
     }
 
-    mfm_encode_sector(&enc, &s);
+    mfm_encode_sector(&enc, cylinder, head, sector, data);
 
     if (enc.pos > enc.size) {
       printf("  ERROR: pos > size at iteration %d\n", iter);
@@ -198,24 +199,22 @@ void fuzz_mfm_roundtrip(int iterations) {
     mfm_encode_t enc;
     mfm_encode_init(&enc, pulse_buf, sizeof(pulse_buf));
 
-    sector_t s_in;
+    mfm_sector_t s_in;
     memset(&s_in, 0, sizeof(s_in));
-    s_in.track = fuzz_rand8() % 80;
-    s_in.side = fuzz_rand8() % 2;
-    s_in.sector_n = 1 + (fuzz_rand8() % 18);
-    s_in.size_code = 2;
-    s_in.valid = true;
-    for (int i = 0; i < SECTOR_SIZE; i++) {
+    s_in.cylinder = fuzz_rand8() % DISK_CYLINDERS;
+    s_in.head = fuzz_rand8() % DISK_HEADS;
+    s_in.sector = fuzz_rand8() % DISK_SECTORS_PER_TRACK;
+    for (size_t i = 0; i < DISK_SECTOR_SIZE; i++) {
       s_in.data[i] = fuzz_rand8();
     }
 
     mfm_encode_gap(&enc, 80);
-    mfm_encode_sector(&enc, &s_in);
+    mfm_encode_sector(&enc, s_in.cylinder, s_in.head, s_in.sector, s_in.data);
 
     mfm_t m;
     mfm_init(&m);
 
-    sector_t s_out;
+    mfm_sector_t s_out;
     memset(&s_out, 0, sizeof(s_out));
     bool got_sector = false;
 
@@ -225,9 +224,12 @@ void fuzz_mfm_roundtrip(int iterations) {
       }
     }
 
-    if (got_sector && s_out.valid) {
-      if (memcmp(s_in.data, s_out.data, SECTOR_SIZE) != 0) {
-        printf("FAIL: Data mismatch at iteration %d (seed %u)\n", iter, fuzz_seed);
+    if (got_sector) {
+      if (s_out.cylinder != s_in.cylinder || s_out.head != s_in.head ||
+          s_out.sector != s_in.sector ||
+          memcmp(s_in.data, s_out.data, DISK_SECTOR_SIZE) != 0) {
+        printf("FAIL: Data mismatch at iteration %d (seed %u)\n",
+               iter, initial_seed);
         exit(1);
       }
     }
@@ -244,7 +246,7 @@ void fuzz_fat12_random_boot_sector(int iterations) {
   printf("Fuzzing FAT12 with random boot sectors (%d iterations)...\n", iterations);
 
   for (int iter = 0; iter < iterations; iter++) {
-    for (int i = 0; i < SECTOR_SIZE; i++) {
+    for (size_t i = 0; i < DISK_SECTOR_SIZE; i++) {
       fuzz_disk->data[0][i] = fuzz_rand8();
     }
 
@@ -314,7 +316,7 @@ void fuzz_fat12_corrupt_bpb_values(int iterations) {
       fat12_dirent_t entry;
       fat12_find(&fat, "TEST.TXT", &entry);
 
-      uint8_t buf[FAT12_MAX_CLUSTER_SECTORS * SECTOR_SIZE];
+      uint8_t buf[FAT12_MAX_CLUSTER_SECTORS * DISK_SECTOR_SIZE];
       fat12_read_cluster(&fat, 2, buf);
       fat12_read_cluster(&fat, fuzz_rand16(), buf);
     }
@@ -332,7 +334,7 @@ void fuzz_fat12_random_fat_entries(int iterations) {
     vdisk_format_valid(fuzz_disk);
 
     for (int sector = 1; sector < 10; sector++) {
-      for (int i = 0; i < SECTOR_SIZE; i++) {
+      for (size_t i = 0; i < DISK_SECTOR_SIZE; i++) {
         fuzz_disk->data[sector][i] = fuzz_rand8();
       }
     }
@@ -363,7 +365,7 @@ void fuzz_fat12_random_directory(int iterations) {
     vdisk_format_valid(fuzz_disk);
 
     for (int sector = 19; sector < 33; sector++) {
-      for (int i = 0; i < SECTOR_SIZE; i++) {
+      for (size_t i = 0; i < DISK_SECTOR_SIZE; i++) {
         fuzz_disk->data[sector][i] = fuzz_rand8();
       }
     }
@@ -374,7 +376,7 @@ void fuzz_fat12_random_directory(int iterations) {
     fat12_err_t err = fat12_init(&fat, io);
     if (err == FAT12_OK) {
       fat12_dirent_t entry;
-      for (int i = 0; i < 50; i++) {
+      for (uint16_t i = 0; i < 50; i++) {
         fat12_read_root_entry(&fat, i, &entry);
       }
 
@@ -398,8 +400,8 @@ void fuzz_fat12_file_operations(int iterations) {
 
     int corrupt_count = fuzz_rand() % 20;
     for (int c = 0; c < corrupt_count; c++) {
-      int sector = fuzz_rand() % VDISK_TOTAL_SECTORS;
-      int offset = fuzz_rand() % SECTOR_SIZE;
+      int sector = fuzz_rand() % DISK_SECTOR_COUNT;
+      int offset = fuzz_rand() % DISK_SECTOR_SIZE;
       fuzz_disk->data[sector][offset] = fuzz_rand8();
     }
 
@@ -416,18 +418,47 @@ void fuzz_fat12_file_operations(int iterations) {
         for (int i = 0; i < 256; i++) {
           write_buf[i] = fuzz_rand8();
         }
-        fat12_write(&writer, write_buf, sizeof(write_buf));
-        fat12_close_write(&writer);
+        fat12_result_t written = fat12_write(&writer, write_buf, sizeof(write_buf));
+        if (written.error == FAT12_OK && written.count == sizeof(write_buf)) {
+          fat12_close_write(&writer);
+        } else {
+          fat12_abort_write(&writer);
+        }
       }
 
       if (fat12_find(&fat, "FUZZ.TXT", &entry) == FAT12_OK) {
         fat12_file_t file;
-        fat12_open(&fat, &entry, &file);
-        uint8_t read_buf[512];
-        fat12_read(&file, read_buf, sizeof(read_buf));
+        if (fat12_open(&fat, &entry, &file) == FAT12_OK) {
+          uint8_t read_buf[DISK_SECTOR_SIZE];
+          fat12_read(&file, read_buf, sizeof(read_buf));
+        }
       }
 
       fat12_delete(&fat, "FUZZ.TXT");
+
+      fat12_fsck_t repaired;
+      fat12_err_t repair_error = FAT12_OK;
+      for (uint16_t pass = 0; pass < FAT12_ROOT_ENTRIES; pass++) {
+        repair_error = fat12_fsck(&fat, &repaired, true);
+        if (repair_error != FAT12_OK || repaired.incomplete ||
+            !repaired.repair_pending) {
+          break;
+        }
+      }
+      if (repair_error == FAT12_OK && !repaired.incomplete &&
+          !repaired.repair_pending) {
+        fat12_fsck_t clean;
+        if (fat12_fsck(&fat, &clean, false) != FAT12_OK ||
+            clean.lost_clusters != 0 || clean.broken_chains != 0 ||
+            clean.crosslinked != 0 || clean.loops != 0 ||
+            clean.size_mismatches != 0 || clean.fat_mismatch ||
+            clean.fat_markers_invalid || clean.repair_pending ||
+            clean.incomplete) {
+          printf("FAIL: FAT invariants did not converge at iteration %d (seed %u)\n",
+                 iter, initial_seed);
+          exit(1);
+        }
+      }
     }
 
     fuzz_tests_run++;
@@ -450,15 +481,15 @@ void fuzz_fat12_cluster_edge_cases(int iterations) {
     return;
   }
 
-  uint8_t buf[512];
+  uint8_t buf[DISK_SECTOR_SIZE];
 
   for (int iter = 0; iter < iterations; iter++) {
     uint16_t test_clusters[] = {
       0, 1, 2, 3,
       0xFF6, 0xFF7, 0xFF8, 0xFF9,
       0xFFF,
-      fat.total_clusters + 1,
-      fat.total_clusters + 2,
+      FAT12_CLUSTER_LIMIT - 1,
+      FAT12_CLUSTER_LIMIT,
       0x7FFF, 0xFFFF
     };
 
@@ -484,18 +515,40 @@ void fuzz_fat12_cluster_edge_cases(int iterations) {
   printf("  Completed %d iterations without crash\n", iterations);
 }
 
+static bool parse_u32(const char *text, uint32_t *value) {
+  if (!text || !*text || *text == '-') return false;
+  char *end;
+  errno = 0;
+  unsigned long parsed = strtoul(text, &end, 10);
+  if (errno != 0 || *end != '\0' || parsed > UINT32_MAX) return false;
+  *value = (uint32_t)parsed;
+  return true;
+}
+
+static int usage(const char *program) {
+  fprintf(stderr, "Usage: %s [-n iterations] [-s seed]\n", program);
+  return 2;
+}
+
 int main(int argc, char *argv[]) {
   int iterations = 1000;
-  uint32_t seed = (uint32_t)time(NULL);
+  uint32_t seed = 0xC0DEC0DEu;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
-      iterations = atoi(argv[++i]);
+      uint32_t parsed;
+      if (!parse_u32(argv[++i], &parsed) || parsed == 0 ||
+          parsed > 1000000u || parsed > INT_MAX) {
+        return usage(argv[0]);
+      }
+      iterations = (int)parsed;
     } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
-      seed = (uint32_t)atoi(argv[++i]);
+      if (!parse_u32(argv[++i], &seed)) return usage(argv[0]);
     } else if (strcmp(argv[i], "-h") == 0) {
       printf("Usage: %s [-n iterations] [-s seed]\n", argv[0]);
       return 0;
+    } else {
+      return usage(argv[0]);
     }
   }
 
@@ -503,6 +556,7 @@ int main(int argc, char *argv[]) {
   printf("Seed: %u (use -s %u to reproduce)\n", seed, seed);
   printf("Iterations: %d\n\n", iterations);
 
+  initial_seed = seed;
   fuzz_srand(seed);
 
   fuzz_disk = (vdisk_t *)malloc(sizeof(vdisk_t));

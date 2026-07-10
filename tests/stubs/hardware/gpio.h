@@ -8,8 +8,10 @@ typedef unsigned int uint;
 
 #define GPIO_IN 0
 #define GPIO_OUT 1
+#define NUM_BANK0_GPIOS 30u
 
 void gpio_init(uint pin);
+void gpio_deinit(uint pin);
 void gpio_set_dir(uint pin, bool out);
 void gpio_pull_up(uint pin);
 void gpio_put(uint pin, bool value);

@@ -1,633 +1,252 @@
 #include "test.h"
-#include "vdisk.h"
 #include "../src/crc.h"
+#include "../src/fat12.h"
 #include "../src/mfm_decode.h"
 #include "../src/mfm_encode.h"
-#include "../src/fat12.h"
 
-TEST(test_fat12_zero_sectors_per_track) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-  disk.data[0][24] = 0;
-  disk.data[0][25] = 0;
+typedef struct {
+  uint8_t data[DISK_SECTOR_COUNT][DISK_SECTOR_SIZE];
+  block_status_t read_failure;
+  block_status_t write_failure;
+  uint16_t fail_lba;
+  bool fail_read;
+} robust_disk_t;
 
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  fat12_err_t err = fat12_init(&fat, io);
-  ASSERT_EQ(err, FAT12_ERR_INVALID);
+static robust_disk_t disk;
+static fat12_t fat;
+
+static block_status_t disk_read(void *ctx, uint16_t lba,
+                                uint8_t out[DISK_SECTOR_SIZE]) {
+  robust_disk_t *d = ctx;
+  if (lba >= DISK_SECTOR_COUNT) return BLOCK_ERR_INVALID;
+  if (d->fail_read && lba == d->fail_lba) return d->read_failure;
+  memcpy(out, d->data[lba], DISK_SECTOR_SIZE);
+  return BLOCK_OK;
 }
 
-TEST(test_fat12_zero_num_heads) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-  disk.data[0][26] = 0;
-  disk.data[0][27] = 0;
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  fat12_err_t err = fat12_init(&fat, io);
-  ASSERT_EQ(err, FAT12_ERR_INVALID);
+static block_status_t disk_write(void *ctx, const track_t *track) {
+  robust_disk_t *d = ctx;
+  if (d->write_failure != BLOCK_OK) return d->write_failure;
+  if (!track || !disk_ch_valid(track->cylinder, track->head) || track->valid == 0) {
+    return BLOCK_ERR_INVALID;
+  }
+  for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
+    if (!track_has(track, sector)) continue;
+    uint16_t lba;
+    if (!disk_chs_to_lba(track->cylinder, track->head, sector, &lba)) {
+      return BLOCK_ERR_INVALID;
+    }
+    memcpy(d->data[lba], track->data[sector], DISK_SECTOR_SIZE);
+  }
+  return BLOCK_OK;
 }
 
-TEST(test_fat12_missing_boot_signature) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-  disk.data[0][510] = 0x00;
-  disk.data[0][511] = 0x00;
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  fat12_err_t err = fat12_init(&fat, io);
-  ASSERT_EQ(err, FAT12_ERR_INVALID);
+static fat12_io_t disk_io(void) {
+  return (fat12_io_t){.read = disk_read, .write = disk_write, .ctx = &disk};
 }
 
-TEST(test_fat12_oversized_sectors_per_cluster) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-  disk.data[0][13] = FAT12_MAX_CLUSTER_SECTORS + 1;
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  ASSERT_EQ(fat12_init(&fat, io), FAT12_ERR_INVALID);
+static void format_disk(void) {
+  memset(&disk, 0, sizeof(disk));
+  memset(&fat, 0, sizeof(fat));
+  ASSERT_EQ(fat12_format(&fat, disk_io(), "ROBUST", false, NULL, NULL), FAT12_OK);
 }
 
-TEST(test_fat12_zero_num_fats) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-  disk.data[0][16] = 0;
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  ASSERT_EQ(fat12_init(&fat, io), FAT12_ERR_INVALID);
+static void set_fat_entry(uint16_t cluster, uint16_t value) {
+  uint32_t offset = cluster + cluster / 2u;
+  for (uint8_t copy = 0; copy < FAT12_NUM_FATS; copy++) {
+    uint16_t start = FAT12_RESERVED_SECTORS + copy * FAT12_SECTORS_PER_FAT;
+    uint8_t *bytes = &disk.data[start][0];
+    if (cluster & 1u) {
+      bytes[offset] = (uint8_t)((bytes[offset] & 0x0Fu) |
+                                ((value & 0x0Fu) << 4u));
+      bytes[offset + 1u] = (uint8_t)(value >> 4u);
+    } else {
+      bytes[offset] = (uint8_t)value;
+      bytes[offset + 1u] = (bytes[offset + 1u] & 0xF0u) | ((value >> 8) & 0x0Fu);
+    }
+  }
 }
 
-TEST(test_fat12_zero_sectors_per_fat) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-  disk.data[0][22] = 0;
-  disk.data[0][23] = 0;
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  ASSERT_EQ(fat12_init(&fat, io), FAT12_ERR_INVALID);
+TEST(test_fat12_rejects_every_noncanonical_bpb_field) {
+  static const uint8_t offsets[] = {
+      11, 13, 14, 16, 17, 19, 21, 22, 24, 26, 28, 32,
+  };
+  for (size_t i = 0; i < sizeof(offsets); i++) {
+    format_disk();
+    disk.data[0][offsets[i]] ^= 1u;
+    fat12_t candidate;
+    ASSERT_EQ(fat12_init(&candidate, disk_io()), FAT12_ERR_INVALID);
+  }
 }
 
-TEST(test_fat12_zero_root_entries) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-  disk.data[0][17] = 0;
-  disk.data[0][18] = 0;
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  ASSERT_EQ(fat12_init(&fat, io), FAT12_ERR_INVALID);
+TEST(test_fat12_rejects_missing_signature_and_flags_bad_fat_markers) {
+  format_disk();
+  disk.data[0][FAT12_BOOT_SIG_OFFSET] = 0;
+  fat12_t candidate;
+  ASSERT_EQ(fat12_init(&candidate, disk_io()), FAT12_ERR_INVALID);
+  format_disk();
+  disk.data[FAT12_RESERVED_SECTORS][0] = 0;
+  ASSERT_EQ(fat12_init(&candidate, disk_io()), FAT12_OK);
+  ASSERT(candidate.fat_mismatch);
+  ASSERT(candidate.fat_markers_invalid);
+  ASSERT_EQ(candidate.fat_start, FAT12_FAT2_START);
+  format_disk();
+  disk.data[FAT12_FAT1_START][0] = 0;
+  disk.data[FAT12_FAT2_START][0] = 0;
+  ASSERT_EQ(fat12_init(&candidate, disk_io()), FAT12_OK);
+  ASSERT(!candidate.fat_mismatch);
+  ASSERT(candidate.fat_markers_invalid);
 }
 
-TEST(test_fat12_zero_total_sectors) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-  disk.data[0][19] = 0;
-  disk.data[0][20] = 0;
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  ASSERT_EQ(fat12_init(&fat, io), FAT12_ERR_INVALID);
+TEST(test_fat12_rejects_missing_callbacks) {
+  fat12_t candidate;
+  ASSERT_EQ(fat12_init(&candidate, (fat12_io_t){0}), FAT12_ERR_INVALID);
+  format_disk();
+  fat12_io_t readonly = {.read = disk_read, .ctx = &disk};
+  ASSERT_EQ(fat12_init(&candidate, readonly), FAT12_OK);
+  fat12_writer_t writer;
+  ASSERT_EQ(fat12_open_write(&candidate, "NO.TXT", &writer), FAT12_ERR_READ_ONLY);
 }
 
-TEST(test_fat12_bad_bytes_per_sector) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-  disk.data[0][11] = 0; disk.data[0][12] = 4;
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  ASSERT_EQ(fat12_init(&fat, io), FAT12_ERR_INVALID);
+TEST(test_fat12_preserves_typed_read_failure) {
+  format_disk();
+  disk.fail_read = true;
+  disk.fail_lba = 0;
+  disk.read_failure = BLOCK_ERR_TIMEOUT;
+  fat12_t candidate;
+  ASSERT_EQ(fat12_init(&candidate, disk_io()), FAT12_ERR_READ);
+  ASSERT_EQ(fat12_last_io(&candidate), BLOCK_ERR_TIMEOUT);
 }
 
-TEST(test_fat12_unaligned_total_sectors) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-  disk.data[0][19] = 0xFF; disk.data[0][20] = 0x01;
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  ASSERT_EQ(fat12_init(&fat, io), FAT12_ERR_INVALID);
+TEST(test_fat12_rejects_cluster_underflow) {
+  format_disk();
+  ASSERT_EQ(fat12_init(&fat, disk_io()), FAT12_OK);
+  uint8_t data[DISK_SECTOR_SIZE];
+  ASSERT_EQ(fat12_read_cluster(&fat, 0, data), FAT12_ERR_INVALID);
+  ASSERT_EQ(fat12_read_cluster(&fat, 1, data), FAT12_ERR_INVALID);
 }
 
-TEST(test_fat12_zero_sectors_per_cluster) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-  disk.data[0][13] = 0;
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  fat12_err_t err = fat12_init(&fat, io);
-  ASSERT_EQ(err, FAT12_ERR_INVALID);
+TEST(test_fat12_detects_fat_copy_mismatch_on_init_and_fsck) {
+  format_disk();
+  uint16_t copy = FAT12_RESERVED_SECTORS + FAT12_SECTORS_PER_FAT;
+  disk.data[copy][3] ^= 0xFFu;
+  ASSERT_EQ(fat12_init(&fat, disk_io()), FAT12_OK);
+  ASSERT(fat.fat_mismatch);
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT(report.fat_mismatch);
 }
 
-TEST(test_fat12_null_read_callback) {
-  fat12_t fat;
-  fat12_io_t io = { .read = NULL, .write = vdisk_write, .ctx = NULL };
-  fat12_err_t err = fat12_init(&fat, io);
-  ASSERT_EQ(err, FAT12_ERR_INVALID);
+TEST(test_fat12_fsck_distinguishes_loop) {
+  format_disk();
+  ASSERT_EQ(fat12_init(&fat, disk_io()), FAT12_OK);
+  fat12_writer_t writer;
+  ASSERT_EQ(fat12_open_write(&fat, "LOOP.TXT", &writer), FAT12_OK);
+  uint8_t data[DISK_SECTOR_SIZE * 2u];
+  memset(data, 0xA5, sizeof(data));
+  fat12_result_t result = fat12_write(&writer, data, sizeof(data));
+  ASSERT_EQ(result.error, FAT12_OK);
+  ASSERT_EQ(result.count, sizeof(data));
+  ASSERT_EQ(fat12_close_write(&writer), FAT12_OK);
+  fat12_dirent_t entry;
+  ASSERT_EQ(fat12_find(&fat, "LOOP.TXT", &entry), FAT12_OK);
+  ASSERT(entry.start_cluster >= 2);
+  set_fat_entry(entry.start_cluster, entry.start_cluster + 1u);
+  set_fat_entry(entry.start_cluster + 1u, entry.start_cluster);
+  ASSERT_EQ(fat12_init(&fat, disk_io()), FAT12_OK);
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT_EQ(report.loops, 1);
+  ASSERT_EQ(report.broken_chains, 1);
 }
 
-TEST(test_fat12_cluster_underflow) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  fat12_init(&fat, io);
-
-  uint8_t buf[512];
-  fat12_err_t err = fat12_read_cluster(&fat, 0, buf);
-  ASSERT_EQ(err, FAT12_ERR_INVALID);
-
-  err = fat12_read_cluster(&fat, 1, buf);
-  ASSERT_EQ(err, FAT12_ERR_INVALID);
-}
-
-TEST(test_fat12_rejects_impossible_layout) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-  disk.data[0][19] = 20;
-  disk.data[0][20] = 0;
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  fat12_err_t err = fat12_init(&fat, io);
-  ASSERT_EQ(err, FAT12_ERR_INVALID);
-}
-
-static uint16_t pulse_to_delta(uint8_t pulse) {
+static uint16_t pulse_delta(uint8_t pulse) {
   return pulse + MFM_PIO_OVERHEAD;
 }
 
-TEST(test_mfm_decode_large_size_code) {
-  mfm_t m;
-  mfm_init(&m);
+static void encode_address(mfm_encode_t *encoder, uint8_t cylinder, uint8_t head,
+                           uint8_t sector, uint8_t size_code, bool corrupt) {
+  uint8_t address[] = {MFM_ADDR_MARK, cylinder, head, sector, size_code};
+  uint16_t crc = crc16_mfm(address, sizeof(address));
+  if (corrupt) crc ^= 1u;
+  uint8_t crc_bytes[] = {crc >> 8, crc & 0xFF};
+  mfm_encode_sync(encoder);
+  mfm_encode_bytes(encoder, address, sizeof(address));
+  mfm_encode_bytes(encoder, crc_bytes, sizeof(crc_bytes));
+  mfm_encode_gap(encoder, 4);
+}
 
-  uint8_t pulse_buf[8192];
-  mfm_encode_t enc;
-  mfm_encode_init(&enc, pulse_buf, sizeof(pulse_buf));
-
-  uint8_t addr_data[] = {0xFE, 0x00, 0x00, 0x01, 0x03};
-  uint16_t crc = 0xFFFF;
-  crc = crc16_update(crc, 0xA1);
-  crc = crc16_update(crc, 0xA1);
-  crc = crc16_update(crc, 0xA1);
-  for (int i = 0; i < 5; i++) {
-    crc = crc16_update(crc, addr_data[i]);
-  }
-
-  mfm_encode_gap(&enc, 80);
-
-  mfm_encode_sync(&enc);
-  mfm_encode_bytes(&enc, addr_data, 5);
-  uint8_t crc_bytes[2] = {crc >> 8, crc & 0xFF};
-  mfm_encode_bytes(&enc, crc_bytes, 2);
-
-  mfm_encode_gap(&enc, 22);
-
-  uint8_t data_mark = 0xFB;
-  uint8_t data_buf[512];
-  memset(data_buf, 0x42, 512);
-
-  uint16_t data_crc = 0xFFFF;
-  data_crc = crc16_update(data_crc, 0xA1);
-  data_crc = crc16_update(data_crc, 0xA1);
-  data_crc = crc16_update(data_crc, 0xA1);
-  data_crc = crc16_update(data_crc, data_mark);
-  for (int i = 0; i < 512; i++) {
-    data_crc = crc16_update(data_crc, data_buf[i]);
-  }
-
-  mfm_encode_sync(&enc);
-  mfm_encode_bytes(&enc, &data_mark, 1);
-  mfm_encode_bytes(&enc, data_buf, 512);
-  uint8_t data_crc_bytes[2] = {data_crc >> 8, data_crc & 0xFF};
-  mfm_encode_bytes(&enc, data_crc_bytes, 2);
-
-  sector_t out;
-  memset(&out, 0, sizeof(out));
-  bool got_sector = false;
-
-  for (size_t i = 0; i < enc.pos; i++) {
-    if (mfm_feed(&m, pulse_to_delta(pulse_buf[i]), &out)) {
-      got_sector = true;
+TEST(test_mfm_rejects_non_512_records_and_bad_address_crc) {
+  for (uint8_t size_code = 0; size_code < 4; size_code++) {
+    if (size_code == MFM_SIZE_CODE) continue;
+    uint8_t pulses[4096];
+    mfm_encode_t encoder;
+    mfm_encode_init(&encoder, pulses, sizeof(pulses));
+    encode_address(&encoder, 0, 0, 1, size_code, false);
+    mfm_t decoder;
+    mfm_sector_t sector;
+    mfm_init(&decoder);
+    for (size_t i = 0; i < encoder.pos; i++) {
+      ASSERT(!mfm_feed(&decoder, pulse_delta(pulses[i]), &sector));
     }
+    ASSERT(decoder.format_errors > 0);
+    ASSERT_EQ(decoder.record_state, MFM_EXPECT_ID);
   }
-
-  ASSERT(!got_sector);
-  ASSERT(!m.have_pending_addr);
+  uint8_t pulses[4096];
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  encode_address(&encoder, 0, 0, 1, MFM_SIZE_CODE, true);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  for (size_t i = 0; i < encoder.pos; i++) {
+    ASSERT(!mfm_feed(&decoder, pulse_delta(pulses[i]), &sector));
+  }
+  ASSERT_EQ(decoder.crc_errors, 1);
 }
 
-TEST(test_mfm_decode_invalid_pulses) {
-  mfm_t m;
-  mfm_init(&m);
-
-  sector_t out;
-  memset(&out, 0, sizeof(out));
-
-  uint16_t garbage[] = {0, 1, 5, 10, 20, 30, 150, 200, 255, 1000, 65535};
-  for (int i = 0; i < 11; i++) {
-    bool got_sector = mfm_feed(&m, garbage[i], &out);
-    ASSERT(!got_sector);
-  }
-
-  ASSERT(m.state == MFM_HUNT);
-}
-
-TEST(test_mfm_decode_invalid_pulse_drops_pending_record) {
-  mfm_t m;
-  mfm_init(&m);
-
-  uint8_t pulse_buf[8192];
-  mfm_encode_t enc;
-  mfm_encode_init(&enc, pulse_buf, sizeof(pulse_buf));
-
-  sector_t s = {
-    .track = 0, .side = 0, .sector_n = 1,
-    .size_code = 2, .valid = true
-  };
-  memset(s.data, 0x66, sizeof(s.data));
-  mfm_encode_sector(&enc, &s);
-
-  sector_t out;
-  memset(&out, 0, sizeof(out));
-
-  for (size_t i = 0; i < enc.pos && !m.have_pending_addr; i++) {
-    ASSERT(!mfm_feed(&m, pulse_to_delta(pulse_buf[i]), &out));
-  }
-
-  ASSERT(m.have_pending_addr);
-  ASSERT(!mfm_feed(&m, 0, &out));
-  ASSERT(!m.have_pending_addr);
-  ASSERT_EQ(m.state, MFM_HUNT);
-}
-
-TEST(test_mfm_decode_truncated_sector) {
-  mfm_t m;
-  mfm_init(&m);
-
-  uint8_t pulse_buf[4096];
-  mfm_encode_t enc;
-  mfm_encode_init(&enc, pulse_buf, sizeof(pulse_buf));
-
-  sector_t s = {
-    .track = 0, .side = 0, .sector_n = 1,
-    .size_code = 2, .valid = true
-  };
-  memset(s.data, 0xAA, 512);
-
-  uint8_t addr[5] = {0xFE, s.track, s.side, s.sector_n, 0x02};
-  uint16_t addr_crc = crc16_mfm(addr, 5);
-
-  mfm_encode_gap(&enc, 80);
-
-  mfm_encode_sync(&enc);
-  mfm_encode_bytes(&enc, addr, 5);
-  uint8_t addr_crc_bytes[2] = {addr_crc >> 8, addr_crc & 0xFF};
-  mfm_encode_bytes(&enc, addr_crc_bytes, 2);
-
-  sector_t out;
-  for (size_t i = 0; i < enc.pos; i++) {
-    mfm_feed(&m, pulse_to_delta(pulse_buf[i]), &out);
-  }
-
-  ASSERT(m.have_pending_addr == true);
-  ASSERT(m.sectors_read == 0);
-}
-
-TEST(test_mfm_decode_corrupted_crc) {
-  mfm_t m;
-  mfm_init(&m);
-
-  uint8_t pulse_buf[8192];
-  mfm_encode_t enc;
-  mfm_encode_init(&enc, pulse_buf, sizeof(pulse_buf));
-
-  sector_t s = {
-    .track = 0, .side = 0, .sector_n = 1,
-    .size_code = 2, .valid = true
-  };
-  memset(s.data, 0x55, 512);
-
-  mfm_encode_sector(&enc, &s);
-
-  sector_t out;
-  memset(&out, 0, sizeof(out));
-
-  for (size_t i = 0; i < enc.pos; i++) {
-    uint16_t delta = pulse_to_delta(pulse_buf[i]);
-    if (i == 50 || i == 51) delta = 0;
-    mfm_feed(&m, delta, &out);
+TEST(test_mfm_arbitrary_timing_never_escapes_state_bounds) {
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  uint32_t seed = 0xD1CEB00Cu;
+  for (uint32_t i = 0; i < 200000u; i++) {
+    seed = seed * 1664525u + 1013904223u;
+    mfm_feed(&decoder, seed >> 16, &sector);
+    ASSERT(decoder.state >= MFM_HUNT && decoder.state <= MFM_CLOCK);
+    ASSERT(decoder.record_state >= MFM_EXPECT_ID &&
+           decoder.record_state <= MFM_READING_DATA);
+    ASSERT(decoder.buf_pos <= sizeof(decoder.buf));
   }
 }
 
-TEST(test_mfm_encode_buffer_overflow) {
-  uint8_t tiny_buf[10];
-  mfm_encode_t enc;
-  mfm_encode_init(&enc, tiny_buf, sizeof(tiny_buf));
-
-  sector_t s = {
-    .track = 0, .side = 0, .sector_n = 1,
-    .size_code = 2, .valid = true
-  };
-  memset(s.data, 0, 512);
-
-  mfm_encode_sector(&enc, &s);
-
-  ASSERT(enc.pos <= sizeof(tiny_buf));
-  ASSERT(enc.overflow);
-}
-
-TEST(test_mfm_decode_rapid_state_changes) {
-  mfm_t m;
-  mfm_init(&m);
-
-  sector_t out;
-
-  for (int i = 0; i < 1000; i++) {
-    uint16_t pulse = (i % 3 == 0) ? 48 : (i % 3 == 1) ? 72 : 96;
-    mfm_feed(&m, pulse, &out);
+TEST(test_mfm_truncated_record_never_emits) {
+  uint8_t pulses[16384];
+  uint8_t data[DISK_SECTOR_SIZE];
+  memset(data, 0x5A, sizeof(data));
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, pulses, sizeof(pulses));
+  mfm_encode_sector(&encoder, 0, 0, 0, data);
+  mfm_t decoder;
+  mfm_sector_t sector;
+  mfm_init(&decoder);
+  for (size_t i = 0; i < encoder.pos / 2u; i++) {
+    ASSERT(!mfm_feed(&decoder, pulse_delta(pulses[i]), &sector));
   }
-
-  ASSERT(m.state >= MFM_HUNT && m.state <= MFM_CLOCK);
-}
-
-TEST(test_mfm_encode_null_sector) {
-  uint8_t buf[4096];
-  mfm_encode_t enc;
-  mfm_encode_init(&enc, buf, sizeof(buf));
-
-  sector_t s;
-  memset(&s, 0, sizeof(s));
-
-  mfm_encode_sector(&enc, &s);
-
-  ASSERT(enc.pos > 0);
-}
-
-TEST(test_mfm_decode_deleted_mark) {
-  mfm_t m;
-  mfm_init(&m);
-
-  uint8_t pulse_buf[16384];
-  mfm_encode_t enc;
-  mfm_encode_init(&enc, pulse_buf, sizeof(pulse_buf));
-
-  uint8_t addr[5] = {0xFE, 0x03, 0x00, 0x02, 0x02};
-  uint16_t addr_crc = crc16_mfm(addr, 5);
-  mfm_encode_gap(&enc, 80);
-  mfm_encode_sync(&enc);
-  mfm_encode_bytes(&enc, addr, 5);
-  uint8_t addr_crc_bytes[2] = {addr_crc >> 8, addr_crc & 0xFF};
-  mfm_encode_bytes(&enc, addr_crc_bytes, 2);
-  mfm_encode_gap(&enc, 22);
-
-  uint8_t data_mark = MFM_DELETED_MARK;
-  uint8_t data[512];
-  memset(data, 0x77, sizeof(data));
-  uint16_t data_crc = crc16(data, SECTOR_SIZE, crc16_mfm(&data_mark, 1));
-
-  mfm_encode_sync(&enc);
-  mfm_encode_bytes(&enc, &data_mark, 1);
-  mfm_encode_bytes(&enc, data, SECTOR_SIZE);
-  uint8_t data_crc_bytes[2] = {data_crc >> 8, data_crc & 0xFF};
-  mfm_encode_bytes(&enc, data_crc_bytes, 2);
-  mfm_encode_gap(&enc, 4);
-
-  sector_t out;
-  memset(&out, 0, sizeof(out));
-  bool got = false;
-  for (size_t i = 0; i < enc.pos; i++) {
-    if (mfm_feed(&m, pulse_to_delta(pulse_buf[i]), &out)) got = true;
-  }
-
-  ASSERT(got);
-  ASSERT(out.valid);
-  ASSERT_EQ(out.sector_n, 2);
-  ASSERT_EQ(out.data[0], 0x77);
-}
-
-TEST(test_mfm_decode_size_code_0) {
-  mfm_t m;
-  mfm_init(&m);
-
-  uint8_t pulse_buf[16384];
-  mfm_encode_t enc;
-  mfm_encode_init(&enc, pulse_buf, sizeof(pulse_buf));
-
-  uint8_t addr[5] = {0xFE, 0x00, 0x00, 0x01, 0x00};
-  uint16_t addr_crc = crc16_mfm(addr, 5);
-  mfm_encode_gap(&enc, 80);
-  mfm_encode_sync(&enc);
-  mfm_encode_bytes(&enc, addr, 5);
-  uint8_t crc_bytes[2] = {addr_crc >> 8, addr_crc & 0xFF};
-  mfm_encode_bytes(&enc, crc_bytes, 2);
-  mfm_encode_gap(&enc, 22);
-
-  uint8_t data_mark = MFM_DATA_MARK;
-  uint8_t data[128];
-  memset(data, 0x88, sizeof(data));
-  uint16_t data_crc = crc16(data, sizeof(data), crc16_mfm(&data_mark, 1));
-
-  mfm_encode_sync(&enc);
-  mfm_encode_bytes(&enc, &data_mark, 1);
-  mfm_encode_bytes(&enc, data, sizeof(data));
-  uint8_t data_crc_bytes[2] = {data_crc >> 8, data_crc & 0xFF};
-  mfm_encode_bytes(&enc, data_crc_bytes, 2);
-  mfm_encode_gap(&enc, 4);
-
-  sector_t out;
-  memset(&out, 0, sizeof(out));
-  bool got = false;
-  for (size_t i = 0; i < enc.pos; i++) {
-    if (mfm_feed(&m, pulse_to_delta(pulse_buf[i]), &out)) got = true;
-  }
-
-  ASSERT(got);
-  ASSERT(out.valid);
-  ASSERT_EQ(out.size_code, 0);
-  ASSERT_EQ(sector_size(&out), 128);
-}
-
-TEST(test_mfm_decode_address_crc_error) {
-  mfm_t m;
-  mfm_init(&m);
-
-  uint8_t pulse_buf[4096];
-  mfm_encode_t enc;
-  mfm_encode_init(&enc, pulse_buf, sizeof(pulse_buf));
-
-  uint8_t addr[5] = {0xFE, 0x00, 0x00, 0x01, 0x02};
-  uint16_t addr_crc = crc16_mfm(addr, 5) ^ 0xFFFF;
-
-  mfm_encode_gap(&enc, 80);
-  mfm_encode_sync(&enc);
-  mfm_encode_bytes(&enc, addr, 5);
-  uint8_t crc_bytes[2] = {addr_crc >> 8, addr_crc & 0xFF};
-  mfm_encode_bytes(&enc, crc_bytes, 2);
-  mfm_encode_gap(&enc, 4);
-
-  sector_t out;
-  memset(&out, 0, sizeof(out));
-  for (size_t i = 0; i < enc.pos; i++) {
-    mfm_feed(&m, pulse_to_delta(pulse_buf[i]), &out);
-  }
-
-  ASSERT_EQ(m.crc_errors, 1);
-  ASSERT(!m.have_pending_addr);
-  ASSERT_EQ(m.state, MFM_HUNT);
-}
-
-TEST(test_mfm_decode_invalid_mark_after_sync) {
-  mfm_t m;
-  mfm_init(&m);
-
-  uint8_t pulse_buf[4096];
-  mfm_encode_t enc;
-  mfm_encode_init(&enc, pulse_buf, sizeof(pulse_buf));
-
-  uint8_t bogus_mark = 0x42;
-
-  mfm_encode_gap(&enc, 80);
-  mfm_encode_sync(&enc);
-  mfm_encode_bytes(&enc, &bogus_mark, 1);
-  mfm_encode_gap(&enc, 6);
-
-  sector_t out;
-  memset(&out, 0, sizeof(out));
-  uint32_t syncs_before = m.syncs_found;
-  for (size_t i = 0; i < enc.pos; i++) {
-    mfm_feed(&m, pulse_to_delta(pulse_buf[i]), &out);
-  }
-
-  ASSERT(m.syncs_found > syncs_before);
-  ASSERT(!m.have_pending_addr);
-  ASSERT_EQ(m.state, MFM_HUNT);
-}
-
-TEST(test_mfm_decode_data_without_address) {
-  mfm_t m;
-  mfm_init(&m);
-
-  uint8_t pulse_buf[16384];
-  mfm_encode_t enc;
-  mfm_encode_init(&enc, pulse_buf, sizeof(pulse_buf));
-
-  sector_t s = {.track = 0, .side = 0, .sector_n = 1, .size_code = 2, .valid = true};
-  memset(s.data, 0x33, SECTOR_SIZE);
-
-  uint8_t data_mark = MFM_DATA_MARK;
-  uint16_t data_crc = crc16(s.data, SECTOR_SIZE, crc16_mfm(&data_mark, 1));
-
-  mfm_encode_gap(&enc, 80);
-  mfm_encode_sync(&enc);
-  mfm_encode_bytes(&enc, &data_mark, 1);
-  mfm_encode_bytes(&enc, s.data, SECTOR_SIZE);
-  uint8_t crc_bytes[2] = {data_crc >> 8, data_crc & 0xFF};
-  mfm_encode_bytes(&enc, crc_bytes, 2);
-  mfm_encode_gap(&enc, 4);
-
-  sector_t out;
-  memset(&out, 0, sizeof(out));
-  bool got_sector = false;
-  for (size_t i = 0; i < enc.pos; i++) {
-    if (mfm_feed(&m, pulse_to_delta(pulse_buf[i]), &out)) {
-      got_sector = true;
-    }
-  }
-
-  ASSERT(!got_sector);
-  ASSERT_EQ(m.state, MFM_HUNT);
-}
-
-TEST(test_fat12_fat_mismatch_detection) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  fat12_init(&fat, io);
-  ASSERT(!fat.fat_mismatch);
-
-  disk.data[VDISK_FAT2_START][3] ^= 0xFF;
-
-  fat12_init(&fat, io);
-  ASSERT(fat.fat_mismatch);
-
-  vdisk_format_valid(&disk);
-  disk.data[VDISK_FAT2_START + 1][3] ^= 0xFF;
-  fat12_init(&fat, io);
-  ASSERT(fat.fat_mismatch);
-}
-
-TEST(test_fat12_delete_loop_detection) {
-  vdisk_t disk;
-  vdisk_format_valid(&disk);
-
-  fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = &disk };
-  fat12_init(&fat, io);
-
-  fat12_writer_t writer;
-  fat12_open_write(&fat, "LOOP.TXT", &writer);
-  uint8_t data[1024];
-  memset(data, 0xAA, sizeof(data));
-  fat12_write(&writer, data, sizeof(data));
-  fat12_close_write(&writer);
-
-  fat12_dirent_t entry;
-  fat12_find(&fat, "LOOP.TXT", &entry);
-  uint16_t start = entry.start_cluster;
-  ASSERT(start >= 2);
-
-  vdisk_set_fat_entry(&disk, start, start + 1);
-  vdisk_set_fat_entry(&disk, start + 1, start);
-
-  fat12_init(&fat, io);
-
-  fat12_delete(&fat, "LOOP.TXT");
+  ASSERT_EQ(decoder.sectors_read, 0);
 }
 
 int main(void) {
   printf("=== Robustness Tests ===\n\n");
-
-  printf("--- FAT12 Edge Cases ---\n");
-  RUN_TEST(test_fat12_zero_sectors_per_track);
-  RUN_TEST(test_fat12_zero_num_heads);
-  RUN_TEST(test_fat12_missing_boot_signature);
-  RUN_TEST(test_fat12_zero_sectors_per_cluster);
-  RUN_TEST(test_fat12_oversized_sectors_per_cluster);
-  RUN_TEST(test_fat12_zero_num_fats);
-  RUN_TEST(test_fat12_zero_sectors_per_fat);
-  RUN_TEST(test_fat12_zero_root_entries);
-  RUN_TEST(test_fat12_zero_total_sectors);
-  RUN_TEST(test_fat12_bad_bytes_per_sector);
-  RUN_TEST(test_fat12_unaligned_total_sectors);
-  RUN_TEST(test_fat12_null_read_callback);
-  RUN_TEST(test_fat12_cluster_underflow);
-  RUN_TEST(test_fat12_rejects_impossible_layout);
-  RUN_TEST(test_fat12_delete_loop_detection);
-  RUN_TEST(test_fat12_fat_mismatch_detection);
-
-  printf("\n--- MFM Decoder Edge Cases ---\n");
-  RUN_TEST(test_mfm_decode_large_size_code);
-  RUN_TEST(test_mfm_decode_invalid_pulses);
-  RUN_TEST(test_mfm_decode_invalid_pulse_drops_pending_record);
-  RUN_TEST(test_mfm_decode_truncated_sector);
-  RUN_TEST(test_mfm_decode_corrupted_crc);
-  RUN_TEST(test_mfm_decode_deleted_mark);
-  RUN_TEST(test_mfm_decode_size_code_0);
-  RUN_TEST(test_mfm_decode_address_crc_error);
-  RUN_TEST(test_mfm_decode_invalid_mark_after_sync);
-  RUN_TEST(test_mfm_decode_data_without_address);
-  RUN_TEST(test_mfm_encode_buffer_overflow);
-  RUN_TEST(test_mfm_decode_rapid_state_changes);
-  RUN_TEST(test_mfm_encode_null_sector);
-
+  RUN_TEST(test_fat12_rejects_every_noncanonical_bpb_field);
+  RUN_TEST(test_fat12_rejects_missing_signature_and_flags_bad_fat_markers);
+  RUN_TEST(test_fat12_rejects_missing_callbacks);
+  RUN_TEST(test_fat12_preserves_typed_read_failure);
+  RUN_TEST(test_fat12_rejects_cluster_underflow);
+  RUN_TEST(test_fat12_detects_fat_copy_mismatch_on_init_and_fsck);
+  RUN_TEST(test_fat12_fsck_distinguishes_loop);
+  RUN_TEST(test_mfm_rejects_non_512_records_and_bad_address_crc);
+  RUN_TEST(test_mfm_arbitrary_timing_never_escapes_state_bounds);
+  RUN_TEST(test_mfm_truncated_record_never_emits);
   TEST_RESULTS();
 }

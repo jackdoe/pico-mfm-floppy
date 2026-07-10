@@ -1,600 +1,919 @@
 #include "f12.h"
 #include <string.h>
 
-static f12_err_t f12_set_error(f12_t *fs, f12_err_t err) {
-  if (fs) fs->last_error = err;
-  return err;
+#define F12_SIGNATURE 0x46313246u
+
+static uint64_t f12_next_generation(uint64_t generation) {
+  generation++;
+  return generation ? generation : 1u;
 }
 
-static f12_err_t f12_check_disk(f12_t *fs) {
-  if (!fs->mounted) {
-    return f12_set_error(fs, F12_ERR_NOT_MOUNTED);
-  }
+static uint64_t f12_incarnation_source;
 
-  if (fs->io.disk_changed && fs->io.disk_changed(fs->io.ctx)) {
-    if (fs->cache) {
-      lru_clear(fs->cache);
-    }
-
-    fat12_abort_write(&fs->fat);
-
-    for (int i = 0; i < F12_MAX_OPEN_FILES; i++) {
-      fs->files[i].mode = F12_MODE_CLOSED;
-    }
-
-    fs->mounted = false;
-    return f12_set_error(fs, F12_ERR_DISK_CHANGED);
-  }
-
-  return F12_OK;
+static uint64_t f12_next_incarnation(void) {
+  f12_incarnation_source++;
+  if (f12_incarnation_source == 0) f12_incarnation_source++;
+  return f12_incarnation_source;
 }
 
-static f12_err_t f12_check_writable(f12_t *fs) {
-  f12_err_t err = f12_check_disk(fs);
-  if (err != F12_OK) return err;
-
-  if (fs->io.write_protected && fs->io.write_protected(fs->io.ctx)) {
-    return f12_set_error(fs, F12_ERR_WRITE_PROTECTED);
-  }
-
-  return F12_OK;
+static bool f12_valid(const f12_t *fs) {
+  return fs && fs->signature == F12_SIGNATURE &&
+         fs->signature_inverse == ~F12_SIGNATURE;
 }
 
-static bool f12_should_pin(const fat12_t *fat, uint16_t lba) {
-  uint16_t first_fat_end = fat->fat_start_sector + fat->bpb.sectors_per_fat;
-  uint16_t root_end = fat->root_dir_start_sector + fat->root_dir_sectors;
-  if (lba < first_fat_end) return true;
-  if (lba >= fat->root_dir_start_sector && lba < root_end) return true;
-  return false;
+static f12_result_t f12_result(f12_err_t error, size_t count) {
+  return (f12_result_t){.error = error, .count = count};
 }
 
-static bool f12_cached_read(void *ctx, sector_t *sector) {
-  f12_t *fs = (f12_t *)ctx;
-
-  if (fs->mounted) {
-    if (f12_check_disk(fs) != F12_OK) {
-      return false;
-    }
+static f12_err_t f12_from_block(block_status_t status) {
+  switch (status) {
+    case BLOCK_OK: return F12_OK;
+    case BLOCK_ERR_INVALID: return F12_ERR_INVALID;
+    case BLOCK_ERR_BUSY: return F12_ERR_BUSY;
+    case BLOCK_ERR_TIMEOUT: return F12_ERR_TIMEOUT;
+    case BLOCK_ERR_CRC: return F12_ERR_CRC;
+    case BLOCK_ERR_WRONG_TRACK: return F12_ERR_WRONG_TRACK;
+    case BLOCK_ERR_WRONG_SIDE: return F12_ERR_WRONG_SIDE;
+    case BLOCK_ERR_NO_TRACK0: return F12_ERR_NO_TRACK0;
+    case BLOCK_ERR_MEDIA_CHANGED: return F12_ERR_MEDIA_CHANGED;
+    case BLOCK_ERR_WRITE_PROTECTED: return F12_ERR_WRITE_PROTECTED;
+    case BLOCK_ERR_UNDERRUN: return F12_ERR_UNDERRUN;
+    case BLOCK_ERR_OVERRUN: return F12_ERR_OVERRUN;
+    case BLOCK_ERR_VERIFY: return F12_ERR_VERIFY;
+    case BLOCK_ERR_CORRUPT: return F12_ERR_CORRUPT;
+    case BLOCK_ERR_IO: return F12_ERR_IO;
   }
-
-  uint32_t key = lru_key(sector->track, sector->side, sector->sector_n);
-  uint8_t *cached = lru_get(fs->cache, key);
-  if (cached) {
-    memcpy(sector->data, cached, SECTOR_SIZE);
-    sector->valid = true;
-    return true;
-  }
-
-  if (fs->io.read_track) {
-    track_t *track = &fs->track;
-    memset(track, 0, sizeof(*track));
-    track->track = sector->track;
-    track->side = sector->side;
-    if (!fs->io.read_track(fs->io.ctx, track)) {
-      goto read_sector;
-    }
-    for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-      if (track->sectors[i].valid) {
-        uint32_t k = lru_key(track->track, track->side, i + 1);
-        lru_set(fs->cache, k, track->sectors[i].data);
-        uint16_t lba = fat12_chs_to_lba(&fs->fat.bpb, track->track, track->side, i + 1);
-        if (f12_should_pin(&fs->fat, lba)) {
-          lru_pin(fs->cache, k);
-        }
-      }
-    }
-    cached = lru_get(fs->cache, key);
-    if (cached) {
-      memcpy(sector->data, cached, SECTOR_SIZE);
-      sector->valid = true;
-      return true;
-    }
-  }
-
-read_sector:
-  if (!fs->io.read(fs->io.ctx, sector)) {
-    return false;
-  }
-
-  if (sector->valid) {
-    lru_set(fs->cache, key, sector->data);
-    uint16_t lba = fat12_chs_to_lba(&fs->fat.bpb, sector->track, sector->side, sector->sector_n);
-    if (f12_should_pin(&fs->fat, lba)) {
-      lru_pin(fs->cache, key);
-    }
-  }
-
-  return true;
+  return F12_ERR_IO;
 }
 
-static bool f12_cached_write(void *ctx, track_t *track) {
-  f12_t *fs = (f12_t *)ctx;
-
-  if (fs->mounted) {
-    if (f12_check_writable(fs) != F12_OK) {
-      return false;
+static f12_err_t f12_from_fat(const f12_t *fs, fat12_err_t error) {
+  switch (error) {
+    case FAT12_OK: return F12_OK;
+    case FAT12_ERR_READ:
+    case FAT12_ERR_WRITE: {
+      block_status_t status = fat12_last_io(&fs->fat);
+      return status == BLOCK_OK ? F12_ERR_IO : f12_from_block(status);
     }
+    case FAT12_ERR_INVALID: return F12_ERR_INVALID;
+    case FAT12_ERR_NOT_FOUND: return F12_ERR_NOT_FOUND;
+    case FAT12_ERR_EOF: return F12_END;
+    case FAT12_ERR_FULL: return F12_ERR_FULL;
+    case FAT12_ERR_EXISTS: return F12_ERR_EXISTS;
+    case FAT12_ERR_READ_ONLY: return F12_ERR_READ_ONLY;
+    case FAT12_ERR_BUSY: return F12_ERR_BUSY;
+    case FAT12_ERR_AMBIGUOUS: return F12_ERR_AMBIGUOUS;
+    case FAT12_ERR_CORRUPT: return F12_ERR_CORRUPT;
   }
-
-  for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-    if (track->sectors[i].valid) continue;
-    uint32_t key = lru_key(track->track, track->side, i + 1);
-    uint8_t *cached = lru_get(fs->cache, key);
-    if (cached) {
-      memcpy(track->sectors[i].data, cached, SECTOR_SIZE);
-      track->sectors[i].track = track->track;
-      track->sectors[i].side = track->side;
-      track->sectors[i].sector_n = i + 1;
-      track->sectors[i].size_code = 2;
-      track->sectors[i].valid = true;
-    }
-  }
-
-  if (!fs->io.write(fs->io.ctx, track)) {
-    return false;
-  }
-
-  for (int i = 0; i < SECTORS_PER_TRACK; i++) {
-    if (track->sectors[i].valid) {
-      uint32_t key = lru_key(track->track, track->side, track->sectors[i].sector_n);
-      lru_set(fs->cache, key, track->sectors[i].data);
-    }
-  }
-
-  return true;
+  return F12_ERR_IO;
 }
 
-static f12_file_t *f12_alloc_file(f12_t *fs) {
-  for (int i = 0; i < F12_MAX_OPEN_FILES; i++) {
-    if (fs->files[i].mode == F12_MODE_CLOSED) {
-      f12_file_t *f = &fs->files[i];
-      memset(f, 0, sizeof(*f));
-      f->fs = fs;
-      return f;
+static void f12_cache_clear(f12_t *fs) {
+  memset(fs->cache, 0, sizeof(fs->cache));
+  fs->cache_clock = 0;
+}
+
+static uint64_t f12_cache_used(f12_t *fs) {
+  fs->cache_clock++;
+  if (fs->cache_clock != 0) return fs->cache_clock;
+  for (size_t i = 0; i < F12_CACHE_TRACKS; i++) fs->cache[i].used = 0;
+  fs->cache_clock = 1;
+  return fs->cache_clock;
+}
+
+static track_t *f12_cache_find(f12_t *fs, uint8_t cylinder, uint8_t head) {
+  for (size_t i = 0; i < F12_CACHE_TRACKS; i++) {
+    f12_cache_entry_t *entry = &fs->cache[i];
+    if (entry->occupied &&
+        entry->track.cylinder == cylinder && entry->track.head == head) {
+      entry->used = f12_cache_used(fs);
+      return &entry->track;
     }
   }
   return NULL;
 }
 
-static f12_err_t fat12_to_f12_err(fat12_err_t err) {
-  switch (err) {
-    case FAT12_OK:        return F12_OK;
-    case FAT12_ERR_READ:  return F12_ERR_IO;
-    case FAT12_ERR_WRITE: return F12_ERR_IO;
-    case FAT12_ERR_INVALID: return F12_ERR_INVALID;
-    case FAT12_ERR_NOT_FOUND: return F12_ERR_NOT_FOUND;
-    case FAT12_ERR_EOF:   return F12_ERR_EOF;
-    case FAT12_ERR_FULL:  return F12_ERR_FULL;
-    case FAT12_ERR_EXISTS: return F12_ERR_EXISTS;
-    default:              return F12_ERR_IO;
+static block_status_t f12_cache_put(f12_t *fs, const track_t *track,
+                                    bool authoritative, track_t **cached) {
+  size_t target = F12_CACHE_TRACKS;
+  size_t available = F12_CACHE_TRACKS;
+  uint64_t oldest = UINT64_MAX;
+  for (size_t i = 0; i < F12_CACHE_TRACKS; i++) {
+    f12_cache_entry_t *entry = &fs->cache[i];
+    if (entry->occupied &&
+        entry->track.cylinder == track->cylinder &&
+        entry->track.head == track->head) {
+      target = i;
+      break;
+    }
+    if (!entry->occupied) {
+      if (available == F12_CACHE_TRACKS) available = i;
+    } else if (entry->used < oldest) {
+      oldest = entry->used;
+      target = i;
+    }
+  }
+  if (available != F12_CACHE_TRACKS &&
+      (target == F12_CACHE_TRACKS ||
+       fs->cache[target].track.cylinder != track->cylinder ||
+       fs->cache[target].track.head != track->head)) {
+    target = available;
+  }
+  f12_cache_entry_t *entry = &fs->cache[target];
+  if (!entry->occupied || entry->track.cylinder != track->cylinder ||
+      entry->track.head != track->head || authoritative) {
+    entry->track = *track;
+    entry->conflicted = 0;
+  } else {
+    block_status_t status = BLOCK_OK;
+    for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
+      uint32_t bit = 1u << sector;
+      if (!track_has(track, sector)) continue;
+      if ((entry->conflicted & bit) != 0) {
+        status = BLOCK_ERR_CORRUPT;
+      } else if (track_has(&entry->track, sector) &&
+                 memcmp(entry->track.data[sector], track->data[sector],
+                        DISK_SECTOR_SIZE) != 0) {
+        entry->track.valid &= ~bit;
+        entry->conflicted |= bit;
+        status = BLOCK_ERR_CORRUPT;
+      } else if (!track_has(&entry->track, sector)) {
+        memcpy(entry->track.data[sector], track->data[sector],
+               DISK_SECTOR_SIZE);
+        track_mark(&entry->track, sector);
+      }
+    }
+    entry->track.valid &= ~entry->conflicted;
+    entry->occupied = true;
+    entry->used = f12_cache_used(fs);
+    if (cached) *cached = &entry->track;
+    return status;
+  }
+  entry->occupied = true;
+  entry->used = f12_cache_used(fs);
+  if (cached) *cached = &entry->track;
+  return BLOCK_OK;
+}
+
+static void f12_cache_evict(f12_t *fs, uint8_t cylinder, uint8_t head) {
+  for (size_t i = 0; i < F12_CACHE_TRACKS; i++) {
+    f12_cache_entry_t *entry = &fs->cache[i];
+    if (entry->occupied && entry->track.cylinder == cylinder &&
+        entry->track.head == head) {
+      memset(entry, 0, sizeof(*entry));
+      return;
+    }
   }
 }
 
-static void format_name_83(const fat12_dirent_t *entry, char *out) {
-  int i, j = 0;
+static bool f12_track_complete(const track_t *track, uint8_t cylinder,
+                               uint8_t head) {
+  return track && track->cylinder == cylinder && track->head == head &&
+         track->valid == DISK_TRACK_VALID;
+}
 
-  for (i = 0; i < 8 && entry->name[i] != ' '; i++) {
-    out[j++] = entry->name[i];
+static block_status_t f12_device_generation(f12_t *fs, uint32_t *generation) {
+  if (!fs || !generation || !fs->device.media_generation) {
+    return BLOCK_ERR_INVALID;
+  }
+  return fs->device.media_generation(fs->device.ctx, generation);
+}
+
+static block_status_t f12_block_media(f12_t *fs) {
+  if ((fs->state != F12_STATE_MOUNTED &&
+       fs->state != F12_STATE_BLOCK_ACCESS)) {
+    return BLOCK_ERR_INVALID;
+  }
+  uint32_t generation;
+  block_status_t status = f12_device_generation(fs, &generation);
+  if (status != BLOCK_OK) {
+    if (status == BLOCK_ERR_MEDIA_CHANGED) f12_cache_clear(fs);
+    return status;
+  }
+  if (generation != fs->media_generation) {
+    f12_cache_clear(fs);
+    return BLOCK_ERR_MEDIA_CHANGED;
+  }
+  return BLOCK_OK;
+}
+
+static block_status_t f12_block_writable(f12_t *fs) {
+  if (!fs || !fs->device.write_protected) return BLOCK_ERR_INVALID;
+  if (!fs->device.write_track) return BLOCK_ERR_WRITE_PROTECTED;
+  bool write_protected;
+  block_status_t status =
+      fs->device.write_protected(fs->device.ctx, &write_protected);
+  if (status != BLOCK_OK) return status;
+  return write_protected ? BLOCK_ERR_WRITE_PROTECTED : BLOCK_OK;
+}
+
+static block_status_t f12_refresh_track(f12_t *fs, uint8_t cylinder,
+                                        uint8_t head, track_t **out) {
+  block_status_t status = f12_block_media(fs);
+  if (status != BLOCK_OK) return status;
+  if (!disk_ch_valid(cylinder, head) || !out) return BLOCK_ERR_INVALID;
+
+  memset(&fs->track_work, 0, sizeof(fs->track_work));
+  fs->track_work.cylinder = cylinder;
+  fs->track_work.head = head;
+  status = fs->device.read_track(fs->device.ctx, fs->media_generation,
+                                 cylinder, head, &fs->track_work);
+  block_status_t media_status = f12_block_media(fs);
+  if (media_status != BLOCK_OK) return media_status;
+  if (fs->track_work.cylinder != cylinder || fs->track_work.head != head ||
+      (fs->track_work.valid & ~DISK_TRACK_VALID) != 0) {
+    return status == BLOCK_OK ? BLOCK_ERR_CORRUPT : status;
+  }
+  bool authoritative = status == BLOCK_OK &&
+                       fs->track_work.valid == DISK_TRACK_VALID;
+  track_t *cached = NULL;
+  block_status_t cache_status =
+      f12_cache_put(fs, &fs->track_work, authoritative, &cached);
+  *out = cached;
+  if (!*out) return BLOCK_ERR_IO;
+  if (cache_status != BLOCK_OK) return cache_status;
+  return status;
+}
+
+static block_status_t f12_load_sector(f12_t *fs, uint8_t cylinder,
+                                      uint8_t head, uint8_t sector,
+                                      track_t **out) {
+  block_status_t status = f12_block_media(fs);
+  if (status != BLOCK_OK) return status;
+  if (!disk_ch_valid(cylinder, head) || !disk_sector_valid(sector) || !out) {
+    return BLOCK_ERR_INVALID;
+  }
+  track_t *track = f12_cache_find(fs, cylinder, head);
+  if (track && track_has(track, sector)) {
+    *out = track;
+    return BLOCK_OK;
+  }
+  status = f12_refresh_track(fs, cylinder, head, &track);
+  if (track && track_has(track, sector)) {
+    *out = track;
+    return BLOCK_OK;
+  }
+  return status == BLOCK_OK ? BLOCK_ERR_CORRUPT : status;
+}
+
+static block_status_t f12_load_complete_track(f12_t *fs, uint8_t cylinder,
+                                              uint8_t head, track_t **out) {
+  block_status_t status = f12_block_media(fs);
+  if (status != BLOCK_OK) return status;
+  if (!disk_ch_valid(cylinder, head) || !out) return BLOCK_ERR_INVALID;
+  track_t *track = f12_cache_find(fs, cylinder, head);
+  if (f12_track_complete(track, cylinder, head)) {
+    *out = track;
+    return BLOCK_OK;
+  }
+  status = f12_refresh_track(fs, cylinder, head, &track);
+  if (f12_track_complete(track, cylinder, head)) {
+    *out = track;
+    return BLOCK_OK;
+  }
+  return status == BLOCK_OK ? BLOCK_ERR_CORRUPT : status;
+}
+
+static block_status_t f12_block_read(void *ctx, uint16_t lba,
+                                     uint8_t out[DISK_SECTOR_SIZE]) {
+  f12_t *fs = (f12_t *)ctx;
+  if (!fs || !out || lba >= DISK_SECTOR_COUNT) return BLOCK_ERR_INVALID;
+
+  uint8_t cylinder;
+  uint8_t head;
+  uint8_t sector;
+  if (!disk_lba_to_chs(lba, &cylinder, &head, &sector)) {
+    return BLOCK_ERR_INVALID;
+  }
+  track_t *track;
+  block_status_t status = f12_load_sector(fs, cylinder, head, sector, &track);
+  if (status != BLOCK_OK) return status;
+  memcpy(out, track->data[sector], DISK_SECTOR_SIZE);
+  return f12_block_media(fs);
+}
+
+static block_status_t f12_block_write(void *ctx, const track_t *partial) {
+  f12_t *fs = (f12_t *)ctx;
+  if (!fs || !partial || !disk_ch_valid(partial->cylinder, partial->head) ||
+      partial->valid == 0 || (partial->valid & ~DISK_TRACK_VALID) != 0) {
+    return BLOCK_ERR_INVALID;
   }
 
+  block_status_t status = f12_block_media(fs);
+  if (status != BLOCK_OK) return status;
+  status = f12_block_writable(fs);
+  if (status != BLOCK_OK) return status;
+
+  track_t *full = &fs->track_work;
+  if (partial->valid == DISK_TRACK_VALID) {
+    *full = *partial;
+  } else {
+    track_t *base;
+    status = f12_load_complete_track(fs, partial->cylinder, partial->head,
+                                     &base);
+    if (status != BLOCK_OK) return status;
+    *full = *base;
+    for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
+      if ((partial->valid & (1u << sector)) != 0) {
+        memcpy(full->data[sector], partial->data[sector], DISK_SECTOR_SIZE);
+      }
+    }
+    full->valid = DISK_TRACK_VALID;
+  }
+
+  status = f12_block_media(fs);
+  if (status != BLOCK_OK) return status;
+
+  status = fs->device.write_track(fs->device.ctx, fs->media_generation, full);
+  if (status != BLOCK_OK) {
+    if (status == BLOCK_ERR_MEDIA_CHANGED) f12_cache_clear(fs);
+    else f12_cache_evict(fs, partial->cylinder, partial->head);
+    return status;
+  }
+  status = f12_block_media(fs);
+  if (status != BLOCK_OK) return status;
+  return f12_cache_put(fs, full, true, NULL);
+}
+
+static fat12_io_t f12_fat_io(f12_t *fs) {
+  return (fat12_io_t){
+      .read = f12_block_read,
+      .write = f12_block_write,
+      .ctx = fs,
+  };
+}
+
+static void f12_release_file_slot(f12_file_slot_t *slot) {
+  slot->active = false;
+  slot->mode = 0;
+  slot->generation = f12_next_generation(slot->generation);
+  memset(&slot->name, 0, sizeof(slot->name));
+  memset(&slot->io, 0, sizeof(slot->io));
+}
+
+static void f12_release_dir_slot(f12_dir_slot_t *slot) {
+  slot->active = false;
+  slot->index = 0;
+  slot->generation = f12_next_generation(slot->generation);
+}
+
+static void f12_invalidate(f12_t *fs) {
+  for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) {
+    f12_file_slot_t *slot = &fs->files[i];
+    if (slot->active && slot->mode == F12_OPEN_WRITE) {
+      fat12_forget_write(&slot->io.writer);
+    }
+    f12_release_file_slot(slot);
+  }
+  for (size_t i = 0; i < F12_MAX_OPEN_DIRS; i++) {
+    f12_release_dir_slot(&fs->dirs[i]);
+  }
+  f12_cache_clear(fs);
+  fs->state = F12_STATE_READY;
+  fs->mount_generation = f12_next_generation(fs->mount_generation);
+}
+
+static f12_err_t f12_finish(f12_t *fs, f12_err_t error) {
+  if (error == F12_ERR_MEDIA_CHANGED && f12_valid(fs) &&
+      fs->state == F12_STATE_MOUNTED) {
+    f12_invalidate(fs);
+  }
+  return error;
+}
+
+static f12_err_t f12_check_mounted(f12_t *fs) {
+  if (!f12_valid(fs)) return F12_ERR_NOT_INITIALIZED;
+  if (fs->state != F12_STATE_MOUNTED) return F12_ERR_NOT_MOUNTED;
+  return f12_finish(fs, f12_from_block(f12_block_media(fs)));
+}
+
+static f12_err_t f12_check_writable(f12_t *fs) {
+  f12_err_t error = f12_check_mounted(fs);
+  if (error != F12_OK) return error;
+  return f12_finish(fs, f12_from_block(f12_block_writable(fs)));
+}
+
+static bool f12_writer_open(const f12_t *fs) {
+  for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) {
+    if (fs->files[i].active && fs->files[i].mode == F12_OPEN_WRITE) return true;
+  }
+  return false;
+}
+
+static bool f12_operations_open(const f12_t *fs) {
+  for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) {
+    if (fs->files[i].active) return true;
+  }
+  for (size_t i = 0; i < F12_MAX_OPEN_DIRS; i++) {
+    if (fs->dirs[i].active) return true;
+  }
+  return false;
+}
+
+static bool f12_name_equal(const fat12_name_t *left, const fat12_name_t *right) {
+  return memcmp(left, right, sizeof(*left)) == 0;
+}
+
+static bool f12_name_open(const f12_t *fs, const fat12_name_t *name) {
+  for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) {
+    if (fs->files[i].active && f12_name_equal(&fs->files[i].name, name)) return true;
+  }
+  return false;
+}
+
+static f12_file_slot_t *f12_file_slot(f12_file_t *file) {
+  if (!file || !f12_valid(file->token.fs) ||
+      file->token.fs->state != F12_STATE_MOUNTED ||
+      file->token.slot >= F12_MAX_OPEN_FILES ||
+      file->token.incarnation != file->token.fs->incarnation ||
+      file->token.mount_generation != file->token.fs->mount_generation) {
+    return NULL;
+  }
+  f12_file_slot_t *slot = &file->token.fs->files[file->token.slot];
+  if (!slot->active || slot->generation != file->token.slot_generation) {
+    return NULL;
+  }
+  return slot;
+}
+
+static const f12_file_slot_t *f12_file_slot_const(const f12_file_t *file) {
+  return f12_file_slot((f12_file_t *)file);
+}
+
+static f12_dir_slot_t *f12_dir_slot(f12_dir_t *dir) {
+  if (!dir || !f12_valid(dir->token.fs) ||
+      dir->token.fs->state != F12_STATE_MOUNTED ||
+      dir->token.slot >= F12_MAX_OPEN_DIRS ||
+      dir->token.incarnation != dir->token.fs->incarnation ||
+      dir->token.mount_generation != dir->token.fs->mount_generation) {
+    return NULL;
+  }
+  f12_dir_slot_t *slot = &dir->token.fs->dirs[dir->token.slot];
+  if (!slot->active || slot->generation != dir->token.slot_generation) {
+    return NULL;
+  }
+  return slot;
+}
+
+static const char *f12_path(const char *path) {
+  return path && path[0] == '/' ? path + 1 : path;
+}
+
+static void f12_format_name(const fat12_dirent_t *entry, char out[13]) {
+  size_t pos = 0;
+  size_t i = 0;
+  while (i < FAT12_FILENAME_LEN && entry->name[i] != ' ') out[pos++] = entry->name[i++];
   if (entry->ext[0] != ' ') {
-    out[j++] = '.';
-    for (i = 0; i < 3 && entry->ext[i] != ' '; i++) {
-      out[j++] = entry->ext[i];
-    }
+    out[pos++] = '.';
+    i = 0;
+    while (i < FAT12_EXTENSION_LEN && entry->ext[i] != ' ') out[pos++] = entry->ext[i++];
   }
-
-  out[j] = '\0';
+  out[pos] = '\0';
 }
 
-f12_err_t f12_mount(f12_t *fs, f12_io_t io) {
-  if (!fs) return F12_ERR_INVALID;
+static void f12_fill_stat(const fat12_dirent_t *entry, f12_stat_t *stat) {
+  f12_format_name(entry, stat->name);
+  stat->size = entry->size;
+  stat->attr = entry->attr;
+}
 
+f12_err_t f12_init(f12_t *fs, block_device_t device) {
+  if (!fs || !device.read_track || !device.media_generation ||
+      !device.write_protected) {
+    return F12_ERR_INVALID;
+  }
+  uint64_t incarnation = f12_next_incarnation();
   memset(fs, 0, sizeof(*fs));
-  fs->io = io;
-
-  lru_init_fixed(&fs->cache_obj, fs->cache_storage, sizeof(fs->cache_storage),
-                 F12_CACHE_SIZE, SECTOR_SIZE);
-  fs->cache = &fs->cache_obj;
-
-  fat12_io_t fat_io = {
-    .read = f12_cached_read,
-    .write = f12_cached_write,
-    .ctx = fs,
-  };
-
-  fat12_err_t err = fat12_init(&fs->fat, fat_io);
-  if (err != FAT12_OK) {
-    lru_clear(fs->cache);
-    fs->cache = NULL;
-    return f12_set_error(fs, fat12_to_f12_err(err));
-  }
-
-  if (fs->io.disk_changed)
-    fs->io.disk_changed(fs->io.ctx);
-
-  fs->mounted = true;
+  fs->device = device;
+  fs->incarnation = incarnation;
+  fs->signature = F12_SIGNATURE;
+  fs->signature_inverse = ~F12_SIGNATURE;
+  fs->mount_generation = 1;
+  for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) fs->files[i].generation = 1;
+  for (size_t i = 0; i < F12_MAX_OPEN_DIRS; i++) fs->dirs[i].generation = 1;
   return F12_OK;
 }
 
-void f12_unmount(f12_t *fs) {
-  if (!fs) return;
+f12_err_t f12_mount(f12_t *fs) {
+  if (!f12_valid(fs)) return F12_ERR_NOT_INITIALIZED;
+  if (fs->state == F12_STATE_MOUNTED) return F12_ERR_ALREADY_MOUNTED;
+  if (fs->state != F12_STATE_READY) return F12_ERR_BUSY;
+  if (f12_operations_open(fs) || fat12_busy(&fs->fat)) return F12_ERR_CONFLICT;
 
-  for (int i = 0; i < F12_MAX_OPEN_FILES; i++) {
-    if (fs->files[i].mode != F12_MODE_CLOSED) {
-      f12_close(&fs->files[i]);
-    }
+  f12_cache_clear(fs);
+  block_status_t status =
+      f12_device_generation(fs, &fs->media_generation);
+  if (status != BLOCK_OK) return f12_from_block(status);
+  fs->state = F12_STATE_BLOCK_ACCESS;
+  fat12_err_t fat_error = fat12_init(&fs->fat, f12_fat_io(fs));
+  if (fat_error != FAT12_OK) {
+    fs->state = F12_STATE_READY;
+    f12_cache_clear(fs);
+    return f12_from_fat(fs, fat_error);
   }
-
-  if (fs->cache) {
-    lru_clear(fs->cache);
-    fs->cache = NULL;
+  status = f12_block_media(fs);
+  fs->state = F12_STATE_READY;
+  if (status != BLOCK_OK) {
+    f12_cache_clear(fs);
+    return f12_from_block(status);
   }
-  fat12_abort_write(&fs->fat);
-
-  fs->mounted = false;
+  fs->mount_generation = f12_next_generation(fs->mount_generation);
+  fs->state = F12_STATE_MOUNTED;
+  return F12_OK;
 }
 
-f12_err_t f12_format(f12_t *fs, const char *label, bool full) {
-  if (!fs) return F12_ERR_INVALID;
+f12_err_t f12_unmount(f12_t *fs) {
+  f12_err_t error = f12_check_mounted(fs);
+  if (error != F12_OK) return error;
 
-  if (fs->io.write_protected && fs->io.write_protected(fs->io.ctx)) {
-    return f12_set_error(fs, F12_ERR_WRITE_PROTECTED);
-  }
-
-  fat12_io_t fat_io = {
-    .read = fs->io.read,
-    .write = fs->io.write,
-    .progress = fs->io.progress,
-    .ctx = fs->io.ctx,
-  };
-
-  fat12_err_t err = fat12_format(fat_io, label, full);
-  if (err != FAT12_OK) {
-    return f12_set_error(fs, fat12_to_f12_err(err));
-  }
-
-  if (fs->mounted) {
-    fs->mounted = false;
-    return f12_mount(fs, fs->io);
-  }
-
+  if (f12_operations_open(fs)) return F12_ERR_CONFLICT;
+  if (fat12_busy(&fs->fat)) return F12_ERR_BUSY;
+  f12_cache_clear(fs);
+  fs->state = F12_STATE_READY;
+  fs->mount_generation = f12_next_generation(fs->mount_generation);
   return F12_OK;
+}
+
+f12_err_t f12_format(f12_t *fs, f12_format_options_t options) {
+  if (!f12_valid(fs)) return F12_ERR_NOT_INITIALIZED;
+  if (!options.label ||
+      (options.mode != F12_FORMAT_QUICK && options.mode != F12_FORMAT_FULL)) {
+    return F12_ERR_INVALID;
+  }
+  if (fs->state == F12_STATE_MOUNTED) return F12_ERR_ALREADY_MOUNTED;
+  if (fs->state != F12_STATE_READY) return F12_ERR_BUSY;
+  if (f12_operations_open(fs) || fat12_busy(&fs->fat)) return F12_ERR_CONFLICT;
+  block_status_t status = f12_block_writable(fs);
+  if (status != BLOCK_OK) return f12_from_block(status);
+
+  f12_cache_clear(fs);
+  status = f12_device_generation(fs, &fs->media_generation);
+  if (status != BLOCK_OK) return f12_from_block(status);
+  fs->state = F12_STATE_BLOCK_ACCESS;
+  fat12_err_t fat_error = fat12_format(&fs->fat, f12_fat_io(fs), options.label,
+                                       options.mode == F12_FORMAT_FULL,
+                                       options.progress, options.progress_ctx);
+  if (fat_error != FAT12_OK) {
+    fs->state = F12_STATE_READY;
+    return f12_from_fat(fs, fat_error);
+  }
+  status = f12_block_media(fs);
+  fs->state = F12_STATE_READY;
+  return f12_from_block(status);
 }
 
 f12_err_t f12_fsck(f12_t *fs, fat12_fsck_t *report, bool repair) {
-  if (!fs || !report) return F12_ERR_INVALID;
-
-  f12_err_t err = repair ? f12_check_writable(fs) : f12_check_disk(fs);
-  if (err != F12_OK) return err;
-
-  fat12_err_t ferr = fat12_fsck(&fs->fat, report, repair);
-  if (ferr != FAT12_OK) {
-    return f12_set_error(fs, fat12_to_f12_err(ferr));
+  if (!report) return F12_ERR_INVALID;
+  f12_err_t error = repair ? f12_check_writable(fs) : f12_check_mounted(fs);
+  if (error != F12_OK) return error;
+  if ((repair && f12_operations_open(fs)) || f12_writer_open(fs) || fat12_busy(&fs->fat)) {
+    return F12_ERR_CONFLICT;
   }
-
-  return F12_OK;
+  fat12_err_t fat_error = fat12_fsck(&fs->fat, report, repair);
+  return f12_finish(fs, f12_from_fat(fs, fat_error));
 }
 
-f12_file_t *f12_open(f12_t *fs, const char *path, const char *mode) {
-  if (!fs || !path || !mode) {
-    f12_set_error(fs, F12_ERR_INVALID);
-    return NULL;
+f12_err_t f12_is_mounted(f12_t *fs, bool *mounted) {
+  if (mounted) *mounted = false;
+  if (!mounted) return F12_ERR_INVALID;
+  if (!f12_valid(fs)) return F12_ERR_NOT_INITIALIZED;
+  if (fs->state == F12_STATE_READY) return F12_OK;
+  if (fs->state != F12_STATE_MOUNTED) return F12_ERR_BUSY;
+  f12_err_t error = f12_check_mounted(fs);
+  if (error == F12_OK) *mounted = true;
+  return error;
+}
+
+f12_err_t f12_open(f12_t *fs, const char *path, f12_open_mode_t mode,
+                   f12_file_t *out) {
+  if (out) memset(out, 0, sizeof(*out));
+  if (!out || !path || (mode != F12_OPEN_READ && mode != F12_OPEN_WRITE)) {
+    return F12_ERR_INVALID;
   }
 
-  f12_file_mode_t fmode;
-
-  if (mode[0] == 'r') {
-    fmode = F12_MODE_READ;
-  } else if (mode[0] == 'w') {
-    fmode = F12_MODE_WRITE;
-  } else {
-    f12_set_error(fs, F12_ERR_INVALID);
-    return NULL;
+  f12_err_t error = mode == F12_OPEN_WRITE ? f12_check_writable(fs) : f12_check_mounted(fs);
+  if (error != F12_OK) return error;
+  const char *name = f12_path(path);
+  fat12_name_t parsed;
+  fat12_err_t fat_error = fat12_name_parse(name, &parsed);
+  if (fat_error != FAT12_OK) return f12_from_fat(fs, fat_error);
+  if ((mode == F12_OPEN_READ && f12_writer_open(fs) && f12_name_open(fs, &parsed)) ||
+      (mode == F12_OPEN_WRITE &&
+       (f12_writer_open(fs) || fat12_busy(&fs->fat) || f12_name_open(fs, &parsed)))) {
+    return F12_ERR_CONFLICT;
   }
 
-  f12_err_t err;
-  if (fmode == F12_MODE_WRITE) {
-    err = f12_check_writable(fs);
-  } else {
-    err = f12_check_disk(fs);
-  }
-  if (err != F12_OK) {
-    return NULL;
-  }
-
-  if (path[0] == '/') path++;
-
-  f12_file_t *file = f12_alloc_file(fs);
-  if (!file) {
-    f12_set_error(fs, F12_ERR_TOO_MANY);
-    return NULL;
-  }
-
-  if (fmode == F12_MODE_READ) {
-    fat12_err_t ferr = fat12_find(&fs->fat, path, &file->dirent);
-    if (ferr != FAT12_OK) {
-      f12_set_error(fs, fat12_to_f12_err(ferr));
-      return NULL;
+  size_t index = F12_MAX_OPEN_FILES;
+  for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) {
+    if (!fs->files[i].active) {
+      index = i;
+      break;
     }
+  }
+  if (index == F12_MAX_OPEN_FILES) return F12_ERR_TOO_MANY;
 
-    if (file->dirent.attr & FAT12_ATTR_DIRECTORY) {
-      f12_set_error(fs, F12_ERR_IS_DIR);
-      return NULL;
+  f12_file_slot_t *slot = &fs->files[index];
+  if (mode == F12_OPEN_READ) {
+    fat12_dirent_t entry;
+    fat_error = fat12_find(&fs->fat, name, &entry);
+    if (fat_error != FAT12_OK) return f12_finish(fs, f12_from_fat(fs, fat_error));
+    if ((entry.attr & FAT12_ATTR_DIRECTORY) != 0) return F12_ERR_IS_DIR;
+    fat_error = fat12_open(&fs->fat, &entry, &slot->io.reader);
+    if (fat_error != FAT12_OK) {
+      return f12_finish(fs, f12_from_fat(fs, fat_error));
     }
-
-    fat12_open(&fs->fat, &file->dirent, &file->io.reader);
-    file->mode = F12_MODE_READ;
-
   } else {
-    fat12_err_t ferr = fat12_open_write(&fs->fat, path, &file->io.writer);
-    if (ferr != FAT12_OK) {
-      f12_set_error(fs, fat12_to_f12_err(ferr));
-      return NULL;
-    }
-
-    file->mode = F12_MODE_WRITE;
+    fat_error = fat12_open_write(&fs->fat, name, &slot->io.writer);
+    if (fat_error != FAT12_OK) return f12_finish(fs, f12_from_fat(fs, fat_error));
   }
 
-  return file;
+  slot->generation = f12_next_generation(slot->generation);
+  slot->name = parsed;
+  slot->mode = mode;
+  slot->active = true;
+  *out = (f12_file_t){.token = {
+      .fs = fs,
+      .incarnation = fs->incarnation,
+      .mount_generation = fs->mount_generation,
+      .slot_generation = slot->generation,
+      .slot = (uint16_t)index,
+  },
+  };
+  return F12_OK;
 }
 
 f12_err_t f12_close(f12_file_t *file) {
-  if (!file || !file->fs) {
-    return F12_ERR_BAD_HANDLE;
+  f12_file_slot_t *slot = f12_file_slot(file);
+  if (!slot) return F12_ERR_BAD_HANDLE;
+  f12_t *fs = file->token.fs;
+  f12_err_t error = f12_check_mounted(fs);
+  if (error != F12_OK) return error;
+
+  if (slot->mode == F12_OPEN_WRITE) {
+    fat12_err_t fat_error = fat12_close_write(&slot->io.writer);
+    if (fat_error != FAT12_OK) return f12_finish(fs, f12_from_fat(fs, fat_error));
   }
-
-  f12_t *fs = file->fs;
-
-  if (file->mode == F12_MODE_WRITE) {
-    fat12_err_t ferr = fat12_close_write(&file->io.writer);
-    if (ferr != FAT12_OK) {
-      file->mode = F12_MODE_CLOSED;
-      return f12_set_error(fs, fat12_to_f12_err(ferr));
-    }
-  }
-
-  file->mode = F12_MODE_CLOSED;
+  f12_release_file_slot(slot);
+  memset(file, 0, sizeof(*file));
   return F12_OK;
 }
 
-int f12_read(f12_file_t *file, void *buf, size_t len) {
-  if (!file || !file->fs || !buf) return -1;
-
-  if (file->mode != F12_MODE_READ) {
-    f12_set_error(file->fs, F12_ERR_INVALID);
-    return -1;
-  }
-
-  if (f12_check_disk(file->fs) != F12_OK) {
-    return -1;
-  }
-
-  int n = fat12_read(&file->io.reader, buf, len);
-  if (n < 0) {
-    f12_set_error(file->fs, fat12_to_f12_err((fat12_err_t)(-n)));
-    return -1;
-  }
-
-  return n;
+f12_err_t f12_abort(f12_file_t *file) {
+  f12_file_slot_t *slot = f12_file_slot(file);
+  if (!slot) return F12_ERR_BAD_HANDLE;
+  if (slot->mode != F12_OPEN_WRITE) return F12_ERR_CONFLICT;
+  f12_t *fs = file->token.fs;
+  f12_err_t error = f12_check_mounted(fs);
+  if (error != F12_OK) return error;
+  fat12_err_t fat_error = fat12_abort_write(&slot->io.writer);
+  if (fat_error != FAT12_OK) return f12_from_fat(fs, fat_error);
+  f12_release_file_slot(slot);
+  memset(file, 0, sizeof(*file));
+  return F12_OK;
 }
 
-int f12_write(f12_file_t *file, const void *buf, size_t len) {
-  if (!file || !file->fs || !buf) return -1;
+f12_result_t f12_read(f12_file_t *file, void *buf, size_t len) {
+  f12_file_slot_t *slot = f12_file_slot(file);
+  if (!slot) return f12_result(F12_ERR_BAD_HANDLE, 0);
+  if (slot->mode != F12_OPEN_READ) return f12_result(F12_ERR_CONFLICT, 0);
+  if (!buf && len != 0) return f12_result(F12_ERR_INVALID, 0);
+  if (len == 0) return f12_result(F12_OK, 0);
 
-  if (file->mode != F12_MODE_WRITE) {
-    f12_set_error(file->fs, F12_ERR_INVALID);
-    return -1;
-  }
+  f12_err_t error = f12_check_mounted(file->token.fs);
+  if (error != F12_OK) return f12_result(error, 0);
+  fat12_result_t result = fat12_read(&slot->io.reader, (uint8_t *)buf, len);
+  error = f12_finish(file->token.fs,
+                     f12_from_fat(file->token.fs, result.error));
+  if (error != F12_OK) return f12_result(error, result.count);
+  return f12_result(result.count == 0 ? F12_END : F12_OK, result.count);
+}
 
-  if (f12_check_writable(file->fs) != F12_OK) {
-    return -1;
-  }
+f12_result_t f12_write(f12_file_t *file, const void *buf, size_t len) {
+  f12_file_slot_t *slot = f12_file_slot(file);
+  if (!slot) return f12_result(F12_ERR_BAD_HANDLE, 0);
+  if (slot->mode != F12_OPEN_WRITE) return f12_result(F12_ERR_CONFLICT, 0);
+  if (!buf && len != 0) return f12_result(F12_ERR_INVALID, 0);
+  if (len == 0) return f12_result(F12_OK, 0);
 
-  int n = fat12_write(&file->io.writer, buf, len);
-  if (n < 0) {
-    f12_set_error(file->fs, fat12_to_f12_err((fat12_err_t)(-n)));
-    return -1;
-  }
-
-  return n;
+  f12_err_t error = f12_check_writable(file->token.fs);
+  if (error != F12_OK) return f12_result(error, 0);
+  fat12_result_t result = fat12_write(&slot->io.writer, (const uint8_t *)buf, len);
+  error = f12_finish(file->token.fs,
+                     f12_from_fat(file->token.fs, result.error));
+  if (error != F12_OK) return f12_result(error, result.count);
+  if (result.count == 0) return f12_result(F12_ERR_IO, 0);
+  return f12_result(F12_OK, result.count);
 }
 
 f12_err_t f12_seek(f12_file_t *file, uint32_t offset) {
-  if (!file || !file->fs) return F12_ERR_BAD_HANDLE;
+  f12_file_slot_t *slot = f12_file_slot(file);
+  if (!slot) return F12_ERR_BAD_HANDLE;
+  if (slot->mode != F12_OPEN_READ) return F12_ERR_CONFLICT;
+  f12_err_t error = f12_check_mounted(file->token.fs);
+  if (error != F12_OK) return error;
+  fat12_err_t fat_error = fat12_seek(&slot->io.reader, offset);
+  return f12_finish(file->token.fs,
+                    f12_from_fat(file->token.fs, fat_error));
+}
 
-  if (file->mode != F12_MODE_READ) {
-    return f12_set_error(file->fs, F12_ERR_INVALID);
+f12_err_t f12_tell(const f12_file_t *file, uint32_t *offset) {
+  if (!offset) return F12_ERR_INVALID;
+  const f12_file_slot_t *slot = f12_file_slot_const(file);
+  if (!slot) return F12_ERR_BAD_HANDLE;
+  f12_err_t error = f12_check_mounted(file->token.fs);
+  if (error != F12_OK) return error;
+  if (slot->mode == F12_OPEN_READ) {
+    *offset = slot->io.reader.bytes_read;
+  } else if (slot->mode == F12_OPEN_WRITE) {
+    *offset = slot->io.writer.bytes_written;
+  } else {
+    return F12_ERR_BAD_HANDLE;
   }
-
-  f12_err_t err = f12_check_disk(file->fs);
-  if (err != F12_OK) return err;
-
-  fat12_err_t ferr = fat12_seek(&file->io.reader, offset);
-  if (ferr != FAT12_OK) {
-    return f12_set_error(file->fs, fat12_to_f12_err(ferr));
-  }
-
   return F12_OK;
 }
 
-uint32_t f12_tell(f12_file_t *file) {
-  if (!file) return 0;
-  switch (file->mode) {
-    case F12_MODE_READ:  return file->io.reader.bytes_read;
-    case F12_MODE_WRITE: return file->io.writer.bytes_written;
-    default:             return 0;
+f12_result_t f12_read_at(f12_file_t *file, uint32_t offset, void *buf,
+                         size_t len) {
+  f12_file_slot_t *slot = f12_file_slot(file);
+  if (!slot) return f12_result(F12_ERR_BAD_HANDLE, 0);
+  if (slot->mode != F12_OPEN_READ) return f12_result(F12_ERR_CONFLICT, 0);
+  if (!buf && len != 0) {
+    return f12_result(F12_ERR_INVALID, 0);
   }
-}
-
-int f12_read_at(f12_file_t *file, uint32_t offset, void *buf, size_t len) {
-  if (!file || !file->fs) return -1;
-
-  uint32_t saved_pos = f12_tell(file);
-
-  f12_err_t err = f12_seek(file, offset);
-  if (err != F12_OK) return -1;
-
-  int n = f12_read(file, buf, len);
-
-  if (f12_seek(file, saved_pos) != F12_OK) {
-    return -1;
+  f12_t *fs = file->token.fs;
+  f12_err_t error = f12_check_mounted(fs);
+  if (error != F12_OK) return f12_result(error, 0);
+  fat12_file_t reader = slot->io.reader;
+  fat12_err_t fat_error = fat12_seek(&reader, offset);
+  if (fat_error != FAT12_OK) {
+    return f12_result(f12_finish(fs, f12_from_fat(fs, fat_error)), 0);
   }
-
-  return n;
+  if (len == 0) return f12_result(F12_OK, 0);
+  fat12_result_t result = fat12_read(&reader, (uint8_t *)buf, len);
+  error = f12_finish(fs, f12_from_fat(fs, result.error));
+  if (error != F12_OK) return f12_result(error, result.count);
+  return f12_result(result.count == 0 ? F12_END : F12_OK, result.count);
 }
 
 f12_err_t f12_stat(f12_t *fs, const char *path, f12_stat_t *stat) {
-  if (!fs || !path || !stat) return F12_ERR_INVALID;
-
-  f12_err_t err = f12_check_disk(fs);
-  if (err != F12_OK) return err;
-
-  if (path[0] == '/') path++;
-
+  if (stat) memset(stat, 0, sizeof(*stat));
+  if (!path || !stat) return F12_ERR_INVALID;
+  f12_err_t error = f12_check_mounted(fs);
+  if (error != F12_OK) return error;
   fat12_dirent_t entry;
-  fat12_err_t ferr = fat12_find(&fs->fat, path, &entry);
-  if (ferr != FAT12_OK) {
-    return f12_set_error(fs, fat12_to_f12_err(ferr));
-  }
-
-  format_name_83(&entry, stat->name);
-  stat->size = entry.size;
-  stat->attr = entry.attr;
-  stat->is_dir = (entry.attr & FAT12_ATTR_DIRECTORY) != 0;
-
+  fat12_err_t fat_error = fat12_find(&fs->fat, f12_path(path), &entry);
+  if (fat_error != FAT12_OK) return f12_finish(fs, f12_from_fat(fs, fat_error));
+  f12_fill_stat(&entry, stat);
   return F12_OK;
+}
+
+f12_err_t f12_free_count(f12_t *fs, uint16_t *count) {
+  if (count) *count = 0;
+  if (!count) return F12_ERR_INVALID;
+  f12_err_t error = f12_check_mounted(fs);
+  if (error != F12_OK) return error;
+  if (f12_writer_open(fs) || fat12_busy(&fs->fat)) return F12_ERR_CONFLICT;
+  fat12_err_t fat_error = fat12_free_count(&fs->fat, count);
+  return f12_finish(fs, f12_from_fat(fs, fat_error));
 }
 
 f12_err_t f12_delete(f12_t *fs, const char *path) {
-  if (!fs || !path) return F12_ERR_INVALID;
-
-  f12_err_t err = f12_check_writable(fs);
-  if (err != F12_OK) return err;
-
-  if (path[0] == '/') path++;
-
-  fat12_err_t ferr = fat12_delete(&fs->fat, path);
-  if (ferr != FAT12_OK) {
-    return f12_set_error(fs, fat12_to_f12_err(ferr));
-  }
-
-  return F12_OK;
+  if (!path) return F12_ERR_INVALID;
+  f12_err_t error = f12_check_writable(fs);
+  if (error != F12_OK) return error;
+  if (f12_operations_open(fs) || fat12_busy(&fs->fat)) return F12_ERR_CONFLICT;
+  fat12_err_t fat_error = fat12_delete(&fs->fat, f12_path(path));
+  return f12_finish(fs, f12_from_fat(fs, fat_error));
 }
 
 f12_err_t f12_rename(f12_t *fs, const char *from, const char *to) {
-  if (!fs || !from || !to) return F12_ERR_INVALID;
-
-  f12_err_t err = f12_check_writable(fs);
-  if (err != F12_OK) return err;
-
-  if (from[0] == '/') from++;
-  if (to[0] == '/') to++;
-
-  fat12_err_t ferr = fat12_rename(&fs->fat, from, to);
-  if (ferr != FAT12_OK) {
-    return f12_set_error(fs, fat12_to_f12_err(ferr));
-  }
-
-  return F12_OK;
+  if (!from || !to) return F12_ERR_INVALID;
+  f12_err_t error = f12_check_writable(fs);
+  if (error != F12_OK) return error;
+  if (f12_operations_open(fs) || fat12_busy(&fs->fat)) return F12_ERR_CONFLICT;
+  fat12_err_t fat_error = fat12_rename(&fs->fat, f12_path(from), f12_path(to));
+  return f12_finish(fs, f12_from_fat(fs, fat_error));
 }
 
 f12_err_t f12_opendir(f12_t *fs, const char *path, f12_dir_t *dir) {
-  if (!fs || !path || !dir) return F12_ERR_INVALID;
+  if (dir) memset(dir, 0, sizeof(*dir));
+  if (!path || !dir) return F12_ERR_INVALID;
+  f12_err_t error = f12_check_mounted(fs);
+  if (error != F12_OK) return error;
+  const char *name = f12_path(path);
+  if (*name != '\0') return F12_ERR_NOT_DIR;
+  if (f12_writer_open(fs) || fat12_busy(&fs->fat)) return F12_ERR_CONFLICT;
 
-  f12_err_t err = f12_check_disk(fs);
-  if (err != F12_OK) return err;
-
-  if (path[0] == '/') path++;
-  if (path[0] != '\0') {
-    return f12_set_error(fs, F12_ERR_NOT_FOUND);
+  size_t index = F12_MAX_OPEN_DIRS;
+  for (size_t i = 0; i < F12_MAX_OPEN_DIRS; i++) {
+    if (!fs->dirs[i].active) {
+      index = i;
+      break;
+    }
   }
+  if (index == F12_MAX_OPEN_DIRS) return F12_ERR_TOO_MANY;
 
-  dir->fs = fs;
-  dir->index = 0;
+  f12_dir_slot_t *slot = &fs->dirs[index];
+  slot->generation = f12_next_generation(slot->generation);
+  slot->index = 0;
+  slot->active = true;
+  *dir = (f12_dir_t){.token = {
+      .fs = fs,
+      .incarnation = fs->incarnation,
+      .mount_generation = fs->mount_generation,
+      .slot_generation = slot->generation,
+      .slot = (uint16_t)index,
+  },
+  };
   return F12_OK;
 }
 
 f12_err_t f12_readdir(f12_dir_t *dir, f12_stat_t *stat) {
-  if (!dir || !dir->fs || !stat) return F12_ERR_INVALID;
+  if (stat) memset(stat, 0, sizeof(*stat));
+  if (!stat) return F12_ERR_INVALID;
+  f12_dir_slot_t *slot = f12_dir_slot(dir);
+  if (!slot) return F12_ERR_BAD_HANDLE;
+  f12_err_t error = f12_check_mounted(dir->token.fs);
+  if (error != F12_OK) return error;
 
-  f12_err_t err = f12_check_disk(dir->fs);
-  if (err != F12_OK) return err;
-
-  while (1) {
+  for (;;) {
     fat12_dirent_t entry;
-    fat12_err_t ferr = fat12_read_root_entry(&dir->fs->fat, dir->index, &entry);
-
-    if (ferr != FAT12_OK) {
-      return f12_set_error(dir->fs, F12_ERR_EOF);
+    fat12_err_t fat_error = fat12_read_root_entry(&dir->token.fs->fat,
+                                                  slot->index, &entry);
+    if (fat_error != FAT12_OK) {
+      return f12_finish(dir->token.fs,
+                        f12_from_fat(dir->token.fs, fat_error));
     }
-
-    dir->index++;
-
-    if (fat12_entry_is_end(&entry)) {
-      return f12_set_error(dir->fs, F12_ERR_EOF);
-    }
-
-    if (!fat12_entry_valid(&entry)) {
-      continue;
-    }
-
-    if (entry.attr & FAT12_ATTR_VOLUME_ID) {
-      continue;
-    }
-
-    format_name_83(&entry, stat->name);
-    stat->size = entry.size;
-    stat->attr = entry.attr;
-    stat->is_dir = (entry.attr & FAT12_ATTR_DIRECTORY) != 0;
-
+    slot->index++;
+    if (fat12_entry_is_end(&entry)) return F12_END;
+    if (!fat12_entry_valid(&entry) || (entry.attr & FAT12_ATTR_VOLUME_ID) != 0) continue;
+    f12_fill_stat(&entry, stat);
     return F12_OK;
   }
 }
 
 f12_err_t f12_closedir(f12_dir_t *dir) {
-  if (!dir) return F12_ERR_INVALID;
-  dir->fs = NULL;
-  dir->index = 0;
+  f12_dir_slot_t *slot = f12_dir_slot(dir);
+  if (!slot) return F12_ERR_BAD_HANDLE;
+  f12_release_dir_slot(slot);
+  memset(dir, 0, sizeof(*dir));
   return F12_OK;
 }
 
-f12_err_t f12_list(f12_t *fs, f12_list_cb cb, void *ctx) {
-  if (!fs || !cb) return F12_ERR_INVALID;
-
+f12_err_t f12_list(f12_t *fs, f12_list_fn fn, void *ctx) {
+  if (!fn) return F12_ERR_INVALID;
   f12_dir_t dir;
-  f12_err_t err = f12_opendir(fs, "/", &dir);
-  if (err != F12_OK) return err;
+  f12_err_t error = f12_opendir(fs, "/", &dir);
+  if (error != F12_OK) return error;
 
-  f12_stat_t stat;
-  while (f12_readdir(&dir, &stat) == F12_OK) {
-    cb(&stat, ctx);
+  for (;;) {
+    f12_stat_t stat;
+    error = f12_readdir(&dir, &stat);
+    if (error == F12_END) {
+      return f12_closedir(&dir);
+    }
+    if (error != F12_OK) {
+      f12_closedir(&dir);
+      return error;
+    }
+    error = fn(ctx, &stat);
+    if (error != F12_OK) {
+      f12_closedir(&dir);
+      return error;
+    }
   }
-
-  f12_closedir(&dir);
-  return F12_OK;
 }
 
-f12_err_t f12_errno(f12_t *fs) {
-  if (!fs) return F12_ERR_INVALID;
-  return fs->last_error;
-}
-
-const char *f12_strerror(f12_err_t err) {
-  switch (err) {
-    case F12_OK:                 return "Success";
-    case F12_ERR_IO:             return "I/O error";
-    case F12_ERR_NOT_FOUND:      return "File not found";
-    case F12_ERR_EXISTS:         return "File exists";
-    case F12_ERR_FULL:           return "Disk full";
-    case F12_ERR_TOO_MANY:       return "Too many open files";
-    case F12_ERR_INVALID:        return "Invalid argument";
-    case F12_ERR_IS_DIR:         return "Is a directory";
-    case F12_ERR_NOT_MOUNTED:    return "Not mounted";
-    case F12_ERR_EOF:            return "End of file";
-    case F12_ERR_DISK_CHANGED:   return "Disk changed";
-    case F12_ERR_WRITE_PROTECTED: return "Write protected";
-    case F12_ERR_BAD_HANDLE:     return "Bad file handle";
-    default:                     return "Unknown error";
+const char *f12_strerror(f12_err_t error) {
+  switch (error) {
+    case F12_OK: return "success";
+    case F12_END: return "end";
+    case F12_ERR_INVALID: return "invalid argument";
+    case F12_ERR_NOT_INITIALIZED: return "not initialized";
+    case F12_ERR_NOT_MOUNTED: return "not mounted";
+    case F12_ERR_ALREADY_MOUNTED: return "already mounted";
+    case F12_ERR_NOT_FOUND: return "not found";
+    case F12_ERR_EXISTS: return "already exists";
+    case F12_ERR_FULL: return "disk full";
+    case F12_ERR_TOO_MANY: return "too many open operations";
+    case F12_ERR_IS_DIR: return "is a directory";
+    case F12_ERR_NOT_DIR: return "not a directory";
+    case F12_ERR_READ_ONLY: return "read only";
+    case F12_ERR_CONFLICT: return "operation conflict";
+    case F12_ERR_BUSY: return "busy";
+    case F12_ERR_BAD_HANDLE: return "bad handle";
+    case F12_ERR_TIMEOUT: return "timeout";
+    case F12_ERR_CRC: return "CRC error";
+    case F12_ERR_WRONG_TRACK: return "wrong track";
+    case F12_ERR_WRONG_SIDE: return "wrong side";
+    case F12_ERR_NO_TRACK0: return "track zero unavailable";
+    case F12_ERR_MEDIA_CHANGED: return "media changed";
+    case F12_ERR_WRITE_PROTECTED: return "write protected";
+    case F12_ERR_UNDERRUN: return "underrun";
+    case F12_ERR_OVERRUN: return "overrun";
+    case F12_ERR_VERIFY: return "verification failed";
+    case F12_ERR_AMBIGUOUS: return "ambiguous filesystem state";
+    case F12_ERR_CORRUPT: return "corrupt filesystem";
+    case F12_ERR_IO: return "I/O error";
   }
+  return "unknown error";
 }

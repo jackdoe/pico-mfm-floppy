@@ -11,6 +11,6 @@ static inline pio_sm_config flux_read_program_get_default_config(uint offset) {
     return c;
 }
 
-void flux_read_program_init(PIO pio, uint sm, uint offset, uint pin, uint index_pin);
+int flux_read_program_init(PIO pio, uint sm, uint offset, uint pin, uint index_pin);
 
 #endif

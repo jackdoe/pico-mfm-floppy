@@ -1,203 +1,211 @@
-# Pico Floppy
+# Pico MFM Floppy
 
-A bare-metal 3.5" HD floppy disk driver for the Raspberry Pi Pico (RP2040) and Pico 2 (RP2350). MFM encoding/decoding and FAT12 filesystem with no dedicated floppy controller hardware — just PIO and software.
+A bare-metal 1.44 MB 3.5-inch floppy driver and FAT12 filesystem for Raspberry Pi Pico and Pico 2. It uses PIO, DMA, and software MFM encoding instead of a floppy controller.
 
-Verified against 9 real floppy disks (System Shock, 1994) decoded from raw magnetic flux captures.
+![Raspberry Pi Pico 2 connected to a 3.5-inch floppy drive](picture.jpg)
 
-![picture](picture.jpg)
+## Start here
+
+The Pico is a 3.3 V device and is not 5 V tolerant. Read [Hardware](#hardware) before connecting a drive. Power the drive from a separate regulated 5 V supply, join the Pico and drive grounds, and pull `/READ_DATA` up to 3.3 V rather than 5 V.
+
+1. Wire the drive using the pin table below.
+2. Build the UF2 for the exact board using [Build firmware](#build-firmware).
+3. Hold BOOTSEL while connecting the Pico, then copy `floppy_cli.uf2` to the mounted `RPI-RP2` volume.
+4. Open the Pico USB CDC serial port with a terminal that sends CR or LF. UART output is disabled and the USB port does not depend on a baud rate.
+5. Insert a disk and run `status`, then `mount`, then `ls`.
+
+Mounting is read-only. Do not run `format`, `test-full`, or `crashtest` on media that must be preserved. Start with `diskdump quiet` when evaluating an unknown disk without modifying it.
 
 ## Architecture
 
-```
-Application
-    │
-    ▼
-f12 API ──── open / read / write / seek / delete / rename / readdir / fsck
-    │
-    ▼
-LRU Cache ── 128 sectors (7 tracks)
-    │
-    ▼
-FAT12 ────── BPB, FAT tables, directories, cluster chains, batched writes
-    │
-    ▼
-floppy ───── motor, seek, side select, sector read, write-verify-retry
-    │
-    ▼
-MFM ──────── flux pulse intervals ↔ data bytes (adaptive timing, write precomp)
-    │
-    ▼
-PIO ──────── flux_read (24 MHz pulse measurement) / flux_write (pulse generation)
-    │
-    ▼
-Drive ────── magnetic flux transitions on spinning disk
+```text
+Application and USB serial CLI
+    |
+    v
+f12 handle API
+    |
+    v
+Track cache and media-generation boundary
+    |
+    v
+FAT12 metadata, copy-on-write files, and fsck
+    |
+    v
+Typed block-device interface
+    |
+    v
+Drive control, recovery, write verification
+    |
+    v
+MFM codec, DMA rings, generated PIO programs
+    |
+    v
+34-pin floppy drive
 ```
 
-## Source
+The disk geometry is fixed and explicit: 80 cylinders, two heads, 18 sectors per track, and 512 bytes per sector. Sector identifiers used by the internal API are zero-based.
 
-```
-src/
-├── flux_read.pio       PIO: measure time between flux transitions
-├── flux_write.pio      PIO: generate flux transitions with precise timing
-├── mfm_decode.c/h      4-state MFM decoder with adaptive timing calibration
-├── mfm_encode.c/h      MFM encoder with write precompensation
-├── crc.c/h             CRC-16/CCITT (table lookup)
-├── floppy.c/h          Drive control: motor, seek, side, sector read, write-verify-retry
-├── fat12.c/h           FAT12 filesystem with batched sector writes
-├── f12.c/h             High-level file API with LRU sector cache
-└── lru.c/h             Generic LRU cache (doubly-linked list over flat storage)
-```
+The firmware is split into:
+
+- `block.h`: geometry, partial-track representation, and typed block status.
+- `flux_read.pio` and `flux_write.pio`: timed flux capture and generation programs compiled by `pioasm`.
+- `crc.c`: the table used for MFM sector CRC-16.
+- `floppy.c`: resource ownership, motor and head control, media detection, flux DMA, recovery, and verified track writes.
+- `mfm_decode.c` and `mfm_encode.c`: adaptive MFM decoding and streaming encoding with inner-track precompensation.
+- `fat12.c`: FAT12 names, directories, cluster chains, metadata batching, formatting, transactional replacement, and repair.
+- `f12.c`: mounted-filesystem state, opaque checked handles, track caching, file operations, and error translation.
+- `examples/cli.c`: USB serial administration, diagnostics, destructive tests, and power-cut verification.
+
+The CMake target `floppy_lib` is a static library. It owns its C sources and both generated PIO headers; consumers receive only the public include and link requirements.
+
+## Reliability model
+
+Every layer has one error vocabulary for its abstraction. Block operations return `block_status_t`; file reads and writes return both a typed error and the number of bytes transferred. Partial progress is never disguised as complete success.
+
+The drive serializes operations and gives control, read, write, raw-flux, and teardown paths bounded deadlines. A media generation is captured before I/O and checked throughout the operation, so removal or replacement invalidates cached data and open filesystem state. Reads reject conflicting copies of a sector and recovery is limited to explicit recalibration and head-jog attempts.
+
+Writes stream MFM transitions through DMA, then read the track back and compare it with the requested image. Write protection, media changes, FIFO underruns, overruns, timeouts, CRC failures, wrong-track data, and verification failures remain distinct.
+
+Every successful `f12_init` establishes a fresh context incarnation and invalidates every handle issued by an earlier initialization. File handles also carry mount generation, slot generation, and slot identity, so stale, forged, reused, and post-remount handles are rejected. A failed writer close retains enough state to retry the same commit; callers must either retry `f12_close` or explicitly abort.
+
+`floppy_t` and `f12_t` are large, aligned owner contexts intended for static storage. `floppy_init` accepts fresh storage, permits one active hardware context, rejects live reinitialization, and requires `floppy_deinit` before that storage is released or reused. `f12_init` is an explicit reset. `f12_is_mounted` is a typed query so an observer failure cannot be mistaken for an unmounted filesystem. Hardware operations are serialized, but callers must not race context initialization or teardown, and filesystem calls require application-level serialization across cores.
+
+Replacing a file publishes the new directory entry before reclaiming the old chain. Mount is read-only. Repair is an explicit `fsck` operation, and a repair is considered successful only when a subsequent read-only scan converges to a clean report. FAT-copy ambiguity is reported rather than guessed.
 
 ## Hardware
 
-3.5" HD floppy drive connected to the Pico or Pico 2 via 34-pin interface. All signals are active-low open-drain.
+The default CLI pin assignment is:
 
+| Floppy pin | Signal | Pico GPIO | Direction |
+|---:|---|---:|---|
+| 2 | /DENSITY | GP15 | Pico to drive |
+| 8 | /INDEX | GP14 | Drive to Pico |
+| 12 | /DRIVE_SELECT_B | GP12 | Pico to drive |
+| 16 | /MOTOR_ENABLE_B | GP10 | Pico to drive |
+| 18 | /DIRECTION | GP9 | Pico to drive |
+| 20 | /STEP | GP8 | Pico to drive |
+| 22 | /WRITE_DATA | GP7 | Pico to drive |
+| 24 | /WRITE_GATE | GP6 | Pico to drive |
+| 26 | /TRACK_0 | GP5 | Drive to Pico |
+| 28 | /WRITE_PROTECT | GP4 | Drive to Pico |
+| 30 | /READ_DATA | GP3 | Drive to Pico |
+| 32 | /SIDE_SELECT | GP2 | Pico to drive |
+| 34 | /DISK_CHANGE | GP1 | Drive to Pico |
+
+Connect every odd-numbered floppy pin to ground. Power the drive from a separate regulated 5 V supply sized for its spin-up current, and connect the drive and Pico grounds.
+
+The firmware drives control signals as open-drain outputs. Do not expose a Pico GPIO to 5 V. `/READ_DATA` needs an external pull-up to 3.3 V; 4.7 kΩ is the tested value. Check the electrical requirements of the exact drive before connecting it.
+
+## Timing
+
+The CLI selects clocks that make the PIO dividers integral:
+
+| Board | System clock | Read PIO | Read divider | Write PIO | Write divider |
+|---|---:|---:|---:|---:|---:|
+| Pico / RP2040 | 72 MHz | 72 MHz | 1 | 24 MHz | 3 |
+| Pico 2 / RP2350 | 144 MHz | 72 MHz | 2 | 24 MHz | 6 |
+
+`floppy_init` rejects clocks that are not an exact nonzero multiple of 72 MHz.
+
+## Hardware validation
+
+Use a disposable, writable 1.44 MB disk for the destructive hardware suite:
+
+```text
+test-full 12
 ```
-Floppy Pin   Signal           Pico GPIO
-────────────────────────────────────────
- 2           /DENSITY         GP15  ← 4.7kΩ pull-up to 3.3V
- 8           /INDEX           GP14
-12           /DRIVE_SELECT_B  GP12
-16           /MOTOR_ENABLE_B  GP10
-18           /DIRECTION       GP9
-20           /STEP            GP8
-22           /WRITE_DATA      GP7
-24           /WRITE_GATE      GP6
-26           /TRACK_0         GP5
-28           /WRITE_PROTECT   GP4
-30           /READ_DATA       GP3   ← 4.7kΩ pull-up to 3.3V required
-32           /SIDE_SELECT     GP2
-34           /DISK_CHANGE     GP1
 
-Odd pins (1-33): ground
-Power: separate 5V supply (up to 1A), grounds connected
+This formats every track, exercises raw-flux ownership, rejects concurrent motion and teardown, verifies stable media generation, performs filesystem operations with varied transfer sizes, fills every free cluster with deterministic randomized files, verifies exact disk-full transactions, deletes files across the disk, refills the fragmented space to capacity, observes verified DMA track writes, remounts, requires a clean filesystem check, and reads all 2,880 sectors. A successful run ends with `ALL PASSED` and leaves the drive unmounted, deselected, and stopped.
+
+Test the physical disk-change path with a mounted canonical FAT12 disk and a second canonical FAT12 disk ready:
+
+```text
+test-media
 ```
 
-READ_DATA needs an external 4.7kΩ pull-up because the internal pull-ups (50kΩ) are too weak for 500 kHz MFM pulses. DENSITY also has a 4.7kΩ pull-up to 3.3V.
+At the first prompt, eject the mounted disk, leave the drive empty, and enter `y`. After the stale-state checks pass, insert the replacement disk and confirm the second prompt. The command requires one exact generation advance, rejection of the stale hardware generation, invalidation of an open filesystem handle, successful latch clearing through a physical step, a clean mount of the replacement disk, and safe cleanup.
 
-## Building
+Use `crashtest`, cut power during its overwrite loop, reboot, and run `crashcheck` for physical power-loss validation. The check accepts only the recorded old or new target generation and requires the stable and filler files to remain exact.
 
-Firmware (requires Pico SDK):
+## Build firmware
+
+Install the Pico SDK and export `PICO_SDK_PATH`.
+
 ```sh
-mkdir build && cd build
-cmake .. && make        # builds for the original Pico (RP2040) by default
+cmake -S . -B build-rp2040 -DPICO_BOARD=pico -DCMAKE_BUILD_TYPE=Release
+cmake --build build-rp2040 --parallel
 ```
 
-To build for the Pico 2 (RP2350), change `PICO_BOARD` in `CMakeLists.txt`:
-```cmake
-set(PICO_BOARD pico)    # RP2040 (default)
-set(PICO_BOARD pico2)   # RP2350
+The RP2040 UF2 is `build-rp2040/floppy_cli.uf2`.
+
+```sh
+cmake -S . -B build-rp2350 -DPICO_BOARD=pico2 -DCMAKE_BUILD_TYPE=Release
+cmake --build build-rp2350 --parallel
 ```
 
-RP2040 differences (handled automatically via `#if PICO_RP2040`):
-- System clock: overclocked to 144 MHz so PIO dividers are exact integers (read: 144/72 = 2, write: 144/24 = 6), avoiding the massive jitter from fractional dividers with `div_int=1` at 125 MHz
+The RP2350 UF2 is `build-rp2350/floppy_cli.uf2`.
 
-Tests (host-side, no hardware needed):
+Both builds require C11 for project C and C++17 for Pico SDK dependencies. Project sources compile with warnings treated as errors, including pedantic, conversion, sign-conversion, shadow, format, undefined-macro, and strict-prototype diagnostics.
+
+## Run host tests
+
+The host suite requires:
+
+- a C11 compiler and CMake;
+- `pioasm` on `PATH` or in the Pico SDK build locations searched by CMake;
+- the nonempty SCP fixture at `system-shock-multilingual-floppy-ibm-pc/disk1.scp`, or an explicit replacement through `SCP_FIXTURE`.
+
 ```sh
 ./tests/run_all.sh
 ```
 
-## Key Features
+The runner fails if configuration registers zero tests. It exercises the MFM codec, FAT12 and f12 APIs, malformed media, fuzz cases, SCP decoding and round trips, PIO simulation, PIO instruction emulation, timeout and underrun paths, write verification, and end-to-end corruption recovery.
 
-**DMA flux transfer** — reads and writes both stream through one 4KB DMA ring buffer (~6ms of IRQ tolerance instead of the FIFOs' ~50µs). Writes are encoded live into the ring while DMA feeds the drive — no track-sized encode buffer exists, saving 110-200KB of RAM. Write precompensation is applied in the streaming emit path, byte-identical to the old buffered pass. Interrupt latency (USB, timers) can no longer drop flux samples or underrun the write stream; ring overruns are counted in drive stats.
+Run the same suite with sanitizers:
 
-**Adaptive MFM timing** — the decoder measures preamble pulse widths before each sector and calibrates classification thresholds dynamically. Handles ±8% drive speed variation (professional controllers required ±5%).
-
-**Write precompensation** — on inner tracks (≥40), adjacent flux transitions are shifted ±125ns to counteract magnetic bit shift. Without this, inner track writes have 5-15% error rates.
-
-**Write-verify-retry** — every track write is verified by reading back and comparing all 18 sectors byte-for-byte. Each write attempt retries the verify read up to 3 times (with head jog between each) before re-writing. Three write attempts with escalating recovery: write+verify, write+verify, recalibrate+write+verify. Reports exactly which sectors failed.
-
-**Explicit fsck, read-only mount** — mounting never modifies the disk. `fsck` detects lost clusters, broken chains, cross-linked files, and FAT copy mismatches; `fsck fix` frees lost chains, terminates broken ones, and rewrites FAT2 from FAT1. The CLI warns after mount if the filesystem is dirty.
-
-**Batch-aware FAT writes** — the write batch system coalesces sector writes by track and deduplicates FAT sector updates in-place, minimizing physical I/O. The free cluster search reads through the batch to see pending FAT updates, avoiding unnecessary flushes. When the batch fills mid-write, only data-track sectors are evicted — FAT and root-directory sectors stay resident until the commit point, eliminating the seek-to-track-0 round trip per batch and leaving the on-disk FAT clean if power is lost before close.
-
-**Shared write batch** — a single 18KB write batch in `fat12_t` is shared across all writers, eliminating 166KB of wasted memory from per-file-handle batch storage.
-
-## Testing
-
-271 unit tests, 12,001 fuzz iterations, 100 SCP roundtrip fuzz iterations, 200 fsck convergence fuzz iterations. Tested against real 1994 floppy disks. Tests run for both RP2040 and RP2350 configurations. CI runs the full suite under AddressSanitizer/UBSan and builds firmware for both boards.
-
-```
-tests/
-├── test_lru.c            32 tests: cache operations, eviction, edge cases
-├── test_mfm.c            17 tests: encode/decode roundtrip, all byte patterns, streaming precomp identity
-├── test_fat12.c          83 tests: filesystem operations, format, rename, fsck, cluster chains
-├── test_f12.c            54 tests: high-level API, directory listing, seek, rename, fsck
-├── test_robustness.c     29 tests: corrupt BPB, invalid pulses, truncated sectors
-├── test_fuzz.c           12,001 iterations: random pulses, corrupt disks, FAT chaos
-├── test_flux_sim.c        9 tests: synthetic flux + real SCP decode (all 9 disks)
-├── test_scp_fat12.c       7 tests: mount SCP as FAT12, list files, read content
-├── test_scp_roundtrip.c   9 tests: decode→modify→encode→decode→verify, fsck repair, fuzz
-├── test_pio_sim.c        11 tests: real floppy.c code with PIO hardware simulation
-├── test_pio_emu.c         3 tests: cycle-accurate PIO instruction emulation
-├── test_write_verify.c    7 tests: write-verify-retry through full firmware + PIO sim, cache-skip-flux-read
-├── flux_sim.c/h          SCP file parser + synthetic flux with jitter/drift
-├── pio_sim.c/h           GPIO/PIO hardware simulator with write-back and fault injection
-├── pio_emu.c/h           RP2040 PIO instruction set emulator (9 opcodes)
-├── scp_disk.h            Flux-to-sector IO adapter (MFM decode on demand)
-├── vdisk.h               In-memory sector-level virtual disk
-└── test.h                Minimal test framework
+```sh
+./tests/run_all.sh -DENABLE_SANITIZERS=ON
 ```
 
-### SCP Roundtrip Test
+Increase deterministic SCP round-trip coverage:
 
-The strongest test: decode a real floppy from raw magnetic flux, modify files through FAT12, MFM-encode back to flux, write an SCP file, decode it again, and verify every file.
-
-```
-SCP flux capture (73MB Greaseweazle capture of 1994 System Shock floppy)
-  → MFM decode (2880/2880 sectors, adaptive timing)
-    → F12 mount
-      → modify README.SS ("System" → "Floppy")
-      → delete LHA.DOC, SHOCKGUS.BAT
-      → create HELLO.TXT, BIG.DAT (10KB), TINY.BIN (1 byte), EMPTY.TXT
-      → rename INSTALLE.DAT → RENAMED.OLD, HELLO.TXT → GREET.TXT
-      → overwrite CYB.CFG
-    → MFM encode → SCP file (22.1 MB)
-      → MFM decode (2880/2880 sectors, zero mismatches)
-        → F12 mount → verify all modifications survived
-        → verify untouched files byte-identical (checksums match)
+```sh
+./tests/run_all.sh -DSCP_ITERATIONS=100
 ```
 
-The fill-to-max test formats a fresh floppy, writes 43 files filling 99% of disk space across all 160 tracks on both sides, encodes to SCP, decodes back, and verifies every file checksum.
+Use another capture:
 
-The fuzz roundtrip runs 100 iterations of: format → random creates/overwrites/deletes with random filenames and sizes → encode → decode → verify every surviving file.
-
-### PIO Emulation
-
-Two levels of hardware simulation:
-
-**PIO Simulator** (`pio_sim.c`) — mocks the Pico SDK GPIO/PIO functions so the real `floppy.c` firmware code runs against SCP flux data. Written flux data is captured and converted back to readable track deltas, enabling full write-verify testing. Fault injection simulates marginal media. Tests the complete firmware path: `floppy_read_sector` → PIO FIFO unpacking → delta computation → MFM decode → FAT12 → file read/write.
-
-**PIO Emulator** (`pio_emu.c`) — cycle-accurate execution of the actual `flux_read.pio` and `flux_write.pio` PIO instructions. Verifies the PIO programs produce correct counter values and FIFO output. Hand-assembled from the `.pio` source.
-
-### Real Disk Data
-
-Tested against all 9 disks of System Shock Multilingual Edition (ORIGIN Systems, 1994), captured with Greaseweazle v0.37:
-
-```
-Disk  Sectors   Files                                    Bytes
-────  ────────  ───────────────────────────────────────  ──────────
-  1   2880/2880 INSTALL.EXE INSTALLE.DAT ... BASE.LZH   1,083,020
-  2   2880/2880 BASE.LZH TEXTURE.LZH                    1,456,682
-  3   2880/2880 TEXTURE.LZH ART.LZH                     1,457,118
-  4   2880/2880 ART.LZH                                 1,457,152
-  5   2880/2880 ART.LZH RES.LZH                         1,457,021
-  6   2880/2880 RES.LZH                                 1,457,152
-  7   2880/2880 RES.LZH                                 1,457,152
-  8   2880/2880 RES.LZH                                 1,457,152
-  9   2880/2880 RES.LZH SOUND.LZH                       1,176,866
-
-Total: 25,920 sectors decoded from raw magnetic flux, zero errors
-       23 files read and checksum-verified across 9 physical disks
+```sh
+SCP_FIXTURE=/absolute/path/to/disk.scp ./tests/run_all.sh
 ```
 
-## References
+Generate coverage reports with `gcovr`:
 
-- [floppy.cafe](https://floppy.cafe) — MFM encoding and floppy drive documentation
-- [Adafruit Floppy](https://github.com/adafruit/Adafruit_Floppy) — Arduino/RP2040 floppy library
-- [Greaseweazle](https://github.com/keirf/greaseweazle) — Floppy disk flux capture tool
-- [Microsoft FAT Specification](https://academy.cba.mit.edu/classes/networking_communications/SD/FAT.pdf) — FAT12/16/32 filesystem spec
-- Samsung SFD321B datasheet — Floppy drive pinout and timing
+```sh
+./tests/run_coverage.sh
+```
+
+## Simulation model
+
+The host suite tests three different boundaries:
+
+- `flux_sim` decodes synthetic tracks and the bundled SCP capture as transition intervals.
+- `pio_emu` executes the generated PIO instructions and checks their cycle-level behavior.
+- `pio_sim` models GPIO, index pulses, head motion, DMA rings, FIFOs, write gating, media changes, write protection, torn writes, stalls, and read-back verification while running the production floppy driver.
+
+Flux and PIO simulation use the same seeded timing-noise model. It can combine independent transition jitter, fixed spindle-rate error, bounded correlated speed wander, and sparse impulse displacement. The suite proves that identical seeds reproduce identical waveforms, modest noise still decodes exact sector data from synthetic and real SCP tracks, noise reaches the production PIO/DMA read path, and excessive noise is rejected instead of producing accepted corrupt data. Noise is disabled unless a test configures it, so unrelated tests remain deterministic.
+
+The simulator does not claim to model analog voltage thresholds, cable reflections, grounding faults, motor torque, head alignment, magnetic media physics, or real multicore and interrupt timing. Use `test-full`, `test-media`, and the power-cut procedure for those hardware boundaries.
+
+## CLI
+
+The firmware exposes a USB serial CLI. `help` prints the exact command grammar. Filenames are canonical FAT12 8.3 names; invalid or overlong input is rejected instead of truncated.
+
+`write` and `cp` retain a writer whose final commit failed. Run `commit` to resume that commit. Unmount, format, destructive tests, and reboot refuse to silently discard it.
+
+`fsck` reports every detected defect. `fsck fix` repairs and immediately checks convergence. `crashtest` repeatedly replaces a target file for physical power-cut testing; after reboot, `crashcheck` requires the stable and filler files to be exact and the target to be exactly either the recorded old value or the recorded new value.
+
+`format`, `test-full`, and `crashtest` destroy data. Use media that can be erased.
 
 ## License
 

@@ -7,7 +7,7 @@ typedef enum { clk_sys = 0 } clock_handle_t;
 
 static inline uint32_t clock_get_hz(clock_handle_t clk) {
     (void)clk;
-    return 150000000;
+    return 72000000;
 }
 
 #endif

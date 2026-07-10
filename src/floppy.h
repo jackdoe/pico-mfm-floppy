@@ -1,38 +1,27 @@
 #ifndef FLOPPY_H
 #define FLOPPY_H
 
-#include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
+#include "block.h"
 #include "hardware/pio.h"
 #include "pico/time.h"
 
-#define SECTOR_SIZE 512
-#define FLOPPY_TRACKS 80
-#define SECTORS_PER_TRACK 18
-
-#define FLOPPY_FLUX_RING_BITS 12
+#define FLOPPY_FLUX_RING_BITS 12u
 #define FLOPPY_FLUX_RING_BYTES (1u << FLOPPY_FLUX_RING_BITS)
-#define FLOPPY_FLUX_RING_WORDS (FLOPPY_FLUX_RING_BYTES / 4)
+#define FLOPPY_FLUX_RING_WORDS (FLOPPY_FLUX_RING_BYTES / 4u)
+#define FLOPPY_TX_HALF_BYTES (FLOPPY_FLUX_RING_BYTES / 2u)
+#define FLOPPY_IDLE_TIMEOUT_MS 20000u
 
-typedef struct {
-  uint8_t track;
-  uint8_t side;
-  uint8_t sector_n;
-  uint8_t size_code;
-  uint8_t data[SECTOR_SIZE];
-  bool valid;
-} sector_t;
-
-static inline uint16_t sector_size(const sector_t *s) {
-  return 128 << s->size_code;
-}
-
-typedef struct {
-  sector_t sectors[SECTORS_PER_TRACK];
-  uint8_t track;
-  uint8_t side;
-} track_t;
+typedef enum {
+  FLOPPY_OPERATION_IDLE = 0,
+  FLOPPY_OPERATION_CONTROL,
+  FLOPPY_OPERATION_RAW,
+  FLOPPY_OPERATION_READ,
+  FLOPPY_OPERATION_WRITE,
+  FLOPPY_OPERATION_TEARDOWN,
+} floppy_operation_t;
 
 typedef struct {
   uint8_t index;
@@ -50,16 +39,6 @@ typedef struct {
   uint8_t density;
 } floppy_pins_t;
 
-typedef enum {
-  FLOPPY_OK = 0,
-  FLOPPY_ERR_WRONG_SIDE,
-  FLOPPY_ERR_WRONG_TRACK,
-  FLOPPY_ERR_TIMEOUT,
-  FLOPPY_ERR_NO_TRACK0,
-  FLOPPY_ERR_WRITE_PROTECTED,
-  FLOPPY_ERR_VERIFY,
-} floppy_status_t;
-
 typedef struct {
   PIO pio;
   uint sm;
@@ -70,84 +49,89 @@ typedef struct {
   bool primed;
 } floppy_pio_t;
 
-#define FLOPPY_IDLE_TIMEOUT_MS 20000
-
-typedef struct floppy floppy_t;
-
 typedef struct {
   uint32_t reads;
   uint32_t retries;
   uint32_t recovered;
   uint32_t failed;
   uint32_t timeout;
+  uint32_t crc;
   uint32_t wrong_track;
   uint32_t wrong_side;
   uint32_t overruns;
+  uint32_t underruns;
+  uint32_t media_changes;
   uint32_t flux_words;
   uint32_t ring_peak;
   uint32_t dma_writes;
 } floppy_stats_t;
 
-struct floppy {
-  uint32_t flux_ring[FLOPPY_FLUX_RING_WORDS] __attribute__((aligned(1u << FLOPPY_FLUX_RING_BITS)));
+typedef struct floppy {
+  uint32_t flux_ring[FLOPPY_FLUX_RING_WORDS]
+      __attribute__((aligned(1u << FLOPPY_FLUX_RING_BITS)));
   floppy_pins_t pins;
   floppy_pio_t read;
   floppy_pio_t write;
   int dma_ch;
   uint32_t ring_cpu;
-
-  uint8_t track;
+  uint8_t cylinder;
   bool track0_confirmed;
-  bool disk_change_flag;
+  bool disk_change_active;
+  bool read_overrun;
   volatile bool motor_on;
   volatile bool selected;
-
-  bool auto_motor;
+  bool motor_qualified;
+  bool head_confirmed;
+  uint8_t head;
+  bool read_program_loaded;
+  bool write_program_loaded;
+  bool read_sm_claimed;
+  bool write_sm_claimed;
+  bool dma_claimed;
+  bool timer_active;
+  bool gpio_configured;
+  bool flux_active;
+  bool lock_claimed;
+  uint8_t lock_num;
   volatile uint32_t last_io_time_ms;
+  uint32_t media_generation;
+  uint32_t motor_generation;
+  uint32_t flux_generation;
+  volatile floppy_operation_t operation;
+  uint32_t operation_start_ms;
+  uint32_t operation_limit_ms;
+  uint32_t lifecycle;
   struct repeating_timer idle_timer;
   floppy_stats_t stats;
-};
+} floppy_t;
 
-void floppy_init(floppy_t *f);
+block_status_t floppy_init(floppy_t *f, floppy_pins_t pins);
+block_status_t floppy_deinit(floppy_t *f);
+block_status_t floppy_select(floppy_t *f, bool on);
+block_status_t floppy_side_select(floppy_t *f, uint8_t head);
+block_status_t floppy_motor_on(floppy_t *f);
+block_status_t floppy_motor_off(floppy_t *f);
+block_status_t floppy_seek(floppy_t *f, uint8_t cylinder);
+block_status_t floppy_current_track(const floppy_t *f, uint8_t *cylinder);
+block_status_t floppy_at_track0(const floppy_t *f, bool *active);
+block_status_t floppy_disk_changed(floppy_t *f, bool *changed);
+block_status_t floppy_media_generation(floppy_t *f, uint32_t *generation);
+block_status_t floppy_write_protected(const floppy_t *f, bool *write_protected);
+block_status_t floppy_stats_reset(floppy_t *f);
+block_status_t floppy_stats(const floppy_t *f, floppy_stats_t *stats);
 
-void floppy_pin_oc(uint pin, bool value);
+block_status_t floppy_flux_begin(floppy_t *f, uint32_t expected_generation);
+block_status_t floppy_flux_next(floppy_t *f, uint16_t *delta, bool *index);
+block_status_t floppy_flux_end(floppy_t *f);
 
-void floppy_select(floppy_t *f, bool on);
+block_status_t floppy_read_sector(floppy_t *f, uint32_t expected_generation,
+                                  uint8_t cylinder, uint8_t head, uint8_t sector,
+                                  uint8_t out[DISK_SECTOR_SIZE]);
+block_status_t floppy_read_track(floppy_t *f, uint32_t expected_generation,
+                                 track_t *track);
+block_status_t floppy_write_track(floppy_t *f, uint32_t expected_generation,
+                                  const track_t *track);
 
-void floppy_side_select(floppy_t *f, uint8_t side);
-
-void floppy_motor_on(floppy_t *f);
-void floppy_motor_off(floppy_t *f);
-
-void floppy_set_density(floppy_t *f, bool hd);
-
-floppy_status_t floppy_seek(floppy_t *f, uint8_t track);
-
-uint8_t floppy_current_track(floppy_t *f);
-
-bool floppy_at_track0(floppy_t *f);
-
-bool floppy_disk_changed(floppy_t *f);
-
-bool floppy_write_protected(floppy_t *f);
-
-void floppy_stats_reset(floppy_t *f);
-
-floppy_stats_t floppy_stats(floppy_t *f);
-
-void floppy_flux_begin(floppy_t *f);
-bool floppy_flux_next(floppy_t *f, uint16_t *delta, bool *index);
-void floppy_flux_end(floppy_t *f);
-
-floppy_status_t floppy_read_sector(floppy_t *f, sector_t *sector);
-floppy_status_t floppy_read_track(floppy_t *f, track_t *t);
-
-floppy_status_t floppy_write_track(floppy_t *f, track_t *track);
-
-bool floppy_io_read(void *ctx, sector_t *sector);
-bool floppy_io_read_track(void *ctx, track_t *track);
-bool floppy_io_write(void *ctx, track_t *track);
-bool floppy_io_disk_changed(void *ctx);
-bool floppy_io_write_protected(void *ctx);
+block_device_t floppy_device(floppy_t *f);
 
 #endif
