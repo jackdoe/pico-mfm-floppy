@@ -1,5 +1,5 @@
 #include "flux_sim.h"
-#include "../src/mfm_encode.h"
+#include "../src/mfm.h"
 #include <stdlib.h>
 #include <string.h>
 

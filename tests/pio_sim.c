@@ -1,8 +1,7 @@
 #include "pio_sim.h"
 #include "hardware/dma.h"
-#include "hardware/sync.h"
 #include "../src/floppy.h"
-#include "../src/mfm_encode.h"
+#include "../src/mfm.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,12 +9,9 @@
 
 static pio_sim_drive_t *g_drive;
 static void pio_sim_load_track(void);
-extern floppy_t *pio_sim_floppy_ref;
 uint64_t pico_test_time_us;
 static uint32_t tx_time_remainder;
 static uint32_t rx_time_remainder;
-static repeating_timer_callback_t sim_timer_callback;
-static struct repeating_timer *sim_timer;
 
 typedef struct {
   bool read_active;
@@ -35,7 +31,6 @@ typedef struct {
 } sim_dma_t;
 
 static sim_dma_t sim_dma;
-static spin_lock_t sim_spin_lock;
 
 static uint32_t read_le32(const uint8_t *p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8u) |
@@ -61,14 +56,11 @@ void pio_sim_init(pio_sim_drive_t *drive) {
   drive->index_low_us = 2000u;
   if (g_drive && g_drive != drive) return;
   memset(&sim_dma, 0, sizeof(sim_dma));
-  memset(&sim_spin_lock, 0, sizeof(sim_spin_lock));
   pio0->fdebug = 0;
   pio1->fdebug = 0;
   pico_test_time_us = 0;
   tx_time_remainder = 0;
   rx_time_remainder = 0;
-  sim_timer_callback = NULL;
-  sim_timer = NULL;
 }
 
 void pio_sim_free(pio_sim_drive_t *drive) {
@@ -85,8 +77,6 @@ void pio_sim_free(pio_sim_drive_t *drive) {
   if (installed) {
     memset(&sim_dma, 0, sizeof(sim_dma));
     g_drive = NULL;
-    sim_timer = NULL;
-    sim_timer_callback = NULL;
   }
 }
 
@@ -247,8 +237,13 @@ bool pio_sim_replace_track(pio_sim_drive_t *drive, const track_t *track) {
   return true;
 }
 
-void pio_sim_install(pio_sim_drive_t *drive) {
+void pio_sim_install(pio_sim_drive_t *drive, floppy_pins_t pins,
+                     const uint32_t *ring, const uint32_t *consumer) {
   g_drive = drive;
+  if (!drive) return;
+  drive->pins = pins;
+  drive->ring = ring;
+  drive->consumer = consumer;
 }
 
 bool pio_sim_set_noise(pio_sim_drive_t *drive, flux_noise_config_t config) {
@@ -343,32 +338,35 @@ void gpio_deinit(uint pin) {
 }
 
 void gpio_set_dir(uint pin, bool output) {
-  if (!g_drive || !pio_sim_floppy_ref) return;
-  floppy_t *f = pio_sim_floppy_ref;
-  if (pin == f->pins.direction) {
+  if (!g_drive) return;
+  const floppy_pins_t *pins = &g_drive->pins;
+  if (pin == pins->direction) {
     g_drive->step_direction_inward = output;
-  } else if (pin == f->pins.step && output) {
+  } else if (pin == pins->step && output) {
+    g_drive->step_pulses++;
+    bool moved = false;
     if (g_drive->step_direction_inward && g_drive->head_track + 1u < DISK_CYLINDERS) {
       g_drive->head_track++;
-      g_drive->disk_changed = false;
+      moved = true;
     } else if (!g_drive->step_direction_inward && g_drive->head_track > 0) {
       g_drive->head_track--;
-      g_drive->disk_changed = false;
+      moved = true;
     }
+    if (moved && !g_drive->disk_change_stuck) g_drive->disk_changed = false;
     pio_sim_load_track();
-  } else if (pin == f->pins.side_select) {
+  } else if (pin == pins->side_select) {
     uint8_t head = output ? 1u : 0u;
     if (head != g_drive->head_side) {
       g_drive->head_side = head;
       pio_sim_load_track();
     }
-  } else if (pin == f->pins.drive_select) {
+  } else if (pin == pins->drive_select) {
     g_drive->selected = output;
-  } else if (pin == f->pins.motor_enable) {
+  } else if (pin == pins->motor_enable) {
     g_drive->motor_on = output;
-  } else if (pin == f->pins.density) {
+  } else if (pin == pins->density) {
     g_drive->density_hd = output;
-  } else if (pin == f->pins.write_gate) {
+  } else if (pin == pins->write_gate) {
     if (output && !g_drive->write_gate_active) {
       g_drive->write_gate_active = true;
       g_drive->write_gate_assertions++;
@@ -395,20 +393,26 @@ void gpio_pull_up(uint pin) {
   (void)pin;
 }
 
+void gpio_disable_pulls(uint pin) {
+  (void)pin;
+}
+
 void gpio_put(uint pin, bool value) {
   (void)pin;
   (void)value;
 }
 
 bool gpio_get(uint pin) {
-  if (!g_drive || !pio_sim_floppy_ref) return true;
-  floppy_t *f = pio_sim_floppy_ref;
-  if (pin == f->pins.track0) return g_drive->head_track != 0;
-  if (pin == f->pins.disk_change) {
+  if (!g_drive) return true;
+  const floppy_pins_t *pins = &g_drive->pins;
+  if (pin == pins->track0) {
+    return g_drive->track0_missing || g_drive->head_track != 0;
+  }
+  if (pin == pins->disk_change) {
     return !g_drive->selected || !g_drive->disk_changed;
   }
-  if (pin == f->pins.write_protect) return !g_drive->write_protected;
-  if (pin != f->pins.index) return true;
+  if (pin == pins->write_protect) return !g_drive->write_protected;
+  if (pin != pins->index) return true;
   if (!g_drive->write_gate_active) pico_test_time_us += 1000u;
   bool value;
   if (g_drive->index_stuck) {
@@ -635,7 +639,7 @@ static void sim_tx_fill(void) {
   if (!sim_dma.write_active || !g_drive || g_drive->tx_stall) return;
   while (sim_dma.tx_count < sizeof(sim_dma.tx_fifo) &&
          sim_dma.tx_position < sim_dma.tx_length) {
-    if (!pio_sim_floppy_ref) {
+    if (!g_drive->ring) {
       g_drive->dma_source_overread = true;
       break;
     }
@@ -717,6 +721,8 @@ void dma_channel_configure(uint channel, const dma_channel_config *config,
   sim_dma.hw.transfer_count = transfer_count;
   if (!g_drive) return;
   g_drive->dma_tx_configurations++;
+  if (g_drive->disk_change_on_tx_configure) g_drive->disk_changed = true;
+  if (g_drive->write_protect_on_tx_configure) g_drive->write_protected = true;
   if (g_drive->dma_tx_min_count == 0 ||
       transfer_count < g_drive->dma_tx_min_count) {
     g_drive->dma_tx_min_count = transfer_count;
@@ -724,8 +730,8 @@ void dma_channel_configure(uint channel, const dma_channel_config *config,
   if (transfer_count > g_drive->dma_tx_max_count) {
     g_drive->dma_tx_max_count = transfer_count;
   }
-  if (pio_sim_floppy_ref) {
-    uintptr_t base = (uintptr_t)pio_sim_floppy_ref->flux_ring;
+  if (g_drive->ring) {
+    uintptr_t base = (uintptr_t)g_drive->ring;
     uintptr_t source = (uintptr_t)read_addr;
     bool in_ring = source >= base && source < base + FLOPPY_FLUX_RING_BYTES;
     uintptr_t offset = in_ring ? source - base : FLOPPY_FLUX_RING_BYTES;
@@ -752,14 +758,14 @@ dma_channel_hw_t *dma_channel_hw_addr(uint channel) {
   (void)channel;
   if (sim_dma.read_active && g_drive && g_drive->read_buf &&
       g_drive->read_count > 0 && sim_dma.hw.transfer_count > 0 &&
-      pio_sim_floppy_ref) {
+      g_drive->consumer) {
     if (g_drive->rx_pio_stall) {
       pio0->fdebug |= 1u << PIO_FDEBUG_RXSTALL_LSB;
       if (!g_drive->rx_pio_stall_repeat) g_drive->rx_pio_stall = false;
     }
     uint32_t words = g_drive->rx_burst_words;
     if (words == 0 &&
-        sim_dma.read_ring_pos - pio_sim_floppy_ref->ring_cpu < 4u) {
+        sim_dma.read_ring_pos - *g_drive->consumer < 4u) {
       words = 1;
     }
     if (words > sim_dma.hw.transfer_count) words = sim_dma.hw.transfer_count;
@@ -805,56 +811,3 @@ int flux_write_program_init(PIO pio, uint sm, uint offset, uint pin) {
   return g_drive && g_drive->fail_write_program_init ? -1 : 0;
 }
 
-int spin_lock_claim_unused(bool required) {
-  (void)required;
-  if (g_drive && g_drive->fail_spinlock_claim) return -1;
-  if (g_drive) g_drive->spin_locks_claimed++;
-  return 0;
-}
-
-void spin_lock_unclaim(uint lock_num) {
-  (void)lock_num;
-  if (g_drive && g_drive->spin_locks_claimed > 0) g_drive->spin_locks_claimed--;
-}
-
-spin_lock_t *spin_lock_instance(uint lock_num) {
-  (void)lock_num;
-  return &sim_spin_lock;
-}
-
-uint32_t spin_lock_blocking(spin_lock_t *lock) {
-  (void)lock;
-  return 0;
-}
-
-void spin_unlock(spin_lock_t *lock, uint32_t status) {
-  (void)lock;
-  (void)status;
-}
-
-bool cancel_repeating_timer(struct repeating_timer *timer) {
-  if (!g_drive || g_drive->timers_active == 0) return false;
-  g_drive->timers_active--;
-  if (sim_timer == timer) {
-    sim_timer = NULL;
-    sim_timer_callback = NULL;
-  }
-  return true;
-}
-
-bool add_repeating_timer_ms(int32_t delay_ms, repeating_timer_callback_t callback,
-                            void *user_data, struct repeating_timer *timer) {
-  (void)delay_ms;
-  (void)callback;
-  if (g_drive && g_drive->fail_timer_create) return false;
-  timer->user_data = user_data;
-  sim_timer = timer;
-  sim_timer_callback = callback;
-  if (g_drive) g_drive->timers_active++;
-  return true;
-}
-
-bool pio_sim_fire_timer(pio_sim_drive_t *drive) {
-  if (!drive || drive != g_drive || !sim_timer || !sim_timer_callback) return false;
-  return sim_timer_callback(sim_timer);
-}

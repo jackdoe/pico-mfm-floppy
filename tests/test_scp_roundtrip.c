@@ -1,8 +1,9 @@
 #include "test.h"
 #include "flux_sim.h"
 #include "scp_disk.h"
+#include "scp_fixture.h"
 #include "../src/f12.h"
-#include "../src/mfm_decode.h"
+#include "../src/mfm.h"
 #include <errno.h>
 #include <limits.h>
 
@@ -37,34 +38,6 @@ static uint8_t original[DISK_SECTOR_COUNT][DISK_SECTOR_SIZE];
 static uint8_t modified[DISK_SECTOR_COUNT][DISK_SECTOR_SIZE];
 static uint8_t decoded[DISK_SECTOR_COUNT][DISK_SECTOR_SIZE];
 static bool coverage[DISK_SECTOR_COUNT];
-
-static uint8_t *load_fixture(const char *path, size_t *size) {
-  *size = 0;
-  FILE *file = fopen(path, "rb");
-  if (!file) return NULL;
-  if (fseek(file, 0, SEEK_END) != 0) {
-    fclose(file);
-    return NULL;
-  }
-  long length = ftell(file);
-  if (length <= 0 || fseek(file, 0, SEEK_SET) != 0) {
-    fclose(file);
-    return NULL;
-  }
-  uint8_t *data = malloc((size_t)length);
-  if (!data) {
-    fclose(file);
-    return NULL;
-  }
-  size_t read = fread(data, 1, (size_t)length, file);
-  bool closed = fclose(file) == 0;
-  if (read != (size_t)length || !closed) {
-    free(data);
-    return NULL;
-  }
-  *size = (size_t)length;
-  return data;
-}
 
 static bool parse_u32(const char *text, uint32_t *value) {
   if (!text || !*text || !value || text[0] == '-') return false;
@@ -167,14 +140,14 @@ static bool decode_scp(uint8_t *data, size_t size,
   return true;
 }
 
-static block_status_t image_read_track(void *ctx, uint32_t expected_generation,
+static disk_err_t image_read_track(void *ctx, uint32_t expected_generation,
                                        uint8_t cylinder, uint8_t head,
                                        track_t *track) {
   image_disk_t *disk = (image_disk_t *)ctx;
   if (!disk || !track || !disk_ch_valid(cylinder, head)) {
-    return BLOCK_ERR_INVALID;
+    return DISK_ERR_INVALID;
   }
-  if (expected_generation != disk->generation) return BLOCK_ERR_MEDIA_CHANGED;
+  if (expected_generation != disk->generation) return DISK_ERR_MEDIA_CHANGED;
   memset(track, 0, sizeof(*track));
   track->cylinder = cylinder;
   track->head = head;
@@ -182,50 +155,50 @@ static block_status_t image_read_track(void *ctx, uint32_t expected_generation,
   for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
     uint16_t lba;
     if (!disk_chs_to_lba(cylinder, head, sector, &lba)) {
-      return BLOCK_ERR_INVALID;
+      return DISK_ERR_INVALID;
     }
     memcpy(track->data[sector], disk->sectors[lba], DISK_SECTOR_SIZE);
   }
-  return BLOCK_OK;
+  return DISK_OK;
 }
 
-static block_status_t image_write_track(void *ctx,
+static disk_err_t image_write_track(void *ctx,
                                         uint32_t expected_generation,
                                         const track_t *track) {
   image_disk_t *disk = (image_disk_t *)ctx;
   if (!disk || !track ||
       !disk_ch_valid(track->cylinder, track->head) ||
       track->valid != DISK_TRACK_VALID) {
-    return BLOCK_ERR_INVALID;
+    return DISK_ERR_INVALID;
   }
-  if (expected_generation != disk->generation) return BLOCK_ERR_MEDIA_CHANGED;
-  if (disk->write_protected) return BLOCK_ERR_WRITE_PROTECTED;
+  if (expected_generation != disk->generation) return DISK_ERR_MEDIA_CHANGED;
+  if (disk->write_protected) return DISK_ERR_WRITE_PROTECTED;
   for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
     uint16_t lba;
     if (!disk_chs_to_lba(track->cylinder, track->head, sector, &lba)) {
-      return BLOCK_ERR_INVALID;
+      return DISK_ERR_INVALID;
     }
     memcpy(disk->sectors[lba], track->data[sector], DISK_SECTOR_SIZE);
   }
-  return BLOCK_OK;
+  return DISK_OK;
 }
 
-static block_status_t image_generation(void *ctx, uint32_t *generation) {
+static disk_err_t image_generation(void *ctx, uint32_t *generation) {
   image_disk_t *disk = ctx;
-  if (!disk || !generation) return BLOCK_ERR_INVALID;
+  if (!disk || !generation) return DISK_ERR_INVALID;
   *generation = disk->generation;
-  return BLOCK_OK;
+  return DISK_OK;
 }
 
-static block_status_t image_write_protected(void *ctx, bool *write_protected) {
+static disk_err_t image_write_protected(void *ctx, bool *write_protected) {
   image_disk_t *disk = ctx;
-  if (!disk || !write_protected) return BLOCK_ERR_INVALID;
+  if (!disk || !write_protected) return DISK_ERR_INVALID;
   *write_protected = disk->write_protected;
-  return BLOCK_OK;
+  return DISK_OK;
 }
 
-static block_device_t image_device(image_disk_t *disk) {
-  return (block_device_t){
+static disk_device_t image_device(image_disk_t *disk) {
+  return (disk_device_t){
       .read_track = image_read_track,
       .write_track = image_write_track,
       .media_generation = image_generation,
@@ -234,36 +207,36 @@ static block_device_t image_device(image_disk_t *disk) {
   };
 }
 
-static f12_result_t write_all(f12_file_t *file, const uint8_t *data,
+static disk_result_t write_all(f12_file_t *file, const uint8_t *data,
                               size_t size) {
-  f12_result_t total = {.error = F12_OK, .count = 0};
+  disk_result_t total = {.error = DISK_OK, .count = 0};
   while (total.count < size) {
-    f12_result_t part = f12_write(file, data + total.count,
+    disk_result_t part = f12_write(file, data + total.count,
                                   size - total.count);
     total.count += part.count;
-    if (part.error != F12_OK) {
+    if (part.error != DISK_OK) {
       total.error = part.error;
       return total;
     }
     if (part.count == 0) {
-      total.error = F12_ERR_IO;
+      total.error = DISK_ERR_IO;
       return total;
     }
   }
   return total;
 }
 
-static f12_result_t read_all(f12_file_t *file, uint8_t *data, size_t size) {
-  f12_result_t total = {.error = F12_OK, .count = 0};
+static disk_result_t read_all(f12_file_t *file, uint8_t *data, size_t size) {
+  disk_result_t total = {.error = DISK_OK, .count = 0};
   while (total.count < size) {
-    f12_result_t part = f12_read(file, data + total.count, size - total.count);
+    disk_result_t part = f12_read(file, data + total.count, size - total.count);
     total.count += part.count;
-    if (part.error != F12_OK) {
+    if (part.error != DISK_OK) {
       total.error = part.error;
       return total;
     }
     if (part.count == 0) {
-      total.error = F12_ERR_IO;
+      total.error = DISK_ERR_IO;
       return total;
     }
   }
@@ -272,13 +245,13 @@ static f12_result_t read_all(f12_file_t *file, uint8_t *data, size_t size) {
 
 static bool first_regular_file(f12_t *fs, char name[13]) {
   f12_dir_t dir;
-  if (f12_opendir(fs, "/", &dir) != F12_OK) return false;
+  if (f12_opendir(fs, "/", &dir) != DISK_OK) return false;
   bool found = false;
   for (;;) {
     f12_stat_t stat;
-    f12_err_t error = f12_readdir(&dir, &stat);
-    if (error == F12_END) break;
-    if (error != F12_OK) {
+    disk_err_t error = f12_readdir(&dir, &stat);
+    if (error == DISK_END) break;
+    if (error != DISK_OK) {
       f12_closedir(&dir);
       return false;
     }
@@ -288,7 +261,7 @@ static bool first_regular_file(f12_t *fs, char name[13]) {
       break;
     }
   }
-  if (f12_closedir(&dir) != F12_OK) return false;
+  if (f12_closedir(&dir) != DISK_OK) return false;
   return found;
 }
 
@@ -327,8 +300,8 @@ TEST(test_f12_mutation_survives_flux_roundtrip) {
       .generation = 1,
   };
   f12_t fs;
-  ASSERT_EQ(f12_init(&fs, image_device(&disk)), F12_OK);
-  ASSERT_EQ(f12_mount(&fs), F12_OK);
+  ASSERT_EQ(f12_init(&fs, image_device(&disk)), DISK_OK);
+  ASSERT_EQ(f12_mount(&fs), DISK_OK);
   char old_name[13] = {0};
   ASSERT(first_regular_file(&fs, old_name));
   char new_name[13] = {0};
@@ -336,18 +309,18 @@ TEST(test_f12_mutation_survives_flux_roundtrip) {
   for (unsigned candidate = 0; candidate < 100; candidate++) {
     snprintf(new_name, sizeof(new_name), "RT%02u.BIN", candidate);
     f12_stat_t stat;
-    f12_err_t error = f12_stat(&fs, new_name, &stat);
-    if (error == F12_ERR_NOT_FOUND) {
+    disk_err_t error = f12_stat(&fs, new_name, &stat);
+    if (error == DISK_ERR_NOT_FOUND) {
       available = true;
       break;
     }
-    ASSERT_EQ(error, F12_OK);
+    ASSERT_EQ(error, DISK_OK);
   }
   ASSERT(available);
-  ASSERT_EQ(f12_rename(&fs, old_name, new_name), F12_OK);
+  ASSERT_EQ(f12_rename(&fs, old_name, new_name), DISK_OK);
   f12_stat_t expected;
-  ASSERT_EQ(f12_stat(&fs, new_name, &expected), F12_OK);
-  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+  ASSERT_EQ(f12_stat(&fs, new_name, &expected), DISK_OK);
+  ASSERT_EQ(f12_unmount(&fs), DISK_OK);
 
   size_t encoded_size;
   uint8_t *encoded = scp_encode_disk(modified, &encoded_size);
@@ -360,14 +333,14 @@ TEST(test_f12_mutation_survives_flux_roundtrip) {
       .sectors = decoded,
       .generation = 1,
   };
-  ASSERT_EQ(f12_init(&fs, image_device(&roundtrip)), F12_OK);
-  ASSERT_EQ(f12_mount(&fs), F12_OK);
+  ASSERT_EQ(f12_init(&fs, image_device(&roundtrip)), DISK_OK);
+  ASSERT_EQ(f12_mount(&fs), DISK_OK);
   f12_stat_t actual;
-  ASSERT_EQ(f12_stat(&fs, old_name, &actual), F12_ERR_NOT_FOUND);
-  ASSERT_EQ(f12_stat(&fs, new_name, &actual), F12_OK);
+  ASSERT_EQ(f12_stat(&fs, old_name, &actual), DISK_ERR_NOT_FOUND);
+  ASSERT_EQ(f12_stat(&fs, new_name, &actual), DISK_OK);
   ASSERT_EQ(actual.size, expected.size);
   ASSERT_EQ(actual.attr, expected.attr);
-  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+  ASSERT_EQ(f12_unmount(&fs), DISK_OK);
 }
 
 TEST(test_deterministic_fuzz_roundtrips) {
@@ -381,13 +354,13 @@ TEST(test_deterministic_fuzz_roundtrips) {
         .generation = 1,
     };
     f12_t fs;
-    ASSERT_EQ(f12_init(&fs, image_device(&disk)), F12_OK);
+    ASSERT_EQ(f12_init(&fs, image_device(&disk)), DISK_OK);
     f12_format_options_t format = {
         .label = "ROUNDTRIP",
         .mode = F12_FORMAT_QUICK,
     };
-    ASSERT_EQ(f12_format(&fs, format), F12_OK);
-    ASSERT_EQ(f12_mount(&fs), F12_OK);
+    ASSERT_EQ(f12_format(&fs, format), DISK_OK);
+    ASSERT_EQ(f12_mount(&fs), DISK_OK);
 
     manifest_t manifest[8];
     size_t manifest_count = 2u + random_next() % 7u;
@@ -401,13 +374,13 @@ TEST(test_deterministic_fuzz_roundtrips) {
         buffer[offset] = pattern_byte(entry->pattern, offset);
       }
       f12_file_t file;
-      ASSERT_EQ(f12_open(&fs, entry->name, F12_OPEN_WRITE, &file), F12_OK);
-      f12_result_t result = write_all(&file, buffer, entry->size);
-      ASSERT_EQ(result.error, F12_OK);
+      ASSERT_EQ(f12_open(&fs, entry->name, F12_OPEN_WRITE, &file), DISK_OK);
+      disk_result_t result = write_all(&file, buffer, entry->size);
+      ASSERT_EQ(result.error, DISK_OK);
       ASSERT_EQ(result.count, entry->size);
-      ASSERT_EQ(f12_close(&file), F12_OK);
+      ASSERT_EQ(f12_close(&file), DISK_OK);
     }
-    ASSERT_EQ(f12_unmount(&fs), F12_OK);
+    ASSERT_EQ(f12_unmount(&fs), DISK_OK);
 
     size_t encoded_size;
     uint8_t *encoded = scp_encode_disk(modified, &encoded_size);
@@ -420,24 +393,24 @@ TEST(test_deterministic_fuzz_roundtrips) {
         .sectors = decoded,
         .generation = 1,
     };
-    ASSERT_EQ(f12_init(&fs, image_device(&roundtrip)), F12_OK);
-    ASSERT_EQ(f12_mount(&fs), F12_OK);
+    ASSERT_EQ(f12_init(&fs, image_device(&roundtrip)), DISK_OK);
+    ASSERT_EQ(f12_mount(&fs), DISK_OK);
     for (size_t index = 0; index < manifest_count; index++) {
       manifest_t *entry = &manifest[index];
       f12_stat_t stat;
-      ASSERT_EQ(f12_stat(&fs, entry->name, &stat), F12_OK);
+      ASSERT_EQ(f12_stat(&fs, entry->name, &stat), DISK_OK);
       ASSERT_EQ(stat.size, entry->size);
       f12_file_t file;
-      ASSERT_EQ(f12_open(&fs, entry->name, F12_OPEN_READ, &file), F12_OK);
-      f12_result_t result = read_all(&file, verify, entry->size);
-      ASSERT_EQ(result.error, F12_OK);
+      ASSERT_EQ(f12_open(&fs, entry->name, F12_OPEN_READ, &file), DISK_OK);
+      disk_result_t result = read_all(&file, verify, entry->size);
+      ASSERT_EQ(result.error, DISK_OK);
       ASSERT_EQ(result.count, entry->size);
-      ASSERT_EQ(f12_close(&file), F12_OK);
+      ASSERT_EQ(f12_close(&file), DISK_OK);
       for (uint32_t offset = 0; offset < entry->size; offset++) {
         ASSERT_EQ(verify[offset], pattern_byte(entry->pattern, offset));
       }
     }
-    ASSERT_EQ(f12_unmount(&fs), F12_OK);
+    ASSERT_EQ(f12_unmount(&fs), DISK_OK);
     completed++;
     printf("  iteration %u/%u complete\n", completed, options.iterations);
   }
@@ -452,7 +425,7 @@ int main(int argc, char **argv) {
             argv[0]);
     return 2;
   }
-  fixture_data = load_fixture(options.fixture, &fixture_size);
+  fixture_data = scp_fixture_load(options.fixture, &fixture_size);
   if (!fixture_data) {
     fprintf(stderr, "Cannot read required SCP fixture %s: %s\n",
             options.fixture, strerror(errno));

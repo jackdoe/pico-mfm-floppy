@@ -14,6 +14,7 @@ void gpio_init(uint pin);
 void gpio_deinit(uint pin);
 void gpio_set_dir(uint pin, bool out);
 void gpio_pull_up(uint pin);
+void gpio_disable_pulls(uint pin);
 void gpio_put(uint pin, bool value);
 bool gpio_get(uint pin);
 

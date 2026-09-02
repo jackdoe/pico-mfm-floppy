@@ -1,7 +1,6 @@
 #include "test.h"
 #include "../src/crc.h"
-#include "../src/mfm_decode.h"
-#include "../src/mfm_encode.h"
+#include "../src/mfm.h"
 #include <string.h>
 
 static uint16_t pulse_delta(uint8_t pulse) {
@@ -11,7 +10,7 @@ static uint16_t pulse_delta(uint8_t pulse) {
 static void encode_address(mfm_encode_t *encoder, uint8_t cylinder, uint8_t head,
                            uint8_t sector, uint8_t size_code, bool bad_crc) {
   uint8_t address[] = {MFM_ADDR_MARK, cylinder, head, sector, size_code};
-  uint16_t crc = crc16_mfm(address, sizeof(address));
+  uint16_t crc = crc16(address, sizeof(address), MFM_CRC_INIT);
   if (bad_crc) crc ^= 1u;
   uint8_t crc_bytes[] = {(uint8_t)(crc >> 8), (uint8_t)(crc & 0xFF)};
   mfm_encode_sync(encoder);
@@ -21,7 +20,7 @@ static void encode_address(mfm_encode_t *encoder, uint8_t cylinder, uint8_t head
 
 static void encode_data(mfm_encode_t *encoder, uint8_t mark, const uint8_t *data,
                         size_t size, bool bad_crc) {
-  uint16_t crc = crc16(data, size, crc16_mfm(&mark, 1));
+  uint16_t crc = crc16(data, size, crc16_update(MFM_CRC_INIT, mark));
   if (bad_crc) crc ^= 1u;
   uint8_t crc_bytes[] = {(uint8_t)(crc >> 8), (uint8_t)(crc & 0xFF)};
   mfm_encode_sync(encoder);
@@ -69,13 +68,12 @@ TEST(test_encoder_sync) {
 }
 
 TEST(test_crc) {
-  uint8_t address[] = {MFM_ADDR_MARK, 0, 0, 1, MFM_SIZE_CODE};
-  uint16_t manual = 0xFFFF;
-  manual = crc16_update(manual, 0xA1);
-  manual = crc16_update(manual, 0xA1);
-  manual = crc16_update(manual, 0xA1);
-  for (size_t i = 0; i < sizeof(address); i++) manual = crc16_update(manual, address[i]);
-  ASSERT_EQ(crc16_mfm(address, sizeof(address)), manual);
+  static const uint8_t marks[] = {0xA1, 0xA1, 0xA1};
+  ASSERT_EQ(crc16(marks, sizeof(marks), 0xFFFF), MFM_CRC_INIT);
+  ASSERT_EQ(MFM_PULSE_FLOOR, 38);
+  ASSERT_EQ(MFM_PULSE_CEILING, 120);
+  ASSERT_EQ(MFM_PULSE_SHORT + MFM_PIO_OVERHEAD, MFM_CELL_TICKS);
+  ASSERT_EQ(MFM_READ_PIO_HZ, 72000000u);
 }
 
 TEST(test_roundtrip_sector) {

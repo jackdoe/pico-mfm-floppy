@@ -1,5 +1,5 @@
 #include "test.h"
-#include "../src/block.h"
+#include "../src/disk.h"
 
 TEST(test_geometry_is_bijective) {
   bool seen[DISK_SECTOR_COUNT] = {false};

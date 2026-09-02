@@ -4,11 +4,11 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 fixture="${SCP_FIXTURE:-$(pwd)/../system-shock-multilingual-floppy-ibm-pc/disk1.scp}"
-if [[ ! -s "$fixture" ]]; then
-    printf 'Required SCP fixture missing or empty: %s\n' "$fixture" >&2
-    exit 1
+if [[ -s "$fixture" ]]; then
+    export SCP_FIXTURE="$fixture"
+else
+    printf 'SCP fixture missing; real-media tests are skipped: %s\n' "$fixture" >&2
 fi
-export SCP_FIXTURE="$fixture"
 
 BUILD_DIR=build_cov
 GCOVR="${GCOVR:-gcovr}"
@@ -36,7 +36,8 @@ mkdir -p "$BUILD_DIR/coverage"
     --html-details "$BUILD_DIR/coverage/report.html" \
     --json-summary "$BUILD_DIR/coverage/summary.json" >/dev/null
 
-"$GCOVR" --root . --filter '../src/' --print-summary 2>&1 | tail -30
+"$GCOVR" --root . --filter '../src/' --print-summary \
+    --fail-under-line 98 --fail-under-branch 80 2>&1 | tail -30
 echo
 echo "HTML report: $(pwd)/$BUILD_DIR/coverage/report.html"
 echo "Text report: $(pwd)/$BUILD_DIR/coverage/summary.txt"

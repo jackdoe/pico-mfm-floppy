@@ -4,9 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include "block.h"
+#include "disk.h"
 #include "hardware/pio.h"
-#include "pico/time.h"
 
 #define FLOPPY_FLUX_RING_BITS 12u
 #define FLOPPY_FLUX_RING_BYTES (1u << FLOPPY_FLUX_RING_BITS)
@@ -50,6 +49,11 @@ typedef struct {
 } floppy_pio_t;
 
 typedef struct {
+  uint16_t delta;
+  bool index;
+} floppy_pulse_t;
+
+typedef struct {
   uint32_t reads;
   uint32_t retries;
   uint32_t recovered;
@@ -77,9 +81,10 @@ typedef struct floppy {
   uint8_t cylinder;
   bool track0_confirmed;
   bool disk_change_active;
+  bool media_observed;
   bool read_overrun;
-  volatile bool motor_on;
-  volatile bool selected;
+  bool motor_on;
+  bool selected;
   bool motor_qualified;
   bool head_confirmed;
   uint8_t head;
@@ -88,50 +93,44 @@ typedef struct floppy {
   bool read_sm_claimed;
   bool write_sm_claimed;
   bool dma_claimed;
-  bool timer_active;
   bool gpio_configured;
   bool flux_active;
-  bool lock_claimed;
-  uint8_t lock_num;
-  volatile uint32_t last_io_time_ms;
+  uint32_t last_io_time_ms;
   uint32_t media_generation;
   uint32_t motor_generation;
   uint32_t flux_generation;
-  volatile floppy_operation_t operation;
+  floppy_operation_t operation;
   uint32_t operation_start_ms;
   uint32_t operation_limit_ms;
   uint32_t lifecycle;
-  struct repeating_timer idle_timer;
   floppy_stats_t stats;
 } floppy_t;
 
-block_status_t floppy_init(floppy_t *f, floppy_pins_t pins);
-block_status_t floppy_deinit(floppy_t *f);
-block_status_t floppy_select(floppy_t *f, bool on);
-block_status_t floppy_side_select(floppy_t *f, uint8_t head);
-block_status_t floppy_motor_on(floppy_t *f);
-block_status_t floppy_motor_off(floppy_t *f);
-block_status_t floppy_seek(floppy_t *f, uint8_t cylinder);
-block_status_t floppy_current_track(const floppy_t *f, uint8_t *cylinder);
-block_status_t floppy_at_track0(const floppy_t *f, bool *active);
-block_status_t floppy_disk_changed(floppy_t *f, bool *changed);
-block_status_t floppy_media_generation(floppy_t *f, uint32_t *generation);
-block_status_t floppy_write_protected(const floppy_t *f, bool *write_protected);
-block_status_t floppy_stats_reset(floppy_t *f);
-block_status_t floppy_stats(const floppy_t *f, floppy_stats_t *stats);
+disk_err_t floppy_init(floppy_t *f, floppy_pins_t pins);
+disk_err_t floppy_deinit(floppy_t *f);
+disk_err_t floppy_poll(floppy_t *f);
+disk_err_t floppy_select(floppy_t *f, bool on);
+disk_err_t floppy_side_select(floppy_t *f, uint8_t head);
+disk_err_t floppy_motor_on(floppy_t *f);
+disk_err_t floppy_motor_off(floppy_t *f);
+disk_err_t floppy_seek(floppy_t *f, uint8_t cylinder);
+disk_err_t floppy_current_track(const floppy_t *f, uint8_t *cylinder);
+disk_err_t floppy_at_track0(const floppy_t *f, bool *active);
+disk_err_t floppy_disk_changed(floppy_t *f, bool *changed);
+disk_err_t floppy_media_generation(floppy_t *f, uint32_t *generation);
+disk_err_t floppy_write_protected(const floppy_t *f, bool *write_protected);
+disk_err_t floppy_stats_reset(floppy_t *f);
+disk_err_t floppy_stats(const floppy_t *f, floppy_stats_t *stats);
 
-block_status_t floppy_flux_begin(floppy_t *f, uint32_t expected_generation);
-block_status_t floppy_flux_next(floppy_t *f, uint16_t *delta, bool *index);
-block_status_t floppy_flux_end(floppy_t *f);
+disk_err_t floppy_flux_begin(floppy_t *f, uint32_t expected_generation);
+disk_result_t floppy_flux_read(floppy_t *f, floppy_pulse_t *pulses, size_t capacity);
+disk_err_t floppy_flux_end(floppy_t *f);
 
-block_status_t floppy_read_sector(floppy_t *f, uint32_t expected_generation,
-                                  uint8_t cylinder, uint8_t head, uint8_t sector,
-                                  uint8_t out[DISK_SECTOR_SIZE]);
-block_status_t floppy_read_track(floppy_t *f, uint32_t expected_generation,
-                                 track_t *track);
-block_status_t floppy_write_track(floppy_t *f, uint32_t expected_generation,
-                                  const track_t *track);
+disk_err_t floppy_read_track(floppy_t *f, uint32_t expected_generation,
+                             track_t *track);
+disk_err_t floppy_write_track(floppy_t *f, uint32_t expected_generation,
+                              const track_t *track);
 
-block_device_t floppy_device(floppy_t *f);
+disk_device_t floppy_device(floppy_t *f);
 
 #endif

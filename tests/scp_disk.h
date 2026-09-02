@@ -2,7 +2,7 @@
 #define SCP_DISK_H
 
 #include "flux_sim.h"
-#include "../src/mfm_decode.h"
+#include "../src/mfm.h"
 #include <string.h>
 
 typedef struct {
@@ -10,13 +10,13 @@ typedef struct {
     bool initialized;
 } scp_disk_t;
 
-static block_status_t scp_disk_read_track(void *ctx, uint32_t expected_generation,
+static disk_err_t scp_disk_read_track(void *ctx, uint32_t expected_generation,
                                           uint8_t cylinder, uint8_t head,
                                           track_t *track) {
     scp_disk_t *disk = ctx;
     if (!disk || !disk->initialized || !track ||
-        !disk_ch_valid(cylinder, head)) return BLOCK_ERR_INVALID;
-    if (expected_generation != 1u) return BLOCK_ERR_MEDIA_CHANGED;
+        !disk_ch_valid(cylinder, head)) return DISK_ERR_INVALID;
+    if (expected_generation != 1u) return DISK_ERR_MEDIA_CHANGED;
 
     memset(track, 0, sizeof(*track));
     track->cylinder = cylinder;
@@ -45,26 +45,26 @@ static block_status_t scp_disk_read_track(void *ctx, uint32_t expected_generatio
         }
     }
 
-    if (!sought) return BLOCK_ERR_CORRUPT;
-    return track->valid == DISK_TRACK_VALID ? BLOCK_OK : BLOCK_ERR_CRC;
+    if (!sought) return DISK_ERR_CORRUPT;
+    return track->valid == DISK_TRACK_VALID ? DISK_OK : DISK_ERR_CRC;
 }
 
-static block_status_t scp_disk_media_generation(void *ctx,
+static disk_err_t scp_disk_media_generation(void *ctx,
                                                 uint32_t *generation) {
     scp_disk_t *disk = ctx;
-    if (!disk || !disk->initialized || !generation) return BLOCK_ERR_INVALID;
+    if (!disk || !disk->initialized || !generation) return DISK_ERR_INVALID;
     *generation = 1;
-    return BLOCK_OK;
+    return DISK_OK;
 }
 
-static block_status_t scp_disk_write_protected(void *ctx,
+static disk_err_t scp_disk_write_protected(void *ctx,
                                                bool *write_protected) {
     scp_disk_t *disk = ctx;
     if (!disk || !disk->initialized || !write_protected) {
-        return BLOCK_ERR_INVALID;
+        return DISK_ERR_INVALID;
     }
     *write_protected = true;
-    return BLOCK_OK;
+    return DISK_OK;
 }
 
 static bool scp_disk_init(scp_disk_t *disk, uint8_t *data, size_t size) {
@@ -81,8 +81,8 @@ static void scp_disk_deinit(scp_disk_t *disk) {
     disk->initialized = false;
 }
 
-static inline block_device_t scp_disk_device(scp_disk_t *disk) {
-    return (block_device_t){
+static inline disk_device_t scp_disk_device(scp_disk_t *disk) {
+    return (disk_device_t){
         .read_track = scp_disk_read_track,
         .write_track = NULL,
         .media_generation = scp_disk_media_generation,

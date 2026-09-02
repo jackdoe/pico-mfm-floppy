@@ -1,6 +1,7 @@
 #ifndef VDISK_H
 #define VDISK_H
 
+#include "../src/cache.h"
 #include "../src/fat12.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -8,61 +9,159 @@
 
 typedef struct {
   uint8_t data[DISK_SECTOR_COUNT][DISK_SECTOR_SIZE];
-  int read_count;
-  int write_count;
-  int track_writes;
-  int cyl_writes[DISK_CYLINDERS];
+  uint32_t generation;
   bool write_protected;
-  bool disk_changed;
+  disk_err_t read_status;
+  uint32_t error_valid;
+  bool corrupt_track;
+  disk_err_t write_status;
+  bool apply_failed_write;
+  disk_err_t generation_status;
+  disk_err_t write_protected_status;
+  uint32_t generation_calls;
+  uint32_t change_generation_on_call;
+  int reads_before_failure;
+  int writes_before_failure;
+  disk_err_t read_failure;
+  disk_err_t write_failure;
+  int fail_track;
+  bool fail_reads_after_write;
+  bool tear_next_write;
+  int writes_before_tear;
+  int track_reads;
+  int track_writes;
+  int write_order[DISK_TRACK_COUNT];
+  track_t last_write;
+  uint32_t last_expected_generation;
 } vdisk_t;
-
-static inline int vdisk_lba(uint8_t cylinder, uint8_t head, uint8_t sector) {
-  uint16_t lba;
-  if (!disk_chs_to_lba(cylinder, head, sector, &lba)) return -1;
-  return (int)lba;
-}
 
 static inline void vdisk_init(vdisk_t *disk) {
   memset(disk, 0, sizeof(*disk));
+  disk->generation = 1;
+  disk->reads_before_failure = -1;
+  disk->writes_before_failure = -1;
+  disk->read_failure = DISK_ERR_TIMEOUT;
+  disk->write_failure = DISK_ERR_VERIFY;
+  disk->fail_track = -1;
 }
 
-static block_status_t vdisk_read(
-    void *ctx, uint16_t lba, uint8_t out[DISK_SECTOR_SIZE]) {
-  vdisk_t *disk = ctx;
-  if (disk == NULL || out == NULL || lba >= DISK_SECTOR_COUNT) {
-    return BLOCK_ERR_INVALID;
-  }
-  if (disk->disk_changed) return BLOCK_ERR_MEDIA_CHANGED;
-  memcpy(out, disk->data[lba], DISK_SECTOR_SIZE);
-  disk->read_count++;
-  return BLOCK_OK;
+static inline uint16_t vdisk_first_lba(uint8_t cylinder, uint8_t head) {
+  return (uint16_t)(((uint16_t)cylinder * DISK_HEADS + head) * DISK_SECTORS_PER_TRACK);
 }
 
-static block_status_t vdisk_write(void *ctx, const track_t *track) {
-  vdisk_t *disk = ctx;
-  if (disk == NULL || track == NULL ||
-      !disk_ch_valid(track->cylinder, track->head) ||
-      (track->valid & ~DISK_TRACK_VALID) != 0) {
-    return BLOCK_ERR_INVALID;
-  }
-  if (disk->disk_changed) return BLOCK_ERR_MEDIA_CHANGED;
-  if (disk->write_protected) return BLOCK_ERR_WRITE_PROTECTED;
+static inline void vdisk_copy_track_out(const vdisk_t *disk, uint8_t cylinder,
+                                        uint8_t head, track_t *out) {
+  uint16_t first = vdisk_first_lba(cylinder, head);
   for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
-    if (!track_has(track, sector)) continue;
-    uint16_t lba;
-    if (!disk_chs_to_lba(track->cylinder, track->head, sector, &lba)) {
-      return BLOCK_ERR_INVALID;
+    memcpy(out->data[sector], disk->data[first + sector], DISK_SECTOR_SIZE);
+  }
+}
+
+static inline void vdisk_copy_track_in(vdisk_t *disk, const track_t *track,
+                                       uint8_t sectors) {
+  uint16_t first = vdisk_first_lba(track->cylinder, track->head);
+  for (uint8_t sector = 0; sector < sectors; sector++) {
+    memcpy(disk->data[first + sector], track->data[sector], DISK_SECTOR_SIZE);
+  }
+}
+
+static inline disk_err_t vdisk_read_track(void *ctx, uint32_t expected_generation,
+                                          uint8_t cylinder, uint8_t head,
+                                          track_t *out) {
+  vdisk_t *disk = ctx;
+  if (!disk || !out || !disk_ch_valid(cylinder, head)) return DISK_ERR_INVALID;
+  if (expected_generation != disk->generation) return DISK_ERR_MEDIA_CHANGED;
+  int track = cylinder * (int)DISK_HEADS + head;
+  if (disk->fail_reads_after_write && disk->track_writes != 0) {
+    return disk->read_failure;
+  }
+  if (disk->fail_track == track) return disk->read_failure;
+  if (disk->reads_before_failure == 0) return disk->read_failure;
+  if (disk->reads_before_failure > 0) disk->reads_before_failure--;
+  memset(out, 0, sizeof(*out));
+  out->cylinder = cylinder;
+  out->head = head;
+  vdisk_copy_track_out(disk, cylinder, head, out);
+  out->valid = disk->read_status == DISK_OK
+      ? (disk->corrupt_track ? DISK_TRACK_VALID ^ 1u : DISK_TRACK_VALID)
+      : disk->error_valid;
+  disk->track_reads++;
+  return disk->read_status;
+}
+
+static inline disk_err_t vdisk_write_track(void *ctx, uint32_t expected_generation,
+                                           const track_t *track) {
+  vdisk_t *disk = ctx;
+  if (!disk || !track || !disk_ch_valid(track->cylinder, track->head) ||
+      track->valid != DISK_TRACK_VALID) {
+    return DISK_ERR_INVALID;
+  }
+  disk->last_expected_generation = expected_generation;
+  if (expected_generation != disk->generation) return DISK_ERR_MEDIA_CHANGED;
+  if (disk->write_protected) return DISK_ERR_WRITE_PROTECTED;
+  if (disk->tear_next_write) {
+    if (disk->writes_before_tear > 0) {
+      disk->writes_before_tear--;
+    } else {
+      disk->tear_next_write = false;
+      vdisk_copy_track_in(disk, track, DISK_SECTORS_PER_TRACK / 2u);
+      return DISK_ERR_IO;
     }
-    memcpy(disk->data[lba], track->data[sector], DISK_SECTOR_SIZE);
-    disk->write_count++;
+  }
+  if (disk->writes_before_failure == 0) {
+    if (disk->apply_failed_write) vdisk_copy_track_in(disk, track, DISK_SECTORS_PER_TRACK);
+    return disk->write_failure;
+  }
+  if (disk->writes_before_failure > 0) disk->writes_before_failure--;
+  if (disk->write_status == DISK_OK || disk->apply_failed_write) {
+    vdisk_copy_track_in(disk, track, DISK_SECTORS_PER_TRACK);
+  }
+  if (disk->write_status != DISK_OK) return disk->write_status;
+  disk->last_write = *track;
+  if (disk->track_writes < (int)DISK_TRACK_COUNT) {
+    disk->write_order[disk->track_writes] =
+        track->cylinder * (int)DISK_HEADS + track->head;
   }
   disk->track_writes++;
-  disk->cyl_writes[track->cylinder]++;
-  return BLOCK_OK;
+  return DISK_OK;
+}
+
+static inline disk_err_t vdisk_media_generation(void *ctx, uint32_t *generation) {
+  vdisk_t *disk = ctx;
+  if (!disk || !generation) return DISK_ERR_INVALID;
+  disk->generation_calls++;
+  if (disk->generation_status != DISK_OK) return disk->generation_status;
+  if (disk->change_generation_on_call == disk->generation_calls) disk->generation++;
+  *generation = disk->generation;
+  return DISK_OK;
+}
+
+static inline disk_err_t vdisk_write_protected(void *ctx, bool *write_protected) {
+  vdisk_t *disk = ctx;
+  if (!disk || !write_protected) return DISK_ERR_INVALID;
+  if (disk->write_protected_status != DISK_OK) return disk->write_protected_status;
+  *write_protected = disk->write_protected;
+  return DISK_OK;
+}
+
+static inline disk_device_t vdisk_device(vdisk_t *disk) {
+  return (disk_device_t){
+      .read_track = vdisk_read_track,
+      .write_track = vdisk_write_track,
+      .media_generation = vdisk_media_generation,
+      .write_protected = vdisk_write_protected,
+      .ctx = disk,
+  };
+}
+
+static inline disk_device_t vdisk_readonly_device(vdisk_t *disk) {
+  disk_device_t device = vdisk_device(disk);
+  device.write_track = NULL;
+  return device;
 }
 
 static inline void vdisk_format_valid(vdisk_t *disk) {
-  memset(disk, 0, sizeof(*disk));
+  vdisk_init(disk);
   uint8_t *boot = disk->data[0];
   boot[0] = 0xEB;
   boot[1] = 0x3C;
@@ -70,7 +169,7 @@ static inline void vdisk_format_valid(vdisk_t *disk) {
   memcpy(boot + 3, "MSDOS5.0", 8);
   boot[11] = (uint8_t)DISK_SECTOR_SIZE;
   boot[12] = (uint8_t)(DISK_SECTOR_SIZE >> 8);
-  boot[13] = FAT12_MAX_CLUSTER_SECTORS;
+  boot[13] = FAT12_SECTORS_PER_CLUSTER;
   boot[14] = (uint8_t)FAT12_RESERVED_SECTORS;
   boot[15] = (uint8_t)(FAT12_RESERVED_SECTORS >> 8u);
   boot[16] = FAT12_NUM_FATS;
@@ -96,25 +195,10 @@ static inline void vdisk_format_valid(vdisk_t *disk) {
 static inline void vdisk_set_fat_copy_entry(vdisk_t *disk, uint16_t fat_start,
                                             uint16_t cluster,
                                             uint16_t value) {
-  uint32_t fat_offset = (uint32_t)cluster + cluster / 2u;
-  uint16_t lba = (uint16_t)(fat_start + fat_offset / DISK_SECTOR_SIZE);
-  uint16_t offset = fat_offset % DISK_SECTOR_SIZE;
-  uint8_t *first = disk->data[lba];
-  uint8_t *second = offset == DISK_SECTOR_SIZE - 1u
-      ? disk->data[lba + 1u]
-      : first;
-  uint8_t *lo = &first[offset];
-  uint8_t *hi = offset == DISK_SECTOR_SIZE - 1u
-      ? &second[0]
-      : &second[offset + 1u];
-  value &= 0x0FFFu;
-  if (cluster & 1u) {
-    *lo = (uint8_t)((*lo & 0x0Fu) | ((value & 0x0Fu) << 4));
-    *hi = (uint8_t)(value >> 4);
-  } else {
-    *lo = (uint8_t)value;
-    *hi = (uint8_t)((*hi & 0xF0u) | ((value >> 8) & 0x0Fu));
-  }
+  fat12_entry_loc_t loc = fat12_entry_locate(cluster);
+  uint8_t *lo = &disk->data[fat_start + loc.sector][loc.offset];
+  uint8_t *hi = loc.split ? &disk->data[fat_start + loc.sector + 1u][0] : lo + 1;
+  fat12_entry_pack(cluster, value, lo, hi);
 }
 
 static inline void vdisk_set_fat_entry(vdisk_t *disk, uint16_t cluster,
@@ -126,16 +210,11 @@ static inline void vdisk_set_fat_entry(vdisk_t *disk, uint16_t cluster,
 static inline uint16_t vdisk_get_fat_copy_entry(const vdisk_t *disk,
                                                 uint16_t fat_start,
                                                 uint16_t cluster) {
-  uint32_t fat_offset = (uint32_t)cluster + cluster / 2u;
-  uint16_t lba = (uint16_t)(fat_start + fat_offset / DISK_SECTOR_SIZE);
-  uint16_t offset = fat_offset % DISK_SECTOR_SIZE;
-  uint8_t lo = disk->data[lba][offset];
-  uint8_t hi = offset == DISK_SECTOR_SIZE - 1u
-      ? disk->data[lba + 1u][0]
-      : disk->data[lba][offset + 1u];
-  uint16_t value = (uint16_t)((uint16_t)lo |
-                              (uint16_t)((uint16_t)hi << 8));
-  return (cluster & 1u) != 0 ? value >> 4 : value & 0x0FFFu;
+  fat12_entry_loc_t loc = fat12_entry_locate(cluster);
+  uint8_t lo = disk->data[fat_start + loc.sector][loc.offset];
+  uint8_t hi = loc.split ? disk->data[fat_start + loc.sector + 1u][0]
+                         : disk->data[fat_start + loc.sector][loc.offset + 1u];
+  return fat12_entry_unpack(cluster, lo, hi);
 }
 
 #endif

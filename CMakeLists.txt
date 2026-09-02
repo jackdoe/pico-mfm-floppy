@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 if(NOT DEFINED PICO_BOARD)
-    set(PICO_BOARD pico)
+    set(PICO_BOARD pico2)
 endif()
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 
@@ -33,11 +33,12 @@ set(FLOPPY_C_OPTIONS
 
 set(FLOPPY_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/crc.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/disk.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/cache.c
     ${CMAKE_CURRENT_LIST_DIR}/src/floppy.c
     ${CMAKE_CURRENT_LIST_DIR}/src/f12.c
     ${CMAKE_CURRENT_LIST_DIR}/src/fat12.c
-    ${CMAKE_CURRENT_LIST_DIR}/src/mfm_decode.c
-    ${CMAKE_CURRENT_LIST_DIR}/src/mfm_encode.c)
+    ${CMAKE_CURRENT_LIST_DIR}/src/mfm.c)
 
 set_property(SOURCE ${FLOPPY_SOURCES} APPEND PROPERTY
     COMPILE_OPTIONS ${FLOPPY_C_OPTIONS})
@@ -64,18 +65,25 @@ pico_generate_pio_header(floppy_lib
 function(add_floppy_example name source)
     add_executable(${name} ${source})
     target_link_libraries(${name} PRIVATE floppy_lib)
+    target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/examples)
     set_property(SOURCE ${source} APPEND PROPERTY
         COMPILE_OPTIONS ${FLOPPY_C_OPTIONS})
     pico_enable_stdio_usb(${name} 1)
     pico_enable_stdio_uart(${name} 0)
     pico_add_extra_outputs(${name})
+    pico_set_binary_type(${name} copy_to_ram)
 endfunction()
 
 add_floppy_example(floppy_cli examples/cli.c)
 target_link_libraries(floppy_cli PRIVATE hardware_watchdog)
-pico_set_binary_type(floppy_cli copy_to_ram)
 
 option(FLOPPY_ALT_PINS "Use the alternate GPIO pin mapping in the CLI example" OFF)
 if(FLOPPY_ALT_PINS)
     target_compile_definitions(floppy_cli PRIVATE FLOPPY_ALT_PINS)
 endif()
+
+add_floppy_example(floppy_rpc_slave examples/rpc_slave.c)
+target_link_libraries(floppy_rpc_slave PRIVATE hardware_spi)
+
+add_floppy_example(floppy_rpc_master examples/rpc_master.c)
+target_link_libraries(floppy_rpc_master PRIVATE hardware_spi)

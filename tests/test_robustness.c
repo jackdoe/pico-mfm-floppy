@@ -1,70 +1,27 @@
 #include "test.h"
+#include "vdisk.h"
 #include "../src/crc.h"
-#include "../src/fat12.h"
-#include "../src/mfm_decode.h"
-#include "../src/mfm_encode.h"
+#include "../src/mfm.h"
 
-typedef struct {
-  uint8_t data[DISK_SECTOR_COUNT][DISK_SECTOR_SIZE];
-  block_status_t read_failure;
-  block_status_t write_failure;
-  uint16_t fail_lba;
-  bool fail_read;
-} robust_disk_t;
-
-static robust_disk_t disk;
+static vdisk_t disk;
+static cache_t cache;
 static fat12_t fat;
 
-static block_status_t disk_read(void *ctx, uint16_t lba,
-                                uint8_t out[DISK_SECTOR_SIZE]) {
-  robust_disk_t *d = ctx;
-  if (lba >= DISK_SECTOR_COUNT) return BLOCK_ERR_INVALID;
-  if (d->fail_read && lba == d->fail_lba) return d->read_failure;
-  memcpy(out, d->data[lba], DISK_SECTOR_SIZE);
-  return BLOCK_OK;
-}
-
-static block_status_t disk_write(void *ctx, const track_t *track) {
-  robust_disk_t *d = ctx;
-  if (d->write_failure != BLOCK_OK) return d->write_failure;
-  if (!track || !disk_ch_valid(track->cylinder, track->head) || track->valid == 0) {
-    return BLOCK_ERR_INVALID;
-  }
-  for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
-    if (!track_has(track, sector)) continue;
-    uint16_t lba;
-    if (!disk_chs_to_lba(track->cylinder, track->head, sector, &lba)) {
-      return BLOCK_ERR_INVALID;
-    }
-    memcpy(d->data[lba], track->data[sector], DISK_SECTOR_SIZE);
-  }
-  return BLOCK_OK;
-}
-
-static fat12_io_t disk_io(void) {
-  return (fat12_io_t){.read = disk_read, .write = disk_write, .ctx = &disk};
+static disk_err_t mount(fat12_t *target, disk_device_t device) {
+  ASSERT_EQ(cache_init(&cache, device), DISK_OK);
+  ASSERT_EQ(cache_bind(&cache), DISK_OK);
+  return fat12_init(target, &cache);
 }
 
 static void format_disk(void) {
-  memset(&disk, 0, sizeof(disk));
-  memset(&fat, 0, sizeof(fat));
-  ASSERT_EQ(fat12_format(&fat, disk_io(), "ROBUST", false, NULL, NULL), FAT12_OK);
+  vdisk_init(&disk);
+  ASSERT_EQ(cache_init(&cache, vdisk_device(&disk)), DISK_OK);
+  ASSERT_EQ(cache_bind(&cache), DISK_OK);
+  ASSERT_EQ(fat12_format(&fat, &cache, "ROBUST", false, NULL, NULL), DISK_OK);
 }
 
 static void set_fat_entry(uint16_t cluster, uint16_t value) {
-  uint32_t offset = cluster + cluster / 2u;
-  for (uint8_t copy = 0; copy < FAT12_NUM_FATS; copy++) {
-    uint16_t start = (uint16_t)(FAT12_RESERVED_SECTORS + copy * FAT12_SECTORS_PER_FAT);
-    uint8_t *bytes = &disk.data[start][0];
-    if (cluster & 1u) {
-      bytes[offset] = (uint8_t)((bytes[offset] & 0x0Fu) |
-                                ((value & 0x0Fu) << 4u));
-      bytes[offset + 1u] = (uint8_t)(value >> 4u);
-    } else {
-      bytes[offset] = (uint8_t)value;
-      bytes[offset + 1u] = (bytes[offset + 1u] & 0xF0u) | ((value >> 8) & 0x0Fu);
-    }
-  }
+  vdisk_set_fat_entry(&disk, cluster, value);
 }
 
 TEST(test_fat12_rejects_every_noncanonical_bpb_field) {
@@ -75,7 +32,7 @@ TEST(test_fat12_rejects_every_noncanonical_bpb_field) {
     format_disk();
     disk.data[0][offsets[i]] ^= 1u;
     fat12_t candidate;
-    ASSERT_EQ(fat12_init(&candidate, disk_io()), FAT12_ERR_INVALID);
+    ASSERT_EQ(mount(&candidate, vdisk_device(&disk)), DISK_ERR_INVALID);
   }
 }
 
@@ -83,79 +40,87 @@ TEST(test_fat12_rejects_missing_signature_and_flags_bad_fat_markers) {
   format_disk();
   disk.data[0][FAT12_BOOT_SIG_OFFSET] = 0;
   fat12_t candidate;
-  ASSERT_EQ(fat12_init(&candidate, disk_io()), FAT12_ERR_INVALID);
+  ASSERT_EQ(mount(&candidate, vdisk_device(&disk)), DISK_ERR_INVALID);
   format_disk();
   disk.data[FAT12_RESERVED_SECTORS][0] = 0;
-  ASSERT_EQ(fat12_init(&candidate, disk_io()), FAT12_OK);
-  ASSERT(candidate.fat_mismatch);
-  ASSERT(candidate.fat_markers_invalid);
+  ASSERT_EQ(mount(&candidate, vdisk_device(&disk)), DISK_OK);
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&candidate, &report, false), DISK_OK);
+  ASSERT(report.fat_mismatch);
+  ASSERT(report.fat_markers_invalid);
   ASSERT_EQ(candidate.fat_start, FAT12_FAT2_START);
   format_disk();
   disk.data[FAT12_FAT1_START][0] = 0;
   disk.data[FAT12_FAT2_START][0] = 0;
-  ASSERT_EQ(fat12_init(&candidate, disk_io()), FAT12_OK);
-  ASSERT(!candidate.fat_mismatch);
-  ASSERT(candidate.fat_markers_invalid);
+  ASSERT_EQ(mount(&candidate, vdisk_device(&disk)), DISK_OK);
+  ASSERT_EQ(fat12_fsck(&candidate, &report, false), DISK_OK);
+  ASSERT(!report.fat_mismatch);
+  ASSERT(report.fat_markers_invalid);
 }
 
-TEST(test_fat12_rejects_missing_callbacks) {
+TEST(test_fat12_rejects_missing_cache_and_write_protected_devices) {
   fat12_t candidate;
-  ASSERT_EQ(fat12_init(&candidate, (fat12_io_t){0}), FAT12_ERR_INVALID);
+  ASSERT_EQ(fat12_init(&candidate, NULL), DISK_ERR_INVALID);
+  ASSERT_EQ(fat12_init(NULL, &cache), DISK_ERR_INVALID);
   format_disk();
-  fat12_io_t readonly = {.read = disk_read, .ctx = &disk};
-  ASSERT_EQ(fat12_init(&candidate, readonly), FAT12_OK);
+  ASSERT_EQ(mount(&candidate, vdisk_readonly_device(&disk)), DISK_OK);
   fat12_writer_t writer;
-  ASSERT_EQ(fat12_open_write(&candidate, "NO.TXT", &writer), FAT12_ERR_READ_ONLY);
+  ASSERT_EQ(fat12_open_write(&candidate, "NO.TXT", &writer), DISK_ERR_WRITE_PROTECTED);
+  ASSERT_EQ(fat12_delete(&candidate, "NO.TXT"), DISK_ERR_WRITE_PROTECTED);
+  fat12_fsck_t report;
+  ASSERT_EQ(fat12_fsck(&candidate, &report, true), DISK_ERR_WRITE_PROTECTED);
+  ASSERT_EQ(fat12_fsck(&candidate, &report, false), DISK_OK);
 }
 
 TEST(test_fat12_preserves_typed_read_failure) {
   format_disk();
-  disk.fail_read = true;
-  disk.fail_lba = 0;
-  disk.read_failure = BLOCK_ERR_TIMEOUT;
+  disk.fail_track = 0;
+  disk.read_failure = DISK_ERR_TIMEOUT;
   fat12_t candidate;
-  ASSERT_EQ(fat12_init(&candidate, disk_io()), FAT12_ERR_READ);
-  ASSERT_EQ(fat12_last_io(&candidate), BLOCK_ERR_TIMEOUT);
+  ASSERT_EQ(mount(&candidate, vdisk_device(&disk)), DISK_ERR_TIMEOUT);
 }
 
 TEST(test_fat12_rejects_cluster_underflow) {
   format_disk();
-  ASSERT_EQ(fat12_init(&fat, disk_io()), FAT12_OK);
-  uint8_t data[DISK_SECTOR_SIZE];
-  ASSERT_EQ(fat12_read_cluster(&fat, 0, data), FAT12_ERR_INVALID);
-  ASSERT_EQ(fat12_read_cluster(&fat, 1, data), FAT12_ERR_INVALID);
+  ASSERT_EQ(mount(&fat, vdisk_device(&disk)), DISK_OK);
+  uint16_t next;
+  ASSERT_EQ(fat12_get_entry(&fat, 0, &next), DISK_ERR_INVALID);
+  ASSERT_EQ(fat12_get_entry(&fat, 1, &next), DISK_ERR_INVALID);
+  ASSERT_EQ(fat12_get_entry(&fat, FAT12_CLUSTER_LIMIT, &next), DISK_ERR_INVALID);
+  ASSERT_EQ(fat12_get_entry(&fat, 2, NULL), DISK_ERR_INVALID);
+  ASSERT_EQ(fat12_get_entry(&fat, 2, &next), DISK_OK);
+  ASSERT_EQ(next, 0);
 }
 
 TEST(test_fat12_detects_fat_copy_mismatch_on_init_and_fsck) {
   format_disk();
   uint16_t copy = (uint16_t)(FAT12_RESERVED_SECTORS + FAT12_SECTORS_PER_FAT);
   disk.data[copy][3] ^= 0xFFu;
-  ASSERT_EQ(fat12_init(&fat, disk_io()), FAT12_OK);
-  ASSERT(fat.fat_mismatch);
+  ASSERT_EQ(mount(&fat, vdisk_device(&disk)), DISK_OK);
   fat12_fsck_t report;
-  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), DISK_OK);
   ASSERT(report.fat_mismatch);
 }
 
 TEST(test_fat12_fsck_distinguishes_loop) {
   format_disk();
-  ASSERT_EQ(fat12_init(&fat, disk_io()), FAT12_OK);
+  ASSERT_EQ(mount(&fat, vdisk_device(&disk)), DISK_OK);
   fat12_writer_t writer;
-  ASSERT_EQ(fat12_open_write(&fat, "LOOP.TXT", &writer), FAT12_OK);
+  ASSERT_EQ(fat12_open_write(&fat, "LOOP.TXT", &writer), DISK_OK);
   uint8_t data[DISK_SECTOR_SIZE * 2u];
   memset(data, 0xA5, sizeof(data));
-  fat12_result_t result = fat12_write(&writer, data, sizeof(data));
-  ASSERT_EQ(result.error, FAT12_OK);
+  disk_result_t result = fat12_write(&writer, data, sizeof(data));
+  ASSERT_EQ(result.error, DISK_OK);
   ASSERT_EQ(result.count, sizeof(data));
-  ASSERT_EQ(fat12_close_write(&writer), FAT12_OK);
+  ASSERT_EQ(fat12_close_write(&writer), DISK_OK);
   fat12_dirent_t entry;
-  ASSERT_EQ(fat12_find(&fat, "LOOP.TXT", &entry), FAT12_OK);
+  ASSERT_EQ(fat12_find(&fat, "LOOP.TXT", &entry), DISK_OK);
   ASSERT(entry.start_cluster >= 2);
   set_fat_entry(entry.start_cluster, entry.start_cluster + 1u);
   set_fat_entry(entry.start_cluster + 1u, entry.start_cluster);
-  ASSERT_EQ(fat12_init(&fat, disk_io()), FAT12_OK);
+  ASSERT_EQ(mount(&fat, vdisk_device(&disk)), DISK_OK);
   fat12_fsck_t report;
-  ASSERT_EQ(fat12_fsck(&fat, &report, false), FAT12_OK);
+  ASSERT_EQ(fat12_fsck(&fat, &report, false), DISK_OK);
   ASSERT_EQ(report.loops, 1);
   ASSERT_EQ(report.broken_chains, 1);
 }
@@ -167,7 +132,7 @@ static uint16_t pulse_delta(uint8_t pulse) {
 static void encode_address(mfm_encode_t *encoder, uint8_t cylinder, uint8_t head,
                            uint8_t sector, uint8_t size_code, bool corrupt) {
   uint8_t address[] = {MFM_ADDR_MARK, cylinder, head, sector, size_code};
-  uint16_t crc = crc16_mfm(address, sizeof(address));
+  uint16_t crc = crc16(address, sizeof(address), MFM_CRC_INIT);
   if (corrupt) crc ^= 1u;
   uint8_t crc_bytes[] = {(uint8_t)(crc >> 8), (uint8_t)(crc & 0xFF)};
   mfm_encode_sync(encoder);
@@ -240,7 +205,7 @@ int main(void) {
   printf("=== Robustness Tests ===\n\n");
   RUN_TEST(test_fat12_rejects_every_noncanonical_bpb_field);
   RUN_TEST(test_fat12_rejects_missing_signature_and_flags_bad_fat_markers);
-  RUN_TEST(test_fat12_rejects_missing_callbacks);
+  RUN_TEST(test_fat12_rejects_missing_cache_and_write_protected_devices);
   RUN_TEST(test_fat12_preserves_typed_read_failure);
   RUN_TEST(test_fat12_rejects_cluster_underflow);
   RUN_TEST(test_fat12_detects_fat_copy_mismatch_on_init_and_fsck);

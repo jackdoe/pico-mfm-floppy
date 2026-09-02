@@ -3,8 +3,7 @@
 #include "test.h"
 #include "vdisk.h"
 #include "../src/crc.h"
-#include "../src/mfm_decode.h"
-#include "../src/mfm_encode.h"
+#include "../src/mfm.h"
 #include "../src/fat12.h"
 
 static uint32_t fuzz_seed = 0;
@@ -210,6 +209,7 @@ void fuzz_mfm_roundtrip(int iterations) {
 
     mfm_encode_gap(&enc, 80);
     mfm_encode_sector(&enc, s_in.cylinder, s_in.head, s_in.sector, s_in.data);
+    mfm_encode_gap(&enc, 54);
 
     mfm_t m;
     mfm_init(&m);
@@ -224,14 +224,17 @@ void fuzz_mfm_roundtrip(int iterations) {
       }
     }
 
-    if (got_sector) {
-      if (s_out.cylinder != s_in.cylinder || s_out.head != s_in.head ||
-          s_out.sector != s_in.sector ||
-          memcmp(s_in.data, s_out.data, DISK_SECTOR_SIZE) != 0) {
-        printf("FAIL: Data mismatch at iteration %d (seed %u)\n",
-               iter, initial_seed);
-        exit(1);
-      }
+    if (!got_sector) {
+      printf("FAIL: clean encoding decoded no sector at iteration %d (seed %u)\n",
+             iter, initial_seed);
+      exit(1);
+    }
+    if (s_out.cylinder != s_in.cylinder || s_out.head != s_in.head ||
+        s_out.sector != s_in.sector ||
+        memcmp(s_in.data, s_out.data, DISK_SECTOR_SIZE) != 0) {
+      printf("FAIL: Data mismatch at iteration %d (seed %u)\n",
+             iter, initial_seed);
+      exit(1);
     }
 
     fuzz_tests_run++;
@@ -241,6 +244,62 @@ void fuzz_mfm_roundtrip(int iterations) {
 }
 
 static vdisk_t *fuzz_disk = NULL;
+static cache_t fuzz_cache;
+
+static disk_err_t fuzz_mount(fat12_t *fat) {
+  if (cache_init(&fuzz_cache, vdisk_device(fuzz_disk)) != DISK_OK) return DISK_ERR_INVALID;
+  if (cache_bind(&fuzz_cache) != DISK_OK) return DISK_ERR_INVALID;
+  return fat12_init(fat, &fuzz_cache);
+}
+
+static uint8_t fuzz_model[DISK_SECTOR_COUNT][DISK_SECTOR_SIZE];
+
+static void fuzz_cache_fail(const char *what, int iter) {
+  printf("FAIL: cache %s at operation %d (seed %u)\n", what, iter, initial_seed);
+  exit(1);
+}
+
+void fuzz_cache_random_lba_pattern(int operations) {
+  printf("Fuzzing track cache against a flat model (%d operations)...\n", operations);
+
+  vdisk_init(fuzz_disk);
+  for (uint16_t lba = 0; lba < DISK_SECTOR_COUNT; lba++) {
+    for (size_t i = 0; i < DISK_SECTOR_SIZE; i++) fuzz_disk->data[lba][i] = fuzz_rand8();
+  }
+  memcpy(fuzz_model, fuzz_disk->data, sizeof(fuzz_model));
+  if (cache_init(&fuzz_cache, vdisk_device(fuzz_disk)) != DISK_OK ||
+      cache_bind(&fuzz_cache) != DISK_OK) {
+    fuzz_cache_fail("bind failed", 0);
+  }
+
+  uint8_t sector[DISK_SECTOR_SIZE];
+  for (int op = 0; op < operations; op++) {
+    uint32_t roll = fuzz_rand() % 100;
+    uint16_t lba = fuzz_rand16() % DISK_SECTOR_COUNT;
+    if (roll < 50) {
+      if (cache_read(&fuzz_cache, lba, sector) != DISK_OK) fuzz_cache_fail("read failed", op);
+      if (memcmp(sector, fuzz_model[lba], DISK_SECTOR_SIZE) != 0) {
+        fuzz_cache_fail("read disagrees with model", op);
+      }
+    } else if (roll < 90) {
+      for (size_t i = 0; i < DISK_SECTOR_SIZE; i++) sector[i] = fuzz_rand8();
+      if (cache_write(&fuzz_cache, lba, sector) != DISK_OK) fuzz_cache_fail("write failed", op);
+      memcpy(fuzz_model[lba], sector, DISK_SECTOR_SIZE);
+    } else {
+      if (cache_flush(&fuzz_cache) != DISK_OK) fuzz_cache_fail("flush failed", op);
+      if (cache_dirty(&fuzz_cache)) fuzz_cache_fail("dirty after flush", op);
+    }
+    bool committed = memcmp(fuzz_model, fuzz_disk->data, sizeof(fuzz_model)) == 0;
+    if (cache_dirty(&fuzz_cache) == committed) fuzz_cache_fail("dirty flag lies", op);
+    fuzz_tests_run++;
+  }
+  if (cache_flush(&fuzz_cache) != DISK_OK) fuzz_cache_fail("final flush failed", operations);
+  if (memcmp(fuzz_model, fuzz_disk->data, sizeof(fuzz_model)) != 0) {
+    fuzz_cache_fail("device disagrees with model after flush", operations);
+  }
+
+  printf("  Completed %d operations\n", operations);
+}
 
 void fuzz_fat12_random_boot_sector(int iterations) {
   printf("Fuzzing FAT12 with random boot sectors (%d iterations)...\n", iterations);
@@ -251,8 +310,7 @@ void fuzz_fat12_random_boot_sector(int iterations) {
     }
 
     fat12_t fat;
-    fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = fuzz_disk };
-    fat12_init(&fat, io);
+    fuzz_mount(&fat);
 
     fuzz_tests_run++;
   }
@@ -309,16 +367,14 @@ void fuzz_fat12_corrupt_bpb_values(int iterations) {
     }
 
     fat12_t fat;
-    fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = fuzz_disk };
-
-    fat12_err_t err = fat12_init(&fat, io);
-    if (err == FAT12_OK) {
+    disk_err_t err = fuzz_mount(&fat);
+    if (err == DISK_OK) {
       fat12_dirent_t entry;
       fat12_find(&fat, "TEST.TXT", &entry);
 
-      uint8_t buf[FAT12_MAX_CLUSTER_SECTORS * DISK_SECTOR_SIZE];
-      fat12_read_cluster(&fat, 2, buf);
-      fat12_read_cluster(&fat, fuzz_rand16(), buf);
+      uint16_t next;
+      fat12_get_entry(&fat, 2, &next);
+      fat12_get_entry(&fat, fuzz_rand16(), &next);
     }
 
     fuzz_tests_run++;
@@ -341,10 +397,8 @@ void fuzz_fat12_random_fat_entries(int iterations) {
     fuzz_disk->data[1][0] = 0xF0;
 
     fat12_t fat;
-    fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = fuzz_disk };
-
-    fat12_err_t err = fat12_init(&fat, io);
-    if (err == FAT12_OK) {
+    disk_err_t err = fuzz_mount(&fat);
+    if (err == DISK_OK) {
       for (int i = 0; i < 10; i++) {
         uint16_t cluster = fuzz_rand16() % 3000;
         uint16_t next;
@@ -371,10 +425,8 @@ void fuzz_fat12_random_directory(int iterations) {
     }
 
     fat12_t fat;
-    fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = fuzz_disk };
-
-    fat12_err_t err = fat12_init(&fat, io);
-    if (err == FAT12_OK) {
+    disk_err_t err = fuzz_mount(&fat);
+    if (err == DISK_OK) {
       fat12_dirent_t entry;
       for (uint16_t i = 0; i < 50; i++) {
         fat12_read_root_entry(&fat, i, &entry);
@@ -406,54 +458,52 @@ void fuzz_fat12_file_operations(int iterations) {
     }
 
     fat12_t fat;
-    fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = fuzz_disk };
-
-    fat12_err_t err = fat12_init(&fat, io);
-    if (err == FAT12_OK) {
+    disk_err_t err = fuzz_mount(&fat);
+    if (err == DISK_OK) {
       fat12_dirent_t entry;
 
       fat12_writer_t writer;
-      if (fat12_open_write(&fat, "FUZZ.TXT", &writer) == FAT12_OK) {
-        uint8_t write_buf[256];
+      uint8_t write_buf[256];
+      bool committed = false;
+      if (fat12_open_write(&fat, "FUZZ.TXT", &writer) == DISK_OK) {
         for (int i = 0; i < 256; i++) {
           write_buf[i] = fuzz_rand8();
         }
-        fat12_result_t written = fat12_write(&writer, write_buf, sizeof(write_buf));
-        if (written.error == FAT12_OK && written.count == sizeof(write_buf)) {
-          fat12_close_write(&writer);
+        disk_result_t written = fat12_write(&writer, write_buf, sizeof(write_buf));
+        if (written.error == DISK_OK && written.count == sizeof(write_buf)) {
+          committed = fat12_close_write(&writer) == DISK_OK;
         } else {
           fat12_abort_write(&writer);
         }
       }
 
-      if (fat12_find(&fat, "FUZZ.TXT", &entry) == FAT12_OK) {
+      if (committed) {
         fat12_file_t file;
-        if (fat12_open(&fat, &entry, &file) == FAT12_OK) {
-          uint8_t read_buf[DISK_SECTOR_SIZE];
-          fat12_read(&file, read_buf, sizeof(read_buf));
+        uint8_t read_buf[DISK_SECTOR_SIZE];
+        disk_result_t got = { .error = DISK_ERR_NOT_FOUND, .count = 0 };
+        if (fat12_find(&fat, "FUZZ.TXT", &entry) == DISK_OK &&
+            fat12_open(&fat, &entry, &file) == DISK_OK) {
+          got = fat12_read(&file, read_buf, sizeof(read_buf));
+        }
+        if (got.error != DISK_OK || got.count != sizeof(write_buf) ||
+            memcmp(read_buf, write_buf, sizeof(write_buf)) != 0) {
+          printf("FAIL: committed file did not read back at iteration %d (seed %u)\n",
+                 iter, initial_seed);
+          exit(1);
         }
       }
 
       fat12_delete(&fat, "FUZZ.TXT");
 
       fat12_fsck_t repaired;
-      fat12_err_t repair_error = FAT12_OK;
-      for (uint16_t pass = 0; pass < FAT12_ROOT_ENTRIES; pass++) {
-        repair_error = fat12_fsck(&fat, &repaired, true);
-        if (repair_error != FAT12_OK || repaired.incomplete ||
-            !repaired.repair_pending) {
-          break;
-        }
-      }
-      if (repair_error == FAT12_OK && !repaired.incomplete &&
-          !repaired.repair_pending) {
+      disk_err_t repair_error = fat12_fsck(&fat, &repaired, true);
+      if (repair_error == DISK_OK) {
         fat12_fsck_t clean;
-        if (fat12_fsck(&fat, &clean, false) != FAT12_OK ||
+        if (fat12_fsck(&fat, &clean, false) != DISK_OK ||
             clean.lost_clusters != 0 || clean.broken_chains != 0 ||
             clean.crosslinked != 0 || clean.loops != 0 ||
             clean.size_mismatches != 0 || clean.fat_mismatch ||
-            clean.fat_markers_invalid || clean.repair_pending ||
-            clean.incomplete) {
+            clean.fat_markers_invalid) {
           printf("FAIL: FAT invariants did not converge at iteration %d (seed %u)\n",
                  iter, initial_seed);
           exit(1);
@@ -473,15 +523,11 @@ void fuzz_fat12_cluster_edge_cases(int iterations) {
   vdisk_format_valid(fuzz_disk);
 
   fat12_t fat;
-  fat12_io_t io = { .read = vdisk_read, .write = vdisk_write, .ctx = fuzz_disk };
-
-  fat12_err_t err = fat12_init(&fat, io);
-  if (err != FAT12_OK) {
+  disk_err_t err = fuzz_mount(&fat);
+  if (err != DISK_OK) {
     printf("  ERROR: Failed to init valid disk\n");
     return;
   }
-
-  uint8_t buf[DISK_SECTOR_SIZE];
 
   for (int iter = 0; iter < iterations; iter++) {
     uint16_t test_clusters[] = {
@@ -495,16 +541,12 @@ void fuzz_fat12_cluster_edge_cases(int iterations) {
 
     for (int i = 0; i < (int)(sizeof(test_clusters)/sizeof(test_clusters[0])); i++) {
       uint16_t cluster = test_clusters[i];
-      fat12_read_cluster(&fat, cluster, buf);
-
       uint16_t next;
       fat12_get_entry(&fat, cluster, &next);
     }
 
     for (int i = 0; i < 100; i++) {
       uint16_t cluster = fuzz_rand16();
-      fat12_read_cluster(&fat, cluster, buf);
-
       uint16_t next;
       fat12_get_entry(&fat, cluster, &next);
     }
@@ -531,7 +573,7 @@ static int usage(const char *program) {
 }
 
 int main(int argc, char *argv[]) {
-  int iterations = 1000;
+  int iterations = 5000;
   uint32_t seed = 0xC0DEC0DEu;
 
   for (int i = 1; i < argc; i++) {
@@ -564,6 +606,7 @@ int main(int argc, char *argv[]) {
     printf("ERROR: Failed to allocate virtual disk\n");
     return 1;
   }
+  vdisk_init(fuzz_disk);
 
   printf("--- MFM Decoder Fuzz Tests ---\n");
   fuzz_mfm_decoder_random_pulses(iterations);
@@ -577,6 +620,9 @@ int main(int argc, char *argv[]) {
 
   printf("\n--- MFM Roundtrip Fuzz Tests ---\n");
   fuzz_mfm_roundtrip(iterations);
+
+  printf("\n--- Track Cache Fuzz Tests ---\n");
+  fuzz_cache_random_lba_pattern(2000);
 
   printf("\n--- FAT12 Fuzz Tests ---\n");
   fuzz_fat12_random_boot_sector(iterations);

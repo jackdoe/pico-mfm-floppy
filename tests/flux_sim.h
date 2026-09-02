@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include "../src/block.h"
+#include "../src/disk.h"
 #include "flux_noise.h"
 
 typedef struct {

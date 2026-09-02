@@ -4,7 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include "../src/block.h"
+#include "../src/disk.h"
+#include "../src/floppy.h"
 #include "flux_noise.h"
 
 #define PIO_SIM_MAX_FLUX 200000u
@@ -15,6 +16,9 @@ typedef struct {
 } pio_sim_track_t;
 
 typedef struct {
+  floppy_pins_t pins;
+  const uint32_t *ring;
+  const uint32_t *consumer;
   pio_sim_track_t tracks[DISK_CYLINDERS][DISK_HEADS];
   pio_sim_track_t alternate_track;
   bool alternate_read;
@@ -54,6 +58,11 @@ typedef struct {
   uint32_t torn_writes;
   bool index_stuck;
   bool index_value;
+  bool track0_missing;
+  bool disk_change_stuck;
+  bool disk_change_on_tx_configure;
+  bool write_protect_on_tx_configure;
+  uint32_t step_pulses;
   bool last_index_value;
   bool write_gate_active;
   bool write_started_at_index;
@@ -75,8 +84,6 @@ typedef struct {
   int fail_program_add_call;
   int fail_sm_claim_call;
   bool fail_dma_claim;
-  bool fail_spinlock_claim;
-  bool fail_timer_create;
   bool fail_read_program_init;
   bool fail_write_program_init;
   uint32_t program_add_calls;
@@ -84,8 +91,6 @@ typedef struct {
   uint32_t programs_loaded;
   uint32_t sms_claimed;
   uint32_t dma_channels_claimed;
-  uint32_t spin_locks_claimed;
-  uint32_t timers_active;
   uint32_t gpio_deinits;
   uint32_t read_restart_jumps;
   uint32_t pio_gpio_base;
@@ -93,12 +98,12 @@ typedef struct {
 } pio_sim_drive_t;
 
 bool pio_sim_replace_track(pio_sim_drive_t *drive, const track_t *track);
-bool pio_sim_fire_timer(pio_sim_drive_t *drive);
 bool pio_sim_set_noise(pio_sim_drive_t *drive, flux_noise_config_t config);
 
 void pio_sim_init(pio_sim_drive_t *drive);
 void pio_sim_free(pio_sim_drive_t *drive);
 bool pio_sim_load_scp(pio_sim_drive_t *drive, uint8_t *scp_data, size_t scp_size);
-void pio_sim_install(pio_sim_drive_t *drive);
+void pio_sim_install(pio_sim_drive_t *drive, floppy_pins_t pins,
+                     const uint32_t *ring, const uint32_t *consumer);
 
 #endif

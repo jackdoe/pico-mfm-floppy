@@ -2,13 +2,6 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-fixture="${SCP_FIXTURE:-$script_dir/../system-shock-multilingual-floppy-ibm-pc/disk1.scp}"
-if [[ ! -s "$fixture" ]]; then
-    printf 'Required SCP fixture missing or empty: %s\n' "$fixture" >&2
-    exit 1
-fi
-
-export SCP_FIXTURE="$fixture"
 if [[ "$(uname -s)" == "Darwin" ]]; then
     export ASAN_OPTIONS="${ASAN_OPTIONS:-halt_on_error=1:abort_on_error=1}"
 else

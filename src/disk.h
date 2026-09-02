@@ -1,5 +1,5 @@
-#ifndef BLOCK_H
-#define BLOCK_H
+#ifndef DISK_H
+#define DISK_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -17,22 +17,43 @@ _Static_assert(DISK_SECTORS_PER_TRACK < 32u, "track validity must fit uint32_t")
 _Static_assert(DISK_SECTOR_COUNT <= UINT16_MAX, "LBA must fit uint16_t");
 
 typedef enum {
-  BLOCK_OK = 0,
-  BLOCK_ERR_INVALID,
-  BLOCK_ERR_BUSY,
-  BLOCK_ERR_TIMEOUT,
-  BLOCK_ERR_CRC,
-  BLOCK_ERR_WRONG_TRACK,
-  BLOCK_ERR_WRONG_SIDE,
-  BLOCK_ERR_NO_TRACK0,
-  BLOCK_ERR_MEDIA_CHANGED,
-  BLOCK_ERR_WRITE_PROTECTED,
-  BLOCK_ERR_UNDERRUN,
-  BLOCK_ERR_OVERRUN,
-  BLOCK_ERR_VERIFY,
-  BLOCK_ERR_CORRUPT,
-  BLOCK_ERR_IO,
-} block_status_t;
+  DISK_OK = 0,
+  DISK_END,
+  DISK_ERR_INVALID,
+  DISK_ERR_BUSY,
+  DISK_ERR_TIMEOUT,
+  DISK_ERR_CRC,
+  DISK_ERR_WRONG_TRACK,
+  DISK_ERR_WRONG_SIDE,
+  DISK_ERR_NO_TRACK0,
+  DISK_ERR_MEDIA_CHANGED,
+  DISK_ERR_WRITE_PROTECTED,
+  DISK_ERR_UNDERRUN,
+  DISK_ERR_OVERRUN,
+  DISK_ERR_VERIFY,
+  DISK_ERR_CORRUPT,
+  DISK_ERR_IO,
+  DISK_ERR_NOT_FOUND,
+  DISK_ERR_EXISTS,
+  DISK_ERR_FULL,
+  DISK_ERR_READ_ONLY,
+  DISK_ERR_AMBIGUOUS,
+  DISK_ERR_NOT_INITIALIZED,
+  DISK_ERR_NOT_MOUNTED,
+  DISK_ERR_ALREADY_MOUNTED,
+  DISK_ERR_TOO_MANY,
+  DISK_ERR_IS_DIR,
+  DISK_ERR_NOT_DIR,
+  DISK_ERR_CONFLICT,
+  DISK_ERR_BAD_HANDLE,
+} disk_err_t;
+
+#define DISK_ERR_LAST DISK_ERR_BAD_HANDLE
+
+typedef struct {
+  disk_err_t error;
+  size_t count;
+} disk_result_t;
 
 typedef struct {
   uint8_t cylinder;
@@ -42,14 +63,20 @@ typedef struct {
 } track_t;
 
 typedef struct {
-  block_status_t (*read_track)(void *ctx, uint32_t expected_generation,
-                               uint8_t cylinder, uint8_t head, track_t *out);
-  block_status_t (*write_track)(void *ctx, uint32_t expected_generation,
-                                const track_t *track);
-  block_status_t (*media_generation)(void *ctx, uint32_t *generation);
-  block_status_t (*write_protected)(void *ctx, bool *write_protected);
+  disk_err_t (*read_track)(void *ctx, uint32_t expected_generation,
+                           uint8_t cylinder, uint8_t head, track_t *out);
+  disk_err_t (*write_track)(void *ctx, uint32_t expected_generation,
+                            const track_t *track);
+  disk_err_t (*media_generation)(void *ctx, uint32_t *generation);
+  disk_err_t (*write_protected)(void *ctx, bool *write_protected);
   void *ctx;
-} block_device_t;
+} disk_device_t;
+
+const char *disk_strerror(disk_err_t error);
+
+static inline bool disk_err_is_io(disk_err_t error) {
+  return error >= DISK_ERR_TIMEOUT && error <= DISK_ERR_IO;
+}
 
 static inline bool disk_ch_valid(uint8_t cylinder, uint8_t head) {
   return cylinder < DISK_CYLINDERS && head < DISK_HEADS;

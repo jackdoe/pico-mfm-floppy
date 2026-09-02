@@ -1,7 +1,7 @@
 #include "test.h"
 #include "flux_sim.h"
-#include "../src/mfm_decode.h"
-#include "../src/mfm_encode.h"
+#include "scp_fixture.h"
+#include "../src/mfm.h"
 #include <string.h>
 
 static int decode_track(flux_sim_t *sim, mfm_sector_t *sectors, int max_sectors) {
@@ -311,27 +311,9 @@ TEST(test_adaptive_timing_with_drift) {
 
 static const char *scp_path;
 
-static uint8_t *load_file(const char *path, size_t *size) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long end = ftell(f);
-    if (end <= 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
-    *size = (size_t)end;
-    uint8_t *buf = malloc(*size);
-    if (!buf) { fclose(f); return NULL; }
-    size_t read = fread(buf, 1, *size, f);
-    int closed = fclose(f);
-    if (read != *size || closed != 0) {
-        free(buf);
-        return NULL;
-    }
-    return buf;
-}
-
 TEST(test_scp_decode_track0) {
     size_t size;
-    uint8_t *data = load_file(scp_path, &size);
+    uint8_t *data = scp_fixture_load(scp_path, &size);
     ASSERT_NOT_NULL(data);
 
     flux_sim_t sim;
@@ -365,7 +347,7 @@ TEST(test_scp_decode_track0) {
 
 TEST(test_scp_track0_with_correlated_noise) {
     size_t size;
-    uint8_t *data = load_file(scp_path, &size);
+    uint8_t *data = scp_fixture_load(scp_path, &size);
     ASSERT_NOT_NULL(data);
     flux_sim_t sim;
     ASSERT(flux_sim_open_scp(&sim, data, size));
@@ -395,7 +377,7 @@ TEST(test_scp_track0_with_correlated_noise) {
 
 TEST(test_scp_decode_full_disk) {
     size_t size;
-    uint8_t *data = load_file(scp_path, &size);
+    uint8_t *data = scp_fixture_load(scp_path, &size);
     ASSERT_NOT_NULL(data);
 
     flux_sim_t sim;
@@ -446,7 +428,7 @@ TEST(test_scp_decode_full_disk) {
 
 TEST(test_scp_boot_sector_content) {
     size_t size;
-    uint8_t *data = load_file(scp_path, &size);
+    uint8_t *data = scp_fixture_load(scp_path, &size);
     ASSERT_NOT_NULL(data);
 
     flux_sim_t sim;

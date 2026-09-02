@@ -1,5 +1,6 @@
 #include "test.h"
 #include "scp_disk.h"
+#include "scp_fixture.h"
 #include "../src/f12.h"
 #include <errno.h>
 
@@ -9,51 +10,23 @@ static scp_disk_t fixture_disk;
 static uint8_t image[DISK_SECTOR_COUNT][DISK_SECTOR_SIZE];
 static bool coverage[DISK_SECTOR_COUNT];
 
-static uint8_t *load_fixture(const char *path, size_t *size) {
-  *size = 0;
-  FILE *file = fopen(path, "rb");
-  if (!file) return NULL;
-  if (fseek(file, 0, SEEK_END) != 0) {
-    fclose(file);
-    return NULL;
-  }
-  long length = ftell(file);
-  if (length <= 0 || fseek(file, 0, SEEK_SET) != 0) {
-    fclose(file);
-    return NULL;
-  }
-  uint8_t *data = malloc((size_t)length);
-  if (!data) {
-    fclose(file);
-    return NULL;
-  }
-  size_t read = fread(data, 1, (size_t)length, file);
-  bool closed = fclose(file) == 0;
-  if (read != (size_t)length || !closed) {
-    free(data);
-    return NULL;
-  }
-  *size = (size_t)length;
-  return data;
-}
-
 static uint32_t checksum(const uint8_t *data, size_t size) {
   uint32_t value = 5381u;
   for (size_t i = 0; i < size; i++) value = value * 33u + data[i];
   return value;
 }
 
-static f12_result_t read_all(f12_file_t *file, uint8_t *data, size_t size) {
-  f12_result_t total = {.error = F12_OK, .count = 0};
+static disk_result_t read_all(f12_file_t *file, uint8_t *data, size_t size) {
+  disk_result_t total = {.error = DISK_OK, .count = 0};
   while (total.count < size) {
-    f12_result_t part = f12_read(file, data + total.count, size - total.count);
+    disk_result_t part = f12_read(file, data + total.count, size - total.count);
     total.count += part.count;
-    if (part.error != F12_OK) {
+    if (part.error != DISK_OK) {
       total.error = part.error;
       return total;
     }
     if (part.count == 0) {
-      total.error = F12_ERR_IO;
+      total.error = DISK_ERR_IO;
       return total;
     }
   }
@@ -66,9 +39,9 @@ TEST(test_decode_every_sector) {
   for (uint8_t cylinder = 0; cylinder < DISK_CYLINDERS; cylinder++) {
     for (uint8_t head = 0; head < DISK_HEADS; head++) {
       track_t track;
-      block_status_t status = scp_disk_read_track(
+      disk_err_t status = scp_disk_read_track(
           &fixture_disk, 1u, cylinder, head, &track);
-      ASSERT_EQ(status, BLOCK_OK);
+      ASSERT_EQ(status, DISK_OK);
       ASSERT_EQ(track.cylinder, cylinder);
       ASSERT_EQ(track.head, head);
       ASSERT_EQ(track.valid, DISK_TRACK_VALID);
@@ -106,23 +79,23 @@ TEST(test_fixed_geometry_fat12_image) {
 
 TEST(test_f12_reads_fixture_consistently) {
   f12_t fs;
-  ASSERT_EQ(f12_init(&fs, scp_disk_device(&fixture_disk)), F12_OK);
-  ASSERT_EQ(f12_mount(&fs), F12_OK);
+  ASSERT_EQ(f12_init(&fs, scp_disk_device(&fixture_disk)), DISK_OK);
+  ASSERT_EQ(f12_mount(&fs), DISK_OK);
 
   fat12_fsck_t report;
-  ASSERT_EQ(f12_fsck(&fs, &report, false), F12_OK);
+  ASSERT_EQ(f12_fsck(&fs, &report, false), DISK_OK);
   ASSERT_EQ(report.crosslinked, 0);
   ASSERT_EQ(report.loops, 0);
 
   f12_dir_t dir;
-  ASSERT_EQ(f12_opendir(&fs, "/", &dir), F12_OK);
+  ASSERT_EQ(f12_opendir(&fs, "/", &dir), DISK_OK);
   size_t files = 0;
   size_t bytes = 0;
   for (;;) {
     f12_stat_t stat;
-    f12_err_t error = f12_readdir(&dir, &stat);
-    if (error == F12_END) break;
-    ASSERT_EQ(error, F12_OK);
+    disk_err_t error = f12_readdir(&dir, &stat);
+    if (error == DISK_END) break;
+    ASSERT_EQ(error, DISK_OK);
     if ((stat.attr & FAT12_ATTR_DIRECTORY) != 0 || stat.size == 0) continue;
 
     uint8_t *first = malloc(stat.size);
@@ -130,16 +103,16 @@ TEST(test_f12_reads_fixture_consistently) {
     ASSERT(first != NULL);
     ASSERT(second != NULL);
     f12_file_t file;
-    ASSERT_EQ(f12_open(&fs, stat.name, F12_OPEN_READ, &file), F12_OK);
-    f12_result_t result = read_all(&file, first, stat.size);
-    ASSERT_EQ(result.error, F12_OK);
+    ASSERT_EQ(f12_open(&fs, stat.name, F12_OPEN_READ, &file), DISK_OK);
+    disk_result_t result = read_all(&file, first, stat.size);
+    ASSERT_EQ(result.error, DISK_OK);
     ASSERT_EQ(result.count, stat.size);
-    ASSERT_EQ(f12_close(&file), F12_OK);
-    ASSERT_EQ(f12_open(&fs, stat.name, F12_OPEN_READ, &file), F12_OK);
+    ASSERT_EQ(f12_close(&file), DISK_OK);
+    ASSERT_EQ(f12_open(&fs, stat.name, F12_OPEN_READ, &file), DISK_OK);
     result = read_all(&file, second, stat.size);
-    ASSERT_EQ(result.error, F12_OK);
+    ASSERT_EQ(result.error, DISK_OK);
     ASSERT_EQ(result.count, stat.size);
-    ASSERT_EQ(f12_close(&file), F12_OK);
+    ASSERT_EQ(f12_close(&file), DISK_OK);
     ASSERT_MEM_EQ(first, second, stat.size);
     ASSERT_EQ(checksum(first, stat.size), checksum(second, stat.size));
     free(first);
@@ -147,14 +120,14 @@ TEST(test_f12_reads_fixture_consistently) {
     files++;
     bytes += stat.size;
   }
-  ASSERT_EQ(f12_closedir(&dir), F12_OK);
+  ASSERT_EQ(f12_closedir(&dir), DISK_OK);
   ASSERT(files > 0);
   ASSERT(bytes > 0);
 
   f12_file_t writer;
   ASSERT_EQ(f12_open(&fs, "WRITE.BIN", F12_OPEN_WRITE, &writer),
-            F12_ERR_WRITE_PROTECTED);
-  ASSERT_EQ(f12_unmount(&fs), F12_OK);
+            DISK_ERR_WRITE_PROTECTED);
+  ASSERT_EQ(f12_unmount(&fs), DISK_OK);
 }
 
 int main(int argc, char **argv) {
@@ -162,7 +135,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Usage: %s --fixture PATH\n", argv[0]);
     return 2;
   }
-  fixture_data = load_fixture(argv[2], &fixture_size);
+  fixture_data = scp_fixture_load(argv[2], &fixture_size);
   if (!fixture_data) {
     fprintf(stderr, "Cannot read required SCP fixture %s: %s\n",
             argv[2], strerror(errno));

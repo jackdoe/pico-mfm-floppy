@@ -2,8 +2,7 @@
 #include "pio_emu.h"
 #include "flux_read.pio.h"
 #include "flux_write.pio.h"
-#include "../src/mfm_decode.h"
-#include "../src/mfm_encode.h"
+#include "../src/mfm.h"
 #include <string.h>
 
 static void load_read_program(pio_emu_t *emu) {

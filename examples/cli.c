@@ -1,69 +1,50 @@
+#include "board.h"
 #include "f12.h"
-#include "floppy.h"
-#include "hardware/clocks.h"
+#include "fsck_scenario.h"
 #include "hardware/gpio.h"
-#include "hardware/pio.h"
-#include "hardware/vreg.h"
 #include "hardware/watchdog.h"
-#include "mfm_decode.h"
-#include "pico/stdlib.h"
+#if defined(PICO_RP2040) && PICO_RP2040
+#include "hardware/structs/vreg_and_chip_reset.h"
+#else
+#include "hardware/structs/powman.h"
+#endif
 #include "pico/time.h"
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
-#define FW_VERSION "0.2.0"
+#define FW_VERSION "0.3.0"
 #define CMD_BUF_SIZE 256
 #define IO_BUF_SIZE DISK_SECTOR_SIZE
 #define WORK_BUF_SIZE (8u * DISK_SECTOR_SIZE)
+#define VERIFY_CHUNK_MAX (WORK_BUF_SIZE / 2u)
 #define MAX_ARGS 4
 #define PULSE_BINS 128
+#define PULSE_BATCH 256u
 #define WRITER_CLOSE_ATTEMPTS 3
-#define CLUSTER_SIZE (FAT12_MAX_CLUSTER_SECTORS * DISK_SECTOR_SIZE)
+#define CLUSTER_SIZE (FAT12_SECTORS_PER_CLUSTER * DISK_SECTOR_SIZE)
 #define CAPACITY_FILE_COUNT 64u
 #define CAPACITY_MAX_FILE_CLUSTERS 96u
 #define CLI_INPUT_OVERFLOW (-1)
 #define CLI_INPUT_CANCELLED (-2)
+#define INPUT_POLL_US 100000
+#define FAULT_MAGIC 0x46415531u
 
 static floppy_t floppy;
 static f12_t fs;
 static f12_file_t owned_writer;
 static bool writer_owned;
-static const floppy_pins_t drive_pins = {
 #ifdef FLOPPY_ALT_PINS
-    .index = 16,
-    .track0 = 22,
-    .write_protect = 13,
-    .read_data = 26,
-    .disk_change = 28,
-    .drive_select = 14,
-    .motor_enable = 17,
-    .direction = 18,
-    .step = 19,
-    .write_data = 20,
-    .write_gate = 21,
-    .side_select = 27,
-    .density = 15,
+static const floppy_pins_t drive_pins = FLOPPY_PINS_ALT;
 #else
-    .index = 14,
-    .track0 = 5,
-    .write_protect = 4,
-    .read_data = 3,
-    .disk_change = 1,
-    .drive_select = 12,
-    .motor_enable = 10,
-    .direction = 9,
-    .step = 8,
-    .write_data = 7,
-    .write_gate = 6,
-    .side_select = 2,
-    .density = 15,
+static const floppy_pins_t drive_pins = FLOPPY_PINS_DEFAULT;
 #endif
-};
 
 static char cmd_buf[CMD_BUF_SIZE];
 static uint8_t io_buf[IO_BUF_SIZE];
 static uint8_t work_buf[WORK_BUF_SIZE];
+static track_t work_track;
+static floppy_pulse_t pulse_buf[PULSE_BATCH];
 
 typedef struct {
   uint32_t id;
@@ -116,6 +97,7 @@ static void cmd_crashcheck(int argc, char **argv);
 static void cmd_rpm(int argc, char **argv);
 static void cmd_test_full(int argc, char **argv);
 static void cmd_test_media(int argc, char **argv);
+static void cmd_test_fsck(int argc, char **argv);
 static void cmd_diskdump(int argc, char **argv);
 static void cmd_mfmscan(int argc, char **argv);
 static void cmd_reboot(int argc, char **argv);
@@ -154,6 +136,8 @@ static const cmd_entry_t commands[] = {
      "Run destructive hardware tests"},
     {"test-media", cmd_test_media, true, 1, 1, "",
      "Run interactive media-change tests"},
+    {"test-fsck", cmd_test_fsck, false, 1, 1, "",
+     "Run destructive filesystem repair tests"},
     {"crashtest", cmd_crashtest, false, 1, 1, "",
      "Prepare and loop for power-cut testing"},
     {"crashcheck", cmd_crashcheck, false, 1, 1, "", "Verify after a power cut"},
@@ -165,11 +149,64 @@ static const cmd_entry_t commands[] = {
 
 #define NUM_COMMANDS (sizeof(commands) / sizeof(commands[0]))
 
-static f12_err_t do_mount(void) { return f12_mount(&fs); }
+static void __attribute__((noreturn, used)) fault_record(const uint32_t *frame) {
+  watchdog_hw->scratch[0] = FAULT_MAGIC;
+  watchdog_hw->scratch[1] = frame[6];
+  watchdog_hw->scratch[2] = frame[5];
+  watchdog_hw->scratch[3] = frame[7];
+  watchdog_reboot(0, 0, 10);
+  for (;;) tight_loop_contents();
+}
 
-static bool writer_handle_gone(f12_err_t error) {
-  return error == F12_ERR_BAD_HANDLE || error == F12_ERR_MEDIA_CHANGED ||
-         error == F12_ERR_NOT_MOUNTED || error == F12_ERR_NOT_INITIALIZED;
+void __attribute__((naked)) isr_hardfault(void) {
+  __asm volatile(
+      "mrs r0, msp\n"
+      "ldr r1, 1f\n"
+      "bx r1\n"
+      ".align 2\n"
+      "1: .word fault_record\n");
+}
+
+static void print_reset_cause(void) {
+  printf("  reset:    ");
+#if defined(PICO_RP2040) && PICO_RP2040
+  uint32_t reset = vreg_and_chip_reset_hw->chip_reset;
+  if (reset & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_POR_BITS) printf(" power-on");
+  if (reset & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_RUN_BITS) printf(" run-pin");
+  if (reset & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_PSM_RESTART_BITS) printf(" debug");
+#else
+  uint32_t reset = powman_hw->chip_reset;
+  if (reset & POWMAN_CHIP_RESET_HAD_POR_BITS) printf(" power-on");
+  if (reset & POWMAN_CHIP_RESET_HAD_BOR_BITS) printf(" brownout");
+  if (reset & POWMAN_CHIP_RESET_HAD_RUN_LOW_BITS) printf(" run-pin");
+  if (reset & POWMAN_CHIP_RESET_HAD_DP_RESET_REQ_BITS) printf(" debug");
+  if (reset & POWMAN_CHIP_RESET_HAD_RESCUE_BITS) printf(" rescue");
+  if (reset & POWMAN_CHIP_RESET_HAD_GLITCH_DETECT_BITS) printf(" glitch");
+  if (reset & POWMAN_CHIP_RESET_HAD_HZD_SYS_RESET_REQ_BITS) printf(" hazard");
+  if (reset & POWMAN_CHIP_RESET_HAD_SWCORE_PD_BITS) printf(" core-power");
+  if (reset & (POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_RSM_BITS |
+               POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_SWCORE_BITS |
+               POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_POWMAN_BITS |
+               POWMAN_CHIP_RESET_HAD_WATCHDOG_RESET_POWMAN_ASYNC_BITS)) {
+    printf(" watchdog");
+  }
+#endif
+  if (watchdog_caused_reboot()) printf(" watchdog-reboot");
+  printf("\n");
+  if (watchdog_caused_reboot() && watchdog_hw->scratch[0] == FAULT_MAGIC) {
+    printf("  HARD FAULT in previous run: pc=%08lx lr=%08lx xpsr=%08lx\n",
+           (unsigned long)watchdog_hw->scratch[1],
+           (unsigned long)watchdog_hw->scratch[2],
+           (unsigned long)watchdog_hw->scratch[3]);
+    watchdog_hw->scratch[0] = 0;
+  }
+}
+
+static disk_err_t do_mount(void) { return f12_mount(&fs); }
+
+static bool writer_handle_gone(disk_err_t error) {
+  return error == DISK_ERR_BAD_HANDLE || error == DISK_ERR_MEDIA_CHANGED ||
+         error == DISK_ERR_NOT_MOUNTED || error == DISK_ERR_NOT_INITIALIZED;
 }
 
 static void writer_forget(void) {
@@ -177,15 +214,14 @@ static void writer_forget(void) {
   writer_owned = false;
 }
 
-static f12_err_t writer_commit(void) {
-  if (!writer_owned)
-    return F12_OK;
-  f12_err_t error = F12_OK;
+static disk_err_t writer_commit(void) {
+  if (!writer_owned) return DISK_OK;
+  disk_err_t error = DISK_OK;
   for (unsigned attempt = 0; attempt < WRITER_CLOSE_ATTEMPTS; attempt++) {
     error = f12_close(&owned_writer);
-    if (error == F12_OK) {
+    if (error == DISK_OK) {
       writer_forget();
-      return F12_OK;
+      return DISK_OK;
     }
     if (writer_handle_gone(error)) {
       writer_forget();
@@ -195,100 +231,108 @@ static f12_err_t writer_commit(void) {
   return error;
 }
 
-static f12_err_t writer_abort(void) {
-  if (!writer_owned)
-    return F12_OK;
-  f12_err_t error = f12_abort(&owned_writer);
-  if (error == F12_OK || writer_handle_gone(error))
-    writer_forget();
+static disk_err_t writer_abort(void) {
+  if (!writer_owned) return DISK_OK;
+  disk_err_t error = f12_abort(&owned_writer);
+  if (error == DISK_OK || writer_handle_gone(error)) writer_forget();
   return error;
 }
 
-static f12_err_t writer_open(const char *name) {
-  f12_err_t error = writer_commit();
-  if (error != F12_OK)
-    return error;
+static disk_err_t writer_open(const char *name) {
+  disk_err_t error = writer_commit();
+  if (error != DISK_OK) return error;
   error = f12_open(&fs, name, F12_OPEN_WRITE, &owned_writer);
-  writer_owned = error == F12_OK;
+  writer_owned = error == DISK_OK;
   return error;
 }
 
-static f12_err_t unmount_filesystem(void) {
-  f12_err_t error = writer_commit();
-  if (error != F12_OK)
-    return error;
+static disk_err_t unmount_filesystem(void) {
+  disk_err_t error = writer_commit();
+  if (error != DISK_OK) return error;
   bool mounted;
   error = f12_is_mounted(&fs, &mounted);
-  if (error != F12_OK)
-    return error;
-  return mounted ? f12_unmount(&fs) : F12_OK;
+  if (error != DISK_OK) return error;
+  return mounted ? f12_unmount(&fs) : DISK_OK;
 }
 
-static f12_result_t f12_write_full(f12_file_t *file, const void *buf,
-                                   uint32_t len) {
-  f12_result_t total = {.error = F12_OK, .count = 0};
+static disk_result_t f12_write_full(f12_file_t *file, const void *buf,
+                                    uint32_t len) {
+  disk_result_t total = {.error = DISK_OK, .count = 0};
   while (total.count < len) {
     uint32_t chunk = len - (uint32_t)total.count;
-    if (chunk > DISK_SECTOR_SIZE)
-      chunk = DISK_SECTOR_SIZE;
-    f12_result_t result =
+    if (chunk > DISK_SECTOR_SIZE) chunk = DISK_SECTOR_SIZE;
+    disk_result_t result =
         f12_write(file, (const uint8_t *)buf + total.count, chunk);
     if (result.count > chunk) {
-      total.error = F12_ERR_IO;
+      total.error = DISK_ERR_IO;
       return total;
     }
     total.count += result.count;
-    if (result.error != F12_OK) {
+    if (result.error != DISK_OK) {
       total.error = result.error;
       return total;
     }
     if (result.count == 0) {
-      total.error = F12_ERR_IO;
+      total.error = DISK_ERR_IO;
       return total;
     }
   }
   return total;
 }
 
-static f12_result_t f12_read_full(f12_file_t *file, void *buf,
-                                  uint32_t capacity) {
-  f12_result_t total = {.error = F12_OK, .count = 0};
+static disk_result_t f12_read_full(f12_file_t *file, void *buf,
+                                   uint32_t capacity) {
+  disk_result_t total = {.error = DISK_OK, .count = 0};
   while (total.count < capacity) {
     size_t remaining = (size_t)capacity - total.count;
     size_t chunk = remaining < DISK_SECTOR_SIZE ? remaining : DISK_SECTOR_SIZE;
-    f12_result_t result = f12_read(file, (uint8_t *)buf + total.count, chunk);
+    disk_result_t result = f12_read(file, (uint8_t *)buf + total.count, chunk);
     if (result.count > chunk) {
-      total.error = F12_ERR_IO;
+      total.error = DISK_ERR_IO;
       return total;
     }
     total.count += result.count;
-    if (result.error == F12_END)
-      return total;
-    if (result.error != F12_OK) {
+    if (result.error == DISK_END) return total;
+    if (result.error != DISK_OK) {
       total.error = result.error;
       return total;
     }
     if (result.count == 0) {
-      total.error = F12_ERR_IO;
+      total.error = DISK_ERR_IO;
       return total;
     }
   }
   return total;
 }
 
-static bool text_equal_case(const char *left, const char *right);
+static unsigned char ascii_fold(unsigned char value) {
+  if (value >= (unsigned char)'A' && value <= (unsigned char)'Z') {
+    return (unsigned char)(value + ((unsigned char)'a' - (unsigned char)'A'));
+  }
+  return value;
+}
+
+static bool text_equal_case(const char *left, const char *right) {
+  if (!left || !right) return false;
+  while (*left != '\0' && *right != '\0') {
+    if (ascii_fold((unsigned char)*left) != ascii_fold((unsigned char)*right)) {
+      return false;
+    }
+    left++;
+    right++;
+  }
+  return *left == *right;
+}
 
 static bool canonical_name(const char *input, char output[13]) {
   fat12_name_t name;
-  if (fat12_name_parse(input, &name) != FAT12_OK)
-    return false;
+  if (fat12_name_parse(input, &name) != DISK_OK) return false;
   size_t pos = 0;
   for (size_t i = 0; i < sizeof(name.name) && name.name[i] != ' '; i++) {
     output[pos++] = name.name[i];
   }
   size_t ext = 0;
-  while (ext < sizeof(name.ext) && name.ext[ext] != ' ')
-    ext++;
+  while (ext < sizeof(name.ext) && name.ext[ext] != ' ') ext++;
   if (ext != 0) {
     output[pos++] = '.';
     memcpy(output + pos, name.ext, ext);
@@ -306,13 +350,10 @@ static bool resolve_name(const char *input, char output[13]) {
 
 static void print_prompt(void) {
   bool mounted;
-  f12_err_t error = f12_is_mounted(&fs, &mounted);
-  if (error != F12_OK)
-    printf("[??]> ");
-  else if (mounted)
-    printf("[A:]> ");
-  else
-    printf("[--]> ");
+  disk_err_t error = f12_is_mounted(&fs, &mounted);
+  if (error != DISK_OK) printf("[??]> ");
+  else if (mounted) printf("[A:]> ");
+  else printf("[--]> ");
 }
 
 static int cli_readline(char buf[static CMD_BUF_SIZE]) {
@@ -321,9 +362,9 @@ static int cli_readline(char buf[static CMD_BUF_SIZE]) {
   memset(buf, 0, CMD_BUF_SIZE);
 
   for (;;) {
-    int c = getchar();
-    if (c == EOF) {
-      tight_loop_contents();
+    int c = getchar_timeout_us(INPUT_POLL_US);
+    if (c == PICO_ERROR_TIMEOUT) {
+      floppy_poll(&floppy);
       continue;
     }
 
@@ -353,9 +394,7 @@ static int cli_readline(char buf[static CMD_BUF_SIZE]) {
     }
 
     if (c == 8 || c == 127) {
-      if (overflow) {
-        continue;
-      } else if (pos > 0) {
+      if (!overflow && pos > 0) {
         printf("\b \b");
         pos--;
       }
@@ -390,32 +429,24 @@ static bool cli_confirm(void) {
 static int tokenize(char *buf, char **argv, int max_args) {
   int argc = 0;
   char *p = buf;
-
   while (*p) {
-    while (*p == ' ' || *p == '\t')
-      p++;
-    if (*p == '\0')
-      break;
-    if (argc == max_args)
-      return -1;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') break;
+    if (argc == max_args) return -1;
     argv[argc++] = p;
-    while (*p && *p != ' ' && *p != '\t')
-      p++;
-    if (*p)
-      *p++ = '\0';
+    while (*p && *p != ' ' && *p != '\t') p++;
+    if (*p) *p++ = '\0';
   }
   return argc;
 }
 
 static bool parse_u32(const char *text, uint32_t minimum, uint32_t maximum,
                       uint32_t *value) {
-  if (!text || !*text || !value || minimum > maximum)
-    return false;
+  if (!text || !*text || !value || minimum > maximum) return false;
   uint32_t parsed = 0;
   for (const unsigned char *cursor = (const unsigned char *)text;
        *cursor != '\0'; cursor++) {
-    if (*cursor < (unsigned char)'0' || *cursor > (unsigned char)'9')
-      return false;
+    if (*cursor < (unsigned char)'0' || *cursor > (unsigned char)'9') return false;
     uint32_t digit = (uint32_t)(*cursor - (unsigned char)'0');
     if (parsed > maximum / 10u ||
         (parsed == maximum / 10u && digit > maximum % 10u)) {
@@ -423,36 +454,14 @@ static bool parse_u32(const char *text, uint32_t minimum, uint32_t maximum,
     }
     parsed = parsed * 10u + digit;
   }
-  if (parsed < minimum)
-    return false;
+  if (parsed < minimum) return false;
   *value = parsed;
   return true;
 }
 
-static unsigned char ascii_fold(unsigned char value) {
-  if (value >= (unsigned char)'A' && value <= (unsigned char)'Z') {
-    return (unsigned char)(value + ((unsigned char)'a' - (unsigned char)'A'));
-  }
-  return value;
-}
-
-static bool text_equal_case(const char *left, const char *right) {
-  if (!left || !right)
-    return false;
-  while (*left != '\0' && *right != '\0') {
-    if (ascii_fold((unsigned char)*left) != ascii_fold((unsigned char)*right)) {
-      return false;
-    }
-    left++;
-    right++;
-  }
-  return *left == *right;
-}
-
 static const cmd_entry_t *find_command(const char *name) {
   for (unsigned i = 0; i < NUM_COMMANDS; i++) {
-    if (text_equal_case(name, commands[i].name))
-      return &commands[i];
+    if (text_equal_case(name, commands[i].name)) return &commands[i];
   }
   return NULL;
 }
@@ -460,6 +469,20 @@ static const cmd_entry_t *find_command(const char *name) {
 static void print_usage(const cmd_entry_t *command) {
   printf("Usage: %s%s%s\n", command->name,
          command->syntax[0] == '\0' ? "" : " ", command->syntax);
+}
+
+static void hexdump_row(uint32_t offset, const uint8_t *data, size_t count) {
+  printf("  %08lX: ", (unsigned long)offset);
+  for (size_t i = 0; i < 16u; i++) {
+    if (i < count) printf("%02X ", (unsigned)data[i]);
+    else printf("   ");
+    if (i == 7) printf(" ");
+  }
+  printf(" |");
+  for (size_t i = 0; i < count; i++) {
+    putchar((data[i] >= 32 && data[i] < 127) ? data[i] : '.');
+  }
+  printf("|\n");
 }
 
 typedef struct {
@@ -487,53 +510,15 @@ typedef struct {
 
 static diskdump_stats_t run_diskdump(bool verbose);
 
-static const char *block_status_text(block_status_t status) {
-  switch (status) {
-  case BLOCK_OK:
-    return "success";
-  case BLOCK_ERR_INVALID:
-    return "invalid state or argument";
-  case BLOCK_ERR_BUSY:
-    return "busy";
-  case BLOCK_ERR_TIMEOUT:
-    return "timeout";
-  case BLOCK_ERR_CRC:
-    return "CRC error";
-  case BLOCK_ERR_WRONG_TRACK:
-    return "wrong track";
-  case BLOCK_ERR_WRONG_SIDE:
-    return "wrong side";
-  case BLOCK_ERR_NO_TRACK0:
-    return "track zero unavailable";
-  case BLOCK_ERR_MEDIA_CHANGED:
-    return "media changed";
-  case BLOCK_ERR_WRITE_PROTECTED:
-    return "write protected";
-  case BLOCK_ERR_UNDERRUN:
-    return "underrun";
-  case BLOCK_ERR_OVERRUN:
-    return "overrun";
-  case BLOCK_ERR_VERIFY:
-    return "verification failed";
-  case BLOCK_ERR_CORRUPT:
-    return "corrupt data";
-  case BLOCK_ERR_IO:
-    return "I/O error";
-  }
-  return "unknown error";
-}
-
-static bool drive_status(const char *operation, block_status_t status) {
-  if (status == BLOCK_OK)
-    return true;
-  printf("%s failed: %s\n", operation, block_status_text(status));
+static bool drive_status(const char *operation, disk_err_t status) {
+  if (status == DISK_OK) return true;
+  printf("%s failed: %s\n", operation, disk_strerror(status));
   return false;
 }
 
 static bool drive_idle(void) {
   bool idle = drive_status("Motor stop", floppy_motor_off(&floppy));
-  if (!drive_status("Drive deselect", floppy_select(&floppy, false)))
-    idle = false;
+  if (!drive_status("Drive deselect", floppy_select(&floppy, false))) idle = false;
   return idle;
 }
 
@@ -542,8 +527,22 @@ static bool drive_generation(uint32_t *generation) {
                       floppy_media_generation(&floppy, generation));
 }
 
+static disk_err_t read_track(uint8_t cylinder, uint8_t head, uint32_t generation) {
+  work_track.cylinder = cylinder;
+  work_track.head = head;
+  return floppy_read_track(&floppy, generation, &work_track);
+}
+
+static unsigned track_sectors(const track_t *track) {
+  unsigned count = 0;
+  for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
+    if (track_has(track, sector)) count++;
+  }
+  return count;
+}
+
 static void print_drive_stats(const floppy_stats_t *s) {
-  printf("  Sector reads:  %lu\n", s->reads);
+  printf("  Track reads:   %lu\n", s->reads);
   printf("  Flux words:    %lu\n", s->flux_words);
   printf("  Track writes:  %lu (DMA)\n", s->dma_writes);
   printf("  Read retries:  %lu attempts, %lu recovered, %lu failed\n",
@@ -568,41 +567,29 @@ static void cmd_dma(int argc, char **argv) {
     printf("Head must be 0 through %u.\n", DISK_HEADS - 1u);
     return;
   }
-  if (!drive_status("Statistics reset", floppy_stats_reset(&floppy)))
-    return;
+  if (!drive_status("Statistics reset", floppy_stats_reset(&floppy))) return;
   uint32_t generation;
-  if (!drive_generation(&generation))
-    return;
-  track_t track = {.cylinder = (uint8_t)cylinder, .head = (uint8_t)head};
-  block_status_t status = floppy_read_track(&floppy, generation, &track);
+  if (!drive_generation(&generation)) return;
+  disk_err_t status = read_track((uint8_t)cylinder, (uint8_t)head, generation);
   printf("  Track C%luH%lu read: %s\n", (unsigned long)cylinder,
-         (unsigned long)head, block_status_text(status));
-  if (status == BLOCK_OK) {
-    unsigned recovered = 0;
-    for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++)
-      if (track_has(&track, sector))
-        recovered++;
-    printf("  Sectors:       %u/%u recovered\n", recovered,
-           DISK_SECTORS_PER_TRACK);
-  }
+         (unsigned long)head, disk_strerror(status));
+  printf("  Sectors:       %u/%u recovered\n", track_sectors(&work_track),
+         DISK_SECTORS_PER_TRACK);
   floppy_stats_t stats;
-  if (drive_status("Statistics", floppy_stats(&floppy, &stats)))
+  if (drive_status("Statistics", floppy_stats(&floppy, &stats))) {
     print_drive_stats(&stats);
+  }
   drive_idle();
 }
 
-static void read_track_stats(int track, int side, track_stats_t *stats) {
+static void read_track_stats(uint8_t track, uint8_t side, track_stats_t *stats) {
   memset(stats, 0, sizeof(*stats));
 
-  if (!drive_status("Seek", floppy_seek(&floppy, (uint8_t)track)))
-    return;
-  if (!drive_status("Side select", floppy_side_select(&floppy, (uint8_t)side)))
-    return;
+  if (!drive_status("Seek", floppy_seek(&floppy, track))) return;
+  if (!drive_status("Side select", floppy_side_select(&floppy, side))) return;
   uint32_t generation;
-  if (!drive_generation(&generation))
-    return;
-  if (!drive_status("Flux capture", floppy_flux_begin(&floppy, generation)))
-    return;
+  if (!drive_generation(&generation)) return;
+  if (!drive_status("Flux capture", floppy_flux_begin(&floppy, generation))) return;
 
   mfm_t mfm;
   mfm_init(&mfm);
@@ -611,48 +598,40 @@ static void read_track_stats(int track, int side, track_stats_t *stats) {
   bool ix_primed = false;
   mfm_sector_t sector;
   int ix_edges = 0;
+  uint32_t oversized = 0;
 
   while (ix_edges < 6) {
-    uint16_t delta;
-    bool ix;
-    block_status_t status = floppy_flux_next(&floppy, &delta, &ix);
-    if (status != BLOCK_OK) {
-      drive_status("Flux read", status);
-      break;
-    }
-
-    if (ix_primed && ix != ix_prev)
-      ix_edges++;
-    ix_prev = ix;
-    ix_primed = true;
-
-    if (delta > 0 && delta < PULSE_BINS) {
-      stats->histogram[delta]++;
-    }
-    stats->total_pulses++;
-
-    if (delta < MFM_PULSE_FLOOR || delta >= MFM_PULSE_CEILING) {
-      stats->invalid_count++;
-    } else if (delta <= mfm.T2_max) {
-      stats->short_count++;
-    } else if (delta <= mfm.T3_max) {
-      stats->medium_count++;
-    } else {
-      stats->long_count++;
-    }
-
-    if (mfm_feed(&mfm, delta, &sector) &&
-        sector.sector < DISK_SECTORS_PER_TRACK) {
-      uint8_t idx = sector.sector;
-      if (!stats->seen[idx]) {
-        stats->seen[idx] = true;
+    disk_result_t result = floppy_flux_read(&floppy, pulse_buf, PULSE_BATCH);
+    for (size_t i = 0; i < result.count && ix_edges < 6; i++) {
+      const floppy_pulse_t *pulse = &pulse_buf[i];
+      if (ix_primed && pulse->index != ix_prev) ix_edges++;
+      ix_prev = pulse->index;
+      ix_primed = true;
+      if (pulse->delta < PULSE_BINS) stats->histogram[pulse->delta]++;
+      else oversized++;
+      stats->total_pulses++;
+      if (mfm_feed(&mfm, pulse->delta, &sector) &&
+          sector.sector < DISK_SECTORS_PER_TRACK && !stats->seen[sector.sector]) {
+        stats->seen[sector.sector] = true;
         stats->unique_sectors++;
       }
+    }
+    if (result.error != DISK_OK) {
+      drive_status("Flux read", result.error);
+      break;
     }
   }
 
   drive_status("Flux stop", floppy_flux_end(&floppy));
 
+  for (unsigned bin = 0; bin < PULSE_BINS; bin++) {
+    uint32_t count = stats->histogram[bin];
+    if (bin < MFM_PULSE_FLOOR || bin >= MFM_PULSE_CEILING) stats->invalid_count += count;
+    else if (bin <= mfm.T2_max) stats->short_count += count;
+    else if (bin <= mfm.T3_max) stats->medium_count += count;
+    else stats->long_count += count;
+  }
+  stats->invalid_count += oversized;
   stats->T2_max = mfm.T2_max;
   stats->T3_max = mfm.T3_max;
   stats->syncs = mfm.syncs_found;
@@ -660,31 +639,50 @@ static void read_track_stats(int track, int side, track_stats_t *stats) {
   stats->crc_errors = mfm.crc_errors;
 }
 
-static void print_histogram(track_stats_t *stats) {
+static void print_histogram(const track_stats_t *stats) {
   uint32_t peak = 0;
   for (int i = 0; i < PULSE_BINS; i++) {
-    if (stats->histogram[i] > peak)
-      peak = stats->histogram[i];
+    if (stats->histogram[i] > peak) peak = stats->histogram[i];
   }
-  if (peak == 0)
-    return;
+  if (peak == 0) return;
 
-  int first = 0, last = PULSE_BINS - 1;
-  while (first < PULSE_BINS && stats->histogram[first] == 0)
-    first++;
-  while (last > first && stats->histogram[last] == 0)
-    last--;
+  int first = 0;
+  int last = PULSE_BINS - 1;
+  while (first < PULSE_BINS && stats->histogram[first] == 0) first++;
+  while (last > first && stats->histogram[last] == 0) last--;
 
   printf("  Pulse Distribution (delta ticks):\n");
   for (int i = first; i <= last; i++) {
-    if (stats->histogram[i] == 0)
-      continue;
+    if (stats->histogram[i] == 0) continue;
     uint32_t bar = (stats->histogram[i] * 50u) / peak;
     printf("  %3d: %6lu |", i, stats->histogram[i]);
-    for (uint32_t j = 0; j < bar; j++)
-      printf("#");
+    for (uint32_t j = 0; j < bar; j++) printf("#");
     printf("\n");
   }
+}
+
+static double percent(uint32_t part, uint32_t total) {
+  return total ? part * 100.0 / total : 0.0;
+}
+
+static void print_track_stats(const track_stats_t *stats, const char *indent) {
+  printf("%sPulses:   %lu total\n", indent, stats->total_pulses);
+  printf("%sShort:    %lu (%.1f%%)\n", indent, stats->short_count,
+         percent(stats->short_count, stats->total_pulses));
+  printf("%sMedium:   %lu (%.1f%%)\n", indent, stats->medium_count,
+         percent(stats->medium_count, stats->total_pulses));
+  printf("%sLong:     %lu (%.1f%%)\n", indent, stats->long_count,
+         percent(stats->long_count, stats->total_pulses));
+  printf("%sInvalid:  %lu (%.1f%%)\n", indent, stats->invalid_count,
+         percent(stats->invalid_count, stats->total_pulses));
+  printf("%sSyncs:    %lu\n", indent, stats->syncs);
+  printf("%sRecords:  %lu\n", indent, stats->sector_records);
+  printf("%sUnique:   %lu / %u\n", indent, stats->unique_sectors,
+         DISK_SECTORS_PER_TRACK);
+  printf("%sCRC err:  %lu\n", indent, stats->crc_errors);
+  printf("%sAdaptive: T2_max=%u  T3_max=%u\n", indent, stats->T2_max,
+         stats->T3_max);
+  print_histogram(stats);
 }
 
 static uint8_t gen_pattern_byte(uint32_t file_id, uint32_t offset) {
@@ -693,117 +691,133 @@ static uint8_t gen_pattern_byte(uint32_t file_id, uint32_t offset) {
 }
 
 static uint32_t checksum_extend(uint32_t sum, const uint8_t *buf, size_t len) {
-  for (size_t i = 0; i < len; i++) {
-    sum = (sum << 5) + sum + buf[i];
-  }
+  for (size_t i = 0; i < len; i++) sum = (sum << 5) + sum + buf[i];
   return sum;
 }
 
-static void fill_pattern_range(uint8_t *buf, uint32_t file_id, uint32_t offset,
-                               uint32_t size) {
-  for (uint32_t i = 0; i < size; i++) {
-    buf[i] = gen_pattern_byte(file_id, offset + i);
-  }
+typedef void (*fill_fn_t)(const void *ctx, uint8_t *buf, uint32_t offset,
+                          uint32_t size);
+
+static void fill_pattern(const void *ctx, uint8_t *buf, uint32_t offset,
+                         uint32_t size) {
+  uint32_t file_id = *(const uint32_t *)ctx;
+  for (uint32_t i = 0; i < size; i++) buf[i] = gen_pattern_byte(file_id, offset + i);
 }
 
-static bool write_pattern_file_chunked(const char *name, uint32_t file_id,
-                                       uint32_t size, uint32_t chunk_size,
-                                       uint32_t *written_out,
-                                       f12_err_t *close_err_out) {
-  if (chunk_size == 0 || chunk_size > WORK_BUF_SIZE) {
-    chunk_size = WORK_BUF_SIZE;
-  }
+static void fill_blob(const void *ctx, uint8_t *buf, uint32_t offset,
+                      uint32_t size) {
+  memcpy(buf, (const uint8_t *)ctx + offset, size);
+}
 
-  f12_err_t open_error = writer_open(name);
-  if (open_error != F12_OK) {
-    if (written_out)
-      *written_out = 0;
-    if (close_err_out)
-      *close_err_out = open_error;
+static bool write_file(const char *name, fill_fn_t fill, const void *ctx,
+                       uint32_t size, uint32_t chunk_size, uint32_t *written_out,
+                       disk_err_t *close_err_out) {
+  if (chunk_size == 0 || chunk_size > WORK_BUF_SIZE) chunk_size = WORK_BUF_SIZE;
+  uint32_t written = 0;
+  disk_err_t error = writer_open(name);
+  if (error == DISK_OK) {
+    while (written < size) {
+      uint32_t chunk = size - written;
+      if (chunk > chunk_size) chunk = chunk_size;
+      fill(ctx, work_buf, written, chunk);
+      disk_result_t result = f12_write_full(&owned_writer, work_buf, chunk);
+      written += (uint32_t)result.count;
+      if (result.error != DISK_OK || result.count != chunk) {
+        disk_err_t abort_error = writer_abort();
+        error = abort_error != DISK_OK ? abort_error
+                : result.error != DISK_OK ? result.error
+                                          : DISK_ERR_IO;
+        break;
+      }
+    }
+    if (error == DISK_OK) error = writer_commit();
+  }
+  if (written_out) *written_out = written;
+  if (close_err_out) *close_err_out = error;
+  return error == DISK_OK;
+}
+
+static bool write_pattern_file(const char *name, uint32_t file_id, uint32_t size,
+                               uint32_t chunk_size, uint32_t *written_out,
+                               disk_err_t *close_err_out) {
+  return write_file(name, fill_pattern, &file_id, size, chunk_size, written_out,
+                    close_err_out);
+}
+
+static bool write_blob_file(const char *name, const void *buf, uint32_t size,
+                            uint32_t chunk_size, uint32_t *written_out,
+                            disk_err_t *close_err_out) {
+  return write_file(name, fill_blob, buf, size, chunk_size, written_out,
+                    close_err_out);
+}
+
+static bool verify_file(const char *name, fill_fn_t fill, const void *ctx,
+                        uint32_t size, uint32_t chunk_size) {
+  if (chunk_size == 0 || chunk_size > VERIFY_CHUNK_MAX) chunk_size = VERIFY_CHUNK_MAX;
+  f12_stat_t stat;
+  disk_err_t error = f12_stat(&fs, name, &stat);
+  if (error != DISK_OK) {
+    printf("  %s: stat failed: %s\n", name, disk_strerror(error));
     return false;
   }
-
-  uint32_t written = 0;
-  while (written < size) {
-    uint32_t chunk = size - written;
-    if (chunk > chunk_size)
-      chunk = chunk_size;
-    fill_pattern_range(work_buf, file_id, written, chunk);
-
-    f12_result_t result = f12_write_full(&owned_writer, work_buf, chunk);
-    written += (uint32_t)result.count;
-    if (result.error != F12_OK || result.count != chunk) {
-      f12_err_t abort_error = writer_abort();
-      if (written_out)
-        *written_out = written;
-      if (close_err_out) {
-        *close_err_out =
-            abort_error == F12_OK
-                ? (result.error == F12_OK ? F12_ERR_IO : result.error)
-                : abort_error;
-      }
-      return false;
-    }
-  }
-
-  if (written_out)
-    *written_out = written;
-  f12_err_t close_error = writer_commit();
-  if (close_err_out)
-    *close_err_out = close_error;
-  return close_error == F12_OK;
-}
-
-static bool verify_pattern_file_chunked(const char *name, uint32_t file_id,
-                                        uint32_t size, uint32_t chunk_size,
-                                        uint32_t *read_out) {
-  if (chunk_size == 0 || chunk_size > WORK_BUF_SIZE) {
-    chunk_size = WORK_BUF_SIZE;
-  }
-
-  f12_stat_t stat;
-  if (f12_stat(&fs, name, &stat) != F12_OK || stat.size != size) {
-    if (read_out)
-      *read_out = 0;
+  if (stat.size != size) {
+    printf("  %s: size %lu, expected %lu\n", name, (unsigned long)stat.size,
+           (unsigned long)size);
     return false;
   }
   f12_file_t file;
-  if (f12_open(&fs, name, F12_OPEN_READ, &file) != F12_OK) {
-    if (read_out)
-      *read_out = 0;
+  error = f12_open(&fs, name, F12_OPEN_READ, &file);
+  if (error != DISK_OK) {
+    printf("  %s: open failed: %s\n", name, disk_strerror(error));
     return false;
   }
 
   bool ok = true;
   uint32_t total = 0;
-  while (total < size) {
+  uint8_t *expected = work_buf + VERIFY_CHUNK_MAX;
+  while (ok && total < size) {
     uint32_t chunk = size - total;
-    if (chunk > chunk_size)
-      chunk = chunk_size;
-
-    f12_result_t result = f12_read(&file, work_buf, chunk);
-    if (result.count > chunk || result.error != F12_OK || result.count == 0) {
+    if (chunk > chunk_size) chunk = chunk_size;
+    disk_result_t result = f12_read(&file, work_buf, chunk);
+    if (result.count > chunk || result.error != DISK_OK || result.count == 0) {
+      printf("  %s: read failed at offset %lu: %s (%lu bytes)\n", name,
+             (unsigned long)total, disk_strerror(result.error),
+             (unsigned long)result.count);
       ok = false;
       break;
     }
-
+    fill(ctx, expected, total, (uint32_t)result.count);
     for (size_t i = 0; i < result.count; i++) {
-      if (work_buf[i] != gen_pattern_byte(file_id, total + (uint32_t)i)) {
-        ok = false;
-        break;
-      }
-    }
-    if (!ok)
+      if (work_buf[i] == expected[i]) continue;
+      printf("  %s: mismatch at offset %lu: read %02X, expected %02X\n", name,
+             (unsigned long)(total + i), (unsigned)work_buf[i],
+             (unsigned)expected[i]);
+      ok = false;
       break;
-
+    }
     total += (uint32_t)result.count;
   }
-
-  if (read_out)
-    *read_out = total;
-  if (f12_close(&file) != F12_OK)
+  error = f12_close(&file);
+  if (error != DISK_OK) {
+    printf("  %s: close failed: %s\n", name, disk_strerror(error));
     ok = false;
+  }
   return ok && total == size;
+}
+
+static bool verify_pattern_file(const char *name, uint32_t file_id, uint32_t size,
+                                uint32_t chunk_size) {
+  return verify_file(name, fill_pattern, &file_id, size, chunk_size);
+}
+
+static bool read_file_exact(const char *name, void *buf, uint32_t size) {
+  f12_stat_t stat;
+  if (f12_stat(&fs, name, &stat) != DISK_OK || stat.size != size) return false;
+  f12_file_t file;
+  if (f12_open(&fs, name, F12_OPEN_READ, &file) != DISK_OK) return false;
+  disk_result_t result = f12_read_full(&file, buf, size);
+  bool closed = f12_close(&file) == DISK_OK;
+  return closed && result.error == DISK_OK && result.count == size;
 }
 
 static uint32_t capacity_random(uint32_t *state) {
@@ -813,12 +827,10 @@ static uint32_t capacity_random(uint32_t *state) {
 
 static uint32_t capacity_partition(uint32_t *state, uint32_t clusters,
                                    uint32_t files) {
-  if (files == 1u)
-    return clusters;
+  if (files == 1u) return clusters;
   uint32_t available = clusters - (files - 1u);
   uint32_t limit = available;
-  if (limit > CAPACITY_MAX_FILE_CLUSTERS)
-    limit = CAPACITY_MAX_FILE_CLUSTERS;
+  if (limit > CAPACITY_MAX_FILE_CLUSTERS) limit = CAPACITY_MAX_FILE_CLUSTERS;
   return 1u + capacity_random(state) % limit;
 }
 
@@ -831,39 +843,32 @@ static void capacity_name(const capacity_file_t *file, uint32_t number,
   snprintf(name, 13, "%c%07lu.BIN", file->prefix, (unsigned long)number);
 }
 
-static void capacity_prepare(capacity_file_t *file, char prefix,
-                             uint32_t clusters, uint32_t *state) {
+static bool capacity_write(capacity_file_t *file, char prefix, uint32_t number,
+                           uint32_t clusters, uint32_t *state) {
   file->prefix = prefix;
   file->id = capacity_random(state);
   file->size = (clusters - 1u) * CLUSTER_SIZE + 1u +
                capacity_random(state) % CLUSTER_SIZE;
   file->chunk = 1u + capacity_random(state) % WORK_BUF_SIZE;
-}
-
-static bool capacity_write(capacity_file_t *file, char prefix, uint32_t number,
-                           uint32_t clusters, uint32_t *state) {
-  capacity_prepare(file, prefix, clusters, state);
   char name[13];
   capacity_name(file, number, name);
   uint32_t written = 0;
-  f12_err_t close_error = F12_OK;
-  bool ok = write_pattern_file_chunked(name, file->id, file->size, file->chunk,
-                                       &written, &close_error);
-  if (!ok && writer_owned)
-    writer_abort();
-  return ok && written == file->size && close_error == F12_OK;
+  disk_err_t close_error = DISK_OK;
+  bool ok = write_pattern_file(name, file->id, file->size, file->chunk,
+                               &written, &close_error);
+  if (!ok && writer_owned) writer_abort();
+  return ok && written == file->size && close_error == DISK_OK;
 }
 
 static bool capacity_verify(void) {
+  uint32_t failures = 0;
   for (uint32_t i = 0; i < CAPACITY_FILE_COUNT; i++) {
     const capacity_file_t *file = &capacity_files[i];
     char name[13];
     capacity_name(file, i, name);
-    if (!verify_pattern_file_chunked(name, file->id, file->size, file->chunk,
-                                     NULL))
-      return false;
+    if (!verify_pattern_file(name, file->id, file->size, file->chunk)) failures++;
   }
-  return true;
+  return failures == 0;
 }
 
 #define CRASH_STATE_FILE "CRASH.STA"
@@ -888,76 +893,6 @@ typedef struct {
 } crash_state_t;
 
 _Static_assert(sizeof(crash_state_t) == DISK_SECTOR_SIZE, "crash_state_t size");
-
-static bool write_blob_file(const char *name, const void *buf, uint32_t size,
-                            uint32_t chunk_size, uint32_t *written_out,
-                            f12_err_t *close_err_out) {
-  if (chunk_size == 0 || chunk_size > WORK_BUF_SIZE) {
-    chunk_size = WORK_BUF_SIZE;
-  }
-
-  f12_err_t open_error = writer_open(name);
-  if (open_error != F12_OK) {
-    if (written_out)
-      *written_out = 0;
-    if (close_err_out)
-      *close_err_out = open_error;
-    return false;
-  }
-
-  uint32_t written = 0;
-  while (written < size) {
-    uint32_t chunk = size - written;
-    if (chunk > chunk_size)
-      chunk = chunk_size;
-
-    f12_result_t result =
-        f12_write_full(&owned_writer, (const uint8_t *)buf + written, chunk);
-    written += (uint32_t)result.count;
-    if (result.error != F12_OK || result.count != chunk) {
-      f12_err_t abort_error = writer_abort();
-      if (written_out)
-        *written_out = written;
-      if (close_err_out) {
-        *close_err_out =
-            abort_error == F12_OK
-                ? (result.error == F12_OK ? F12_ERR_IO : result.error)
-                : abort_error;
-      }
-      return false;
-    }
-  }
-
-  if (written_out)
-    *written_out = written;
-  f12_err_t close_error = writer_commit();
-  if (close_err_out)
-    *close_err_out = close_error;
-  return close_error == F12_OK;
-}
-
-static bool read_blob_file(const char *name, void *buf, uint32_t size,
-                           uint32_t *read_out) {
-  f12_stat_t stat;
-  if (f12_stat(&fs, name, &stat) != F12_OK || stat.size != size) {
-    if (read_out)
-      *read_out = 0;
-    return false;
-  }
-  f12_file_t file;
-  if (f12_open(&fs, name, F12_OPEN_READ, &file) != F12_OK) {
-    if (read_out)
-      *read_out = 0;
-    return false;
-  }
-
-  f12_result_t result = f12_read_full(&file, buf, size);
-  bool ok = result.error == F12_OK && f12_close(&file) == F12_OK;
-
-  if (read_out)
-    *read_out = (uint32_t)result.count;
-  return ok && result.count == size;
-}
 
 static uint32_t crash_state_checksum(const crash_state_t *state) {
   const uint8_t *data = (const uint8_t *)state;
@@ -987,19 +922,15 @@ static bool crash_state_valid(const crash_state_t *state) {
 static bool crash_state_store(crash_state_t *state) {
   state->checksum = crash_state_checksum(state);
   uint32_t written = 0;
-  f12_err_t close_err = F12_OK;
+  disk_err_t close_err = DISK_OK;
   return write_blob_file(CRASH_STATE_FILE, state, sizeof(*state), 37, &written,
                          &close_err) &&
-         written == sizeof(*state) && close_err == F12_OK;
+         written == sizeof(*state) && close_err == DISK_OK;
 }
 
 static bool crash_state_load(crash_state_t *state) {
-  uint32_t got = 0;
-  if (!read_blob_file(CRASH_STATE_FILE, state, sizeof(*state), &got)) {
-    return false;
-  }
-
-  return got == sizeof(*state) && crash_state_valid(state);
+  return read_file_exact(CRASH_STATE_FILE, state, sizeof(*state)) &&
+         crash_state_valid(state);
 }
 
 static void cmd_help(int argc, char **argv) {
@@ -1019,41 +950,36 @@ static void cmd_ls(int argc, char **argv) {
   f12_dir_t dir;
   f12_stat_t st;
 
-  f12_err_t err = f12_opendir(&fs, "/", &dir);
-  if (err != F12_OK) {
-    printf("Error: %s\n", f12_strerror(err));
+  disk_err_t err = f12_opendir(&fs, "/", &dir);
+  if (err != DISK_OK) {
+    printf("Error: %s\n", disk_strerror(err));
     return;
   }
 
   int count = 0;
   uint32_t total_bytes = 0;
-  f12_err_t read_error;
-  while ((read_error = f12_readdir(&dir, &st)) == F12_OK) {
-    if ((st.attr & FAT12_ATTR_DIRECTORY) != 0)
-      printf("  %-12s    <DIR>\n", st.name);
-    else
-      printf("  %-12s %8lu\n", st.name, st.size);
+  disk_err_t read_error;
+  while ((read_error = f12_readdir(&dir, &st)) == DISK_OK) {
+    if ((st.attr & FAT12_ATTR_DIRECTORY) != 0) printf("  %-12s    <DIR>\n", st.name);
+    else printf("  %-12s %8lu\n", st.name, st.size);
     total_bytes += st.size;
     count++;
   }
-  f12_err_t close_error = f12_closedir(&dir);
-  if (read_error != F12_END) {
-    printf("Error: %s\n", f12_strerror(read_error));
+  disk_err_t close_error = f12_closedir(&dir);
+  if (read_error != DISK_END) {
+    printf("Error: %s\n", disk_strerror(read_error));
     return;
   }
-  if (close_error != F12_OK) {
-    printf("Error: %s\n", f12_strerror(close_error));
+  if (close_error != DISK_OK) {
+    printf("Error: %s\n", disk_strerror(close_error));
     return;
   }
-
-  if (count == 0) {
-    printf("  (empty)\n");
-  }
+  if (count == 0) printf("  (empty)\n");
 
   uint16_t free_cl;
-  f12_err_t error = f12_free_count(&fs, &free_cl);
-  if (error != F12_OK) {
-    printf("Free-space query failed: %s\n", f12_strerror(error));
+  disk_err_t error = f12_free_count(&fs, &free_cl);
+  if (error != DISK_OK) {
+    printf("Free-space query failed: %s\n", disk_strerror(error));
     return;
   }
   uint32_t free_bytes = (uint32_t)free_cl * CLUSTER_SIZE;
@@ -1067,34 +993,30 @@ static void cmd_cat(int argc, char **argv) {
   if (!resolve_name(argv[1], name)) return;
 
   f12_file_t file;
-  f12_err_t error = f12_open(&fs, name, F12_OPEN_READ, &file);
-  if (error != F12_OK) {
-    printf("Error: %s\n", f12_strerror(error));
+  disk_err_t error = f12_open(&fs, name, F12_OPEN_READ, &file);
+  if (error != DISK_OK) {
+    printf("Error: %s\n", disk_strerror(error));
     return;
   }
 
   int total = 0;
   for (;;) {
-    f12_result_t result = f12_read(&file, io_buf, IO_BUF_SIZE);
+    disk_result_t result = f12_read(&file, io_buf, IO_BUF_SIZE);
     if (result.count > IO_BUF_SIZE) {
       printf("\nRead error: invalid transfer count\n");
       break;
     }
-    for (size_t i = 0; i < result.count; i++) {
-      putchar(io_buf[i]);
-    }
+    for (size_t i = 0; i < result.count; i++) putchar(io_buf[i]);
     total += (int)result.count;
-    if (result.error == F12_END)
-      break;
-    if (result.error != F12_OK) {
-      printf("\nRead error: %s\n", f12_strerror(result.error));
+    if (result.error == DISK_END) break;
+    if (result.error != DISK_OK) {
+      printf("\nRead error: %s\n", disk_strerror(result.error));
       break;
     }
   }
   printf("\n(%d bytes)\n", total);
   error = f12_close(&file);
-  if (error != F12_OK)
-    printf("Close error: %s\n", f12_strerror(error));
+  if (error != DISK_OK) printf("Close error: %s\n", disk_strerror(error));
 }
 
 static void cmd_hexdump(int argc, char **argv) {
@@ -1103,48 +1025,41 @@ static void cmd_hexdump(int argc, char **argv) {
   if (!resolve_name(argv[1], name)) return;
 
   f12_file_t file;
-  f12_err_t error = f12_open(&fs, name, F12_OPEN_READ, &file);
-  if (error != F12_OK) {
-    printf("Error: %s\n", f12_strerror(error));
+  disk_err_t error = f12_open(&fs, name, F12_OPEN_READ, &file);
+  if (error != DISK_OK) {
+    printf("Error: %s\n", disk_strerror(error));
     return;
   }
 
   uint32_t offset = 0;
   for (;;) {
-    f12_result_t result = f12_read(&file, io_buf, 16);
+    disk_result_t result = f12_read(&file, io_buf, 16);
     if (result.count > 16u) {
       printf("Read error: invalid transfer count\n");
       break;
     }
-    size_t n = result.count;
-    if (n == 0 && result.error == F12_END)
-      break;
-    if (result.error != F12_OK && result.error != F12_END) {
-      printf("Read error: %s\n", f12_strerror(result.error));
+    if (result.count == 0 && result.error == DISK_END) break;
+    if (result.error != DISK_OK && result.error != DISK_END) {
+      printf("Read error: %s\n", disk_strerror(result.error));
       break;
     }
-    printf("  %08lX: ", offset);
-    for (size_t i = 0; i < 16u; i++) {
-      if (i < n)
-        printf("%02X ", (unsigned)io_buf[i]);
-      else
-        printf("   ");
-      if (i == 7)
-        printf(" ");
-    }
-    printf(" |");
-    for (size_t i = 0; i < n; i++) {
-      putchar((io_buf[i] >= 32 && io_buf[i] < 127) ? io_buf[i] : '.');
-    }
-    printf("|\n");
-    offset += (uint32_t)n;
-    if (result.error == F12_END)
-      break;
+    hexdump_row(offset, io_buf, result.count);
+    offset += (uint32_t)result.count;
+    if (result.error == DISK_END) break;
   }
   printf("  %lu bytes\n", offset);
   error = f12_close(&file);
-  if (error != F12_OK)
-    printf("Close error: %s\n", f12_strerror(error));
+  if (error != DISK_OK) printf("Close error: %s\n", disk_strerror(error));
+}
+
+static void report_write_failure(const char *what, disk_err_t error) {
+  disk_err_t abort_error = writer_abort();
+  printf("%s\n", what);
+  if (error != DISK_OK) printf("  cause: %s\n", disk_strerror(error));
+  if (abort_error != DISK_OK) {
+    printf("Abort failed and writer remains retained: %s\n",
+           disk_strerror(abort_error));
+  }
 }
 
 static void cmd_write(int argc, char **argv) {
@@ -1152,9 +1067,9 @@ static void cmd_write(int argc, char **argv) {
   char name[13];
   if (!resolve_name(argv[1], name)) return;
 
-  f12_err_t error = writer_open(name);
-  if (error != F12_OK) {
-    printf("Error: %s\n", f12_strerror(error));
+  disk_err_t error = writer_open(name);
+  if (error != DISK_OK) {
+    printf("Error: %s\n", disk_strerror(error));
     return;
   }
 
@@ -1164,46 +1079,30 @@ static void cmd_write(int argc, char **argv) {
   for (;;) {
     int line_length = cli_readline(line);
     if (line_length == CLI_INPUT_CANCELLED) {
-      f12_err_t abort_error = writer_abort();
-      printf("Write cancelled.\n");
-      if (abort_error != F12_OK) {
-        printf("Abort failed and writer remains retained: %s\n",
-               f12_strerror(abort_error));
-      }
+      report_write_failure("Write cancelled.", DISK_OK);
       return;
     }
     if (line_length == CLI_INPUT_OVERFLOW) {
-      f12_err_t abort_error = writer_abort();
-      printf("Input line too long; write aborted.\n");
-      if (abort_error != F12_OK) {
-        printf("Abort failed and writer remains retained: %s\n",
-               f12_strerror(abort_error));
-      }
+      report_write_failure("Input line too long; write aborted.", DISK_OK);
       return;
     }
-    if (strcmp(line, ".") == 0)
-      break;
+    if (strcmp(line, ".") == 0) break;
 
     uint32_t requested = (uint32_t)line_length + 1u;
     line[line_length] = '\n';
-    f12_result_t result = f12_write_full(&owned_writer, line, requested);
+    disk_result_t result = f12_write_full(&owned_writer, line, requested);
     total += (uint32_t)result.count;
-    if (result.error != F12_OK || result.count != requested) {
-      f12_err_t abort_error = writer_abort();
-      printf("Write failed after %lu bytes: %s\n", (unsigned long)total,
-             f12_strerror(result.error == F12_OK ? F12_ERR_IO : result.error));
-      if (abort_error != F12_OK) {
-        printf("Abort failed and writer remains retained: %s\n",
-               f12_strerror(abort_error));
-      }
+    if (result.error != DISK_OK || result.count != requested) {
+      printf("Write failed after %lu bytes.\n", (unsigned long)total);
+      report_write_failure("Write aborted.",
+                           result.error == DISK_OK ? DISK_ERR_IO : result.error);
       return;
     }
   }
 
   error = writer_commit();
-  if (error != F12_OK) {
-    printf("Commit failed and writer remains retained: %s\n",
-           f12_strerror(error));
+  if (error != DISK_OK) {
+    printf("Commit failed and writer remains retained: %s\n", disk_strerror(error));
     return;
   }
   printf("Wrote %lu bytes to %s\n", (unsigned long)total, name);
@@ -1216,87 +1115,79 @@ static void cmd_commit(int argc, char **argv) {
     printf("No pending commit.\n");
     return;
   }
-  f12_err_t error = writer_commit();
-  if (error == F12_OK)
-    printf("Commit complete.\n");
-  else
-    printf("Commit failed and remains retained: %s\n", f12_strerror(error));
+  disk_err_t error = writer_commit();
+  if (error == DISK_OK) printf("Commit complete.\n");
+  else printf("Commit failed and remains retained: %s\n", disk_strerror(error));
 }
 
 static void cmd_rm(int argc, char **argv) {
   (void)argc;
   char name[13];
   if (!resolve_name(argv[1], name)) return;
-
-  f12_err_t err = f12_delete(&fs, name);
-  if (err != F12_OK)
-    printf("Error: %s\n", f12_strerror(err));
-  else
-    printf("Deleted %s\n", name);
+  disk_err_t err = f12_delete(&fs, name);
+  if (err != DISK_OK) printf("Error: %s\n", disk_strerror(err));
+  else printf("Deleted %s\n", name);
 }
 
 static void cmd_cp(int argc, char **argv) {
   (void)argc;
-  char src[13], dst[13];
+  char src[13];
+  char dst[13];
   if (!canonical_name(argv[1], src) || !canonical_name(argv[2], dst)) {
     printf("Source and destination must be valid 8.3 filenames.\n");
     return;
   }
 
   f12_file_t reader;
-  f12_err_t error = f12_open(&fs, src, F12_OPEN_READ, &reader);
-  if (error != F12_OK) {
-    printf("Error opening %s: %s\n", src, f12_strerror(error));
+  disk_err_t error = f12_open(&fs, src, F12_OPEN_READ, &reader);
+  if (error != DISK_OK) {
+    printf("Error opening %s: %s\n", src, disk_strerror(error));
     return;
   }
 
   error = writer_open(dst);
-  if (error != F12_OK) {
-    printf("Error creating %s: %s\n", dst, f12_strerror(error));
-    f12_err_t read_close = f12_close(&reader);
-    if (read_close != F12_OK)
-      printf("Reader close failed: %s\n", f12_strerror(read_close));
+  if (error != DISK_OK) {
+    printf("Error creating %s: %s\n", dst, disk_strerror(error));
+    disk_err_t read_close = f12_close(&reader);
+    if (read_close != DISK_OK) {
+      printf("Reader close failed: %s\n", disk_strerror(read_close));
+    }
     return;
   }
 
   uint32_t total = 0;
-  f12_err_t copy_error = F12_OK;
+  disk_err_t copy_error = DISK_OK;
   for (;;) {
-    f12_result_t read_result = f12_read(&reader, io_buf, IO_BUF_SIZE);
+    disk_result_t read_result = f12_read(&reader, io_buf, IO_BUF_SIZE);
     if (read_result.count > IO_BUF_SIZE) {
-      copy_error = F12_ERR_IO;
+      copy_error = DISK_ERR_IO;
       break;
     }
     if (read_result.count != 0) {
-      f12_result_t write_result =
+      disk_result_t write_result =
           f12_write_full(&owned_writer, io_buf, (uint32_t)read_result.count);
       total += (uint32_t)write_result.count;
-      if (write_result.error != F12_OK ||
+      if (write_result.error != DISK_OK ||
           write_result.count != read_result.count) {
         copy_error =
-            write_result.error == F12_OK ? F12_ERR_IO : write_result.error;
+            write_result.error == DISK_OK ? DISK_ERR_IO : write_result.error;
         break;
       }
     }
-    if (read_result.error == F12_END)
-      break;
-    if (read_result.error != F12_OK) {
+    if (read_result.error == DISK_END) break;
+    if (read_result.error != DISK_OK) {
       copy_error = read_result.error;
       break;
     }
   }
 
-  f12_err_t read_close = f12_close(&reader);
-  if (copy_error == F12_OK && read_close != F12_OK)
-    copy_error = read_close;
-  f12_err_t write_close =
-      copy_error == F12_OK ? writer_commit() : writer_abort();
-  if (write_close != F12_OK)
-    copy_error = write_close;
-  if (copy_error != F12_OK) {
-    printf("Copy error after %lu bytes: %s\n", total, f12_strerror(copy_error));
-    if (writer_owned)
-      printf("Commit retained; run 'commit' to retry.\n");
+  disk_err_t read_close = f12_close(&reader);
+  if (copy_error == DISK_OK && read_close != DISK_OK) copy_error = read_close;
+  disk_err_t write_close = copy_error == DISK_OK ? writer_commit() : writer_abort();
+  if (write_close != DISK_OK) copy_error = write_close;
+  if (copy_error != DISK_OK) {
+    printf("Copy error after %lu bytes: %s\n", total, disk_strerror(copy_error));
+    if (writer_owned) printf("Commit retained; run 'commit' to retry.\n");
     return;
   }
   printf("Copied %lu bytes: %s -> %s\n", total, src, dst);
@@ -1304,15 +1195,15 @@ static void cmd_cp(int argc, char **argv) {
 
 static void cmd_mv(int argc, char **argv) {
   (void)argc;
-  char src[13], dst[13];
+  char src[13];
+  char dst[13];
   if (!canonical_name(argv[1], src) || !canonical_name(argv[2], dst)) {
     printf("Source and destination must be valid 8.3 filenames.\n");
     return;
   }
-
-  f12_err_t err = f12_rename(&fs, src, dst);
-  if (err != F12_OK) {
-    printf("Error: %s\n", f12_strerror(err));
+  disk_err_t err = f12_rename(&fs, src, dst);
+  if (err != DISK_OK) {
+    printf("Error: %s\n", disk_strerror(err));
     return;
   }
   printf("Renamed %s -> %s\n", src, dst);
@@ -1324,27 +1215,21 @@ static void cmd_stat(int argc, char **argv) {
   if (!resolve_name(argv[1], name)) return;
 
   f12_stat_t st;
-  f12_err_t err = f12_stat(&fs, name, &st);
-  if (err != F12_OK) {
-    printf("Error: %s\n", f12_strerror(err));
+  disk_err_t err = f12_stat(&fs, name, &st);
+  if (err != DISK_OK) {
+    printf("Error: %s\n", disk_strerror(err));
     return;
   }
 
   printf("  Name:   %s\n", st.name);
   printf("  Size:   %lu bytes\n", st.size);
   printf("  Attr:   0x%02X", st.attr);
-  if (st.attr & FAT12_ATTR_READ_ONLY)
-    printf(" RO");
-  if (st.attr & FAT12_ATTR_HIDDEN)
-    printf(" HID");
-  if (st.attr & FAT12_ATTR_SYSTEM)
-    printf(" SYS");
-  if (st.attr & FAT12_ATTR_VOLUME_ID)
-    printf(" VOL");
-  if (st.attr & FAT12_ATTR_DIRECTORY)
-    printf(" DIR");
-  if (st.attr & FAT12_ATTR_ARCHIVE)
-    printf(" ARC");
+  if (st.attr & FAT12_ATTR_READ_ONLY) printf(" RO");
+  if (st.attr & FAT12_ATTR_HIDDEN) printf(" HID");
+  if (st.attr & FAT12_ATTR_SYSTEM) printf(" SYS");
+  if (st.attr & FAT12_ATTR_VOLUME_ID) printf(" VOL");
+  if (st.attr & FAT12_ATTR_DIRECTORY) printf(" DIR");
+  if (st.attr & FAT12_ATTR_ARCHIVE) printf(" ARC");
   printf("\n");
 }
 
@@ -1358,7 +1243,7 @@ static void format_progress(void *ctx, uint8_t cyl, uint8_t side, uint16_t done,
   }
 }
 
-static f12_err_t do_format(const char *label, bool full) {
+static disk_err_t do_format(const char *label, bool full) {
   return f12_format(&fs, (f12_format_options_t){
                              .label = label,
                              .mode = full ? F12_FORMAT_FULL : F12_FORMAT_QUICK,
@@ -1372,11 +1257,8 @@ static void cmd_format(int argc, char **argv) {
   bool full = false;
 
   if (argc == 2) {
-    if (text_equal_case(argv[1], "full")) {
-      full = true;
-    } else {
-      label = argv[1];
-    }
+    if (text_equal_case(argv[1], "full")) full = true;
+    else label = argv[1];
   } else if (argc == 3) {
     if (!text_equal_case(argv[2], "full")) {
       printf("Format mode must be 'full'.\n");
@@ -1387,35 +1269,24 @@ static void cmd_format(int argc, char **argv) {
   }
 
   printf("Format disk as \"%s\" (%s)? [y/N] ", label, full ? "full" : "quick");
+  if (!cli_confirm()) return;
 
-  if (!cli_confirm())
-    return;
-
-  f12_err_t err = unmount_filesystem();
-  if (err != F12_OK) {
-    printf("Unmount failed: %s\n", f12_strerror(err));
+  disk_err_t err = unmount_filesystem();
+  if (err != DISK_OK) {
+    printf("Unmount failed: %s\n", disk_strerror(err));
     return;
   }
 
   err = do_format(label, full);
-  if (err != F12_OK) {
-    printf("Format error: %s\n", f12_strerror(err));
+  if (err != DISK_OK) {
+    printf("Format error: %s\n", disk_strerror(err));
     return;
   }
   printf("Format complete.\n");
 
   err = do_mount();
-  if (err == F12_OK) {
-    printf("Mounted.\n");
-  } else {
-    printf("Mount error: %s\n", f12_strerror(err));
-  }
-}
-
-static bool fsck_dirty(const fat12_fsck_t *r) {
-  return r->lost_clusters || r->crosslinked || r->loops || r->broken_chains ||
-         r->size_mismatches || r->truncated_files || r->duplicate_names ||
-         r->fat_mismatch || r->fat_ambiguous || r->incomplete;
+  if (err == DISK_OK) printf("Mounted.\n");
+  else printf("Mount error: %s\n", disk_strerror(err));
 }
 
 static void print_fsck_report(const fat12_fsck_t *r) {
@@ -1438,16 +1309,10 @@ static void print_fsck_report(const fat12_fsck_t *r) {
            (unsigned long)r->fat2_score,
            r->repaired_fat1 || r->repaired_fat2 ? ", repaired" : "");
   }
-  if (r->removed_directories)
-    printf("  Removed dirs:  %u\n", r->removed_directories);
-  if (r->removed_duplicates)
-    printf("  Removed dupes: %u\n", r->removed_duplicates);
-  if (r->freed_tails)
-    printf("  Freed tails:   %u\n", r->freed_tails);
-  if (r->freed)
-    printf("  Freed:         %u clusters\n", r->freed);
-  if (r->incomplete)
-    printf("  Scan:          incomplete\n");
+  if (r->removed_directories) printf("  Removed dirs:  %u\n", r->removed_directories);
+  if (r->removed_duplicates) printf("  Removed dupes: %u\n", r->removed_duplicates);
+  if (r->freed_tails) printf("  Freed tails:   %u\n", r->freed_tails);
+  if (r->freed) printf("  Freed:         %u clusters\n", r->freed);
 }
 
 static void cmd_fsck(int argc, char **argv) {
@@ -1458,9 +1323,9 @@ static void cmd_fsck(int argc, char **argv) {
   }
 
   fat12_fsck_t report;
-  f12_err_t err = f12_fsck(&fs, &report, fix);
-  if (err != F12_OK) {
-    printf("Error: %s\n", f12_strerror(err));
+  disk_err_t err = f12_fsck(&fs, &report, fix);
+  if (err != DISK_OK) {
+    printf("Error: %s\n", disk_strerror(err));
     return;
   }
 
@@ -1469,17 +1334,17 @@ static void cmd_fsck(int argc, char **argv) {
   if (fix) {
     fat12_fsck_t verification;
     err = f12_fsck(&fs, &verification, false);
-    if (err != F12_OK) {
-      printf("  Verification failed: %s\n", f12_strerror(err));
+    if (err != DISK_OK) {
+      printf("  Verification failed: %s\n", disk_strerror(err));
       return;
     }
-    if (fsck_dirty(&verification)) {
+    if (!fat12_fsck_clean(&verification)) {
       printf("  Result: repair did not converge\n");
       print_fsck_report(&verification);
       return;
     }
     printf("  Result: repaired and verified clean\n");
-  } else if (fsck_dirty(&report)) {
+  } else if (!fat12_fsck_clean(&report)) {
     printf("  Result: DIRTY -- run 'fsck fix' to repair\n");
   } else {
     printf("  Result: clean\n");
@@ -1489,25 +1354,24 @@ static void cmd_fsck(int argc, char **argv) {
 static void cmd_mount(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  f12_err_t err = unmount_filesystem();
-  if (err != F12_OK) {
-    printf("Unmount failed: %s\n", f12_strerror(err));
+  disk_err_t err = unmount_filesystem();
+  if (err != DISK_OK) {
+    printf("Unmount failed: %s\n", disk_strerror(err));
     return;
   }
 
   err = do_mount();
-  if (err != F12_OK) {
-    printf("Mount error: %s\n", f12_strerror(err));
+  if (err != DISK_OK) {
+    printf("Mount error: %s\n", disk_strerror(err));
     return;
   }
-
   printf("Mounted.\n");
 
   fat12_fsck_t report;
-  f12_err_t check_error = f12_fsck(&fs, &report, false);
-  if (check_error != F12_OK) {
-    printf("Filesystem check failed: %s\n", f12_strerror(check_error));
-  } else if (fsck_dirty(&report)) {
+  disk_err_t check_error = f12_fsck(&fs, &report, false);
+  if (check_error != DISK_OK) {
+    printf("Filesystem check failed: %s\n", disk_strerror(check_error));
+  } else if (!fat12_fsck_clean(&report)) {
     printf("WARNING: filesystem is not clean. Run 'fsck' for details.\n");
   }
 }
@@ -1516,25 +1380,23 @@ static void cmd_unmount(int argc, char **argv) {
   (void)argc;
   (void)argv;
   bool mounted;
-  f12_err_t error = f12_is_mounted(&fs, &mounted);
-  if (error != F12_OK) {
-    printf("Filesystem state check failed: %s\n", f12_strerror(error));
+  disk_err_t error = f12_is_mounted(&fs, &mounted);
+  if (error != DISK_OK) {
+    printf("Filesystem state check failed: %s\n", disk_strerror(error));
     return;
   }
   if (!mounted) {
     if (writer_owned) {
       error = writer_commit();
-      if (error != F12_OK)
-        printf("Pending commit failed: %s\n", f12_strerror(error));
+      if (error != DISK_OK) printf("Pending commit failed: %s\n", disk_strerror(error));
     }
     printf("Not mounted.\n");
     return;
   }
   error = writer_commit();
-  if (error == F12_OK)
-    error = f12_unmount(&fs);
-  if (error != F12_OK) {
-    printf("Unmount failed: %s\n", f12_strerror(error));
+  if (error == DISK_OK) error = f12_unmount(&fs);
+  if (error != DISK_OK) {
+    printf("Unmount failed: %s\n", disk_strerror(error));
     return;
   }
   printf("Unmounted.\n");
@@ -1547,26 +1409,29 @@ static void cmd_status(int argc, char **argv) {
   bool changed;
   bool at_track0;
   uint8_t cylinder;
+  disk_err_t track_status = floppy_current_track(&floppy, &cylinder);
   if (!drive_status("Write-protect query",
                     floppy_write_protected(&floppy, &write_protected)) ||
       !drive_status("Media-change query",
                     floppy_disk_changed(&floppy, &changed)) ||
-      !drive_status("Track query", floppy_current_track(&floppy, &cylinder)) ||
-      !drive_status("Track-zero query",
-                    floppy_at_track0(&floppy, &at_track0))) {
+      (track_status != DISK_ERR_NO_TRACK0 &&
+       !drive_status("Track query", track_status)) ||
+      !drive_status("Track-zero query", floppy_at_track0(&floppy, &at_track0))) {
     return;
   }
   printf("  Drive:\n");
   printf("    Write protected: %s\n", write_protected ? "YES" : "no");
   printf("    Disk changed:    %s\n", changed ? "YES" : "no");
-  printf("    Current track:   %u\n", cylinder);
-  printf("    At track 0:      %s\n", at_track0 ? "yes" : "no");
+  if (track_status == DISK_OK) printf("    Current track:   %u\n", cylinder);
+  else printf("    Current track:   unknown until homed\n");
+  if (floppy.selected) printf("    At track 0:      %s\n", at_track0 ? "yes" : "no");
+  else printf("    At track 0:      unknown while deselected\n");
   printf("    Pending commit:  %s\n", writer_owned ? "YES" : "no");
 
   bool mounted;
-  f12_err_t mount_error = f12_is_mounted(&fs, &mounted);
-  if (mount_error != F12_OK) {
-    printf("  Filesystem state: %s\n", f12_strerror(mount_error));
+  disk_err_t mount_error = f12_is_mounted(&fs, &mounted);
+  if (mount_error != DISK_OK) {
+    printf("  Filesystem state: %s\n", disk_strerror(mount_error));
     return;
   }
   if (!mounted) {
@@ -1576,7 +1441,7 @@ static void cmd_status(int argc, char **argv) {
 
   printf("  Geometry:\n");
   printf("    Bytes/sector:     %u\n", DISK_SECTOR_SIZE);
-  printf("    Sectors/cluster:  %u\n", FAT12_MAX_CLUSTER_SECTORS);
+  printf("    Sectors/cluster:  %u\n", FAT12_SECTORS_PER_CLUSTER);
   printf("    Reserved sectors: %u\n", FAT12_RESERVED_SECTORS);
   printf("    FATs:             %u\n", FAT12_NUM_FATS);
   printf("    Root entries:     %u\n", FAT12_ROOT_ENTRIES);
@@ -1587,9 +1452,9 @@ static void cmd_status(int argc, char **argv) {
   printf("    Heads:            %u\n", DISK_HEADS);
 
   uint16_t free_cl;
-  f12_err_t error = f12_free_count(&fs, &free_cl);
-  if (error != F12_OK) {
-    printf("  Free-space query failed: %s\n", f12_strerror(error));
+  disk_err_t error = f12_free_count(&fs, &free_cl);
+  if (error != DISK_OK) {
+    printf("  Free-space query failed: %s\n", disk_strerror(error));
     return;
   }
   uint32_t free_bytes = (uint32_t)free_cl * CLUSTER_SIZE;
@@ -1599,13 +1464,9 @@ static void cmd_status(int argc, char **argv) {
 static void cmd_motor(int argc, char **argv) {
   (void)argc;
   if (text_equal_case(argv[1], "on")) {
-    if (drive_status("Motor start", floppy_motor_on(&floppy))) {
-      printf("Motor ON\n");
-    }
+    if (drive_status("Motor start", floppy_motor_on(&floppy))) printf("Motor ON\n");
   } else if (text_equal_case(argv[1], "off")) {
-    if (drive_status("Motor stop", floppy_motor_off(&floppy))) {
-      printf("Motor off\n");
-    }
+    if (drive_status("Motor stop", floppy_motor_off(&floppy))) printf("Motor off\n");
   } else {
     printf("Motor state must be 'on' or 'off'.\n");
   }
@@ -1630,12 +1491,9 @@ static void cmd_home(int argc, char **argv) {
   (void)argc;
   (void)argv;
   printf("Seeking to track 0...\n");
-  block_status_t st = floppy_seek(&floppy, 0);
-  if (!drive_status("Seek", st))
-    return;
+  if (!drive_status("Seek", floppy_seek(&floppy, 0))) return;
   bool active;
-  if (!drive_status("Track-zero query", floppy_at_track0(&floppy, &active)))
-    return;
+  if (!drive_status("Track-zero query", floppy_at_track0(&floppy, &active))) return;
   printf("At track 0 (TRK0 pin: %s)\n", active ? "active" : "NOT active");
 }
 
@@ -1679,8 +1537,7 @@ static void cmd_poll(int argc, char **argv) {
   (void)argv;
 
   printf("  Starting motor and selecting drive...\n");
-  if (!drive_status("Drive select", floppy_select(&floppy, true)))
-    return;
+  if (!drive_status("Drive select", floppy_select(&floppy, true))) return;
   if (!drive_status("Motor start", floppy_motor_on(&floppy))) {
     drive_status("Drive deselect", floppy_select(&floppy, false));
     return;
@@ -1714,8 +1571,7 @@ static void cmd_poll(int argc, char **argv) {
          transitions);
   printf("  index transitions:     %d  (expect about 20 at 300 RPM)\n",
          ix_transitions);
-  if (transitions == 0)
-    printf("  No activity on read_data -- check wiring or disk.\n");
+  if (transitions == 0) printf("  No activity on read_data -- check wiring or disk.\n");
   drive_idle();
 }
 
@@ -1727,33 +1583,34 @@ static void cmd_flux(int argc, char **argv) {
   }
 
   printf("  Reading %lu raw flux transitions...\n", (unsigned long)count);
-  printf("  read_data=GP%u  index=GP%u\n", drive_pins.read_data,
-         drive_pins.index);
+  printf("  read_data=GP%u  index=GP%u\n", drive_pins.read_data, drive_pins.index);
 
   uint32_t generation;
   if (!drive_generation(&generation) ||
-      !drive_status("Flux capture", floppy_flux_begin(&floppy, generation)))
+      !drive_status("Flux capture", floppy_flux_begin(&floppy, generation))) {
     return;
+  }
 
-  for (uint32_t i = 0; i < count; i++) {
-    uint16_t delta;
-    bool ix;
-    block_status_t status = floppy_flux_next(&floppy, &delta, &ix);
-    if (status != BLOCK_OK) {
-      printf("  Capture stopped after %lu transitions: %s.\n", (unsigned long)i,
-             block_status_text(status));
+  for (uint32_t printed = 0; printed < count;) {
+    size_t want = count - printed < PULSE_BATCH ? count - printed : PULSE_BATCH;
+    disk_result_t result = floppy_flux_read(&floppy, pulse_buf, want);
+    for (size_t i = 0; i < result.count; i++) {
+      printf("  %4lu: delta=%3u  ix=%d\n", (unsigned long)(printed + i),
+             pulse_buf[i].delta, pulse_buf[i].index);
+    }
+    printed += (uint32_t)result.count;
+    if (result.error != DISK_OK) {
+      printf("  Capture stopped after %lu transitions: %s.\n", (unsigned long)printed,
+             disk_strerror(result.error));
       printf("  Check: disk inserted? read_data wiring? motor spinning?\n");
       printf("  Current read_data (GP%u) = %d\n", drive_pins.read_data,
              gpio_get(drive_pins.read_data));
       drive_status("Flux stop", floppy_flux_end(&floppy));
       return;
     }
-
-    printf("  %4lu: delta=%3u  ix=%d\n", (unsigned long)i, delta, ix);
   }
 
-  if (!drive_status("Flux stop", floppy_flux_end(&floppy)))
-    return;
+  if (!drive_status("Flux stop", floppy_flux_end(&floppy))) return;
   printf("  Done.\n");
 }
 
@@ -1764,9 +1621,9 @@ static void cmd_seek(int argc, char **argv) {
     printf("Cylinder must be 0 through %u.\n", DISK_CYLINDERS - 1u);
     return;
   }
-  block_status_t st = floppy_seek(&floppy, (uint8_t)cylinder);
-  if (drive_status("Seek", st))
+  if (drive_status("Seek", floppy_seek(&floppy, (uint8_t)cylinder))) {
     printf("Head at cylinder %lu\n", (unsigned long)cylinder);
+  }
 }
 
 static void cmd_dump(int argc, char **argv) {
@@ -1789,36 +1646,21 @@ static void cmd_dump(int argc, char **argv) {
     sec_end = sec_start;
   }
 
-  uint8_t sector[DISK_SECTOR_SIZE];
   uint32_t generation;
-  if (!drive_generation(&generation))
-    return;
-  for (uint32_t sector_number = sec_start; sector_number <= sec_end;
-       sector_number++) {
-    block_status_t st = floppy_read_sector(
-        &floppy, generation, (uint8_t)cylinder, (uint8_t)head,
-        (uint8_t)(sector_number - 1u), sector);
-    printf("  --- C%lu/H%lu/S%lu %s ---\n", (unsigned long)cylinder,
-           (unsigned long)head, (unsigned long)sector_number,
-           block_status_text(st));
-
-    if (st != BLOCK_OK)
+  if (!drive_generation(&generation)) return;
+  disk_err_t status = read_track((uint8_t)cylinder, (uint8_t)head, generation);
+  printf("  --- C%lu/H%lu %s, %u/%u sectors ---\n", (unsigned long)cylinder,
+         (unsigned long)head, disk_strerror(status), track_sectors(&work_track),
+         DISK_SECTORS_PER_TRACK);
+  for (uint32_t number = sec_start; number <= sec_end; number++) {
+    uint8_t sector = (uint8_t)(number - 1u);
+    if (!track_has(&work_track, sector)) {
+      printf("  --- S%lu missing ---\n", (unsigned long)number);
       continue;
-
-    for (int row = 0; row < 32; row++) {
-      int off = row * 16;
-      printf("  %03X: ", off);
-      for (int i = 0; i < 16; i++) {
-        printf("%02X ", sector[off + i]);
-        if (i == 7)
-          printf(" ");
-      }
-      printf(" |");
-      for (int i = 0; i < 16; i++) {
-        uint8_t c = sector[off + i];
-        putchar((c >= 32 && c < 127) ? c : '.');
-      }
-      printf("|\n");
+    }
+    printf("  --- S%lu ---\n", (unsigned long)number);
+    for (uint32_t row = 0; row < DISK_SECTOR_SIZE; row += 16u) {
+      hexdump_row(row, work_track.data[sector] + row, 16u);
     }
   }
 }
@@ -1837,29 +1679,8 @@ static void cmd_mfm(int argc, char **argv) {
   printf("  Analyzing cylinder %lu head %lu...\n", (unsigned long)cylinder,
          (unsigned long)head);
   track_stats_t stats;
-  read_track_stats((int)cylinder, (int)head, &stats);
-
-  printf("  Pulses:   %lu total\n", stats.total_pulses);
-  printf("  Short:    %lu (%.1f%%)\n", stats.short_count,
-         stats.total_pulses ? stats.short_count * 100.0 / stats.total_pulses
-                            : 0);
-  printf("  Medium:   %lu (%.1f%%)\n", stats.medium_count,
-         stats.total_pulses ? stats.medium_count * 100.0 / stats.total_pulses
-                            : 0);
-  printf("  Long:     %lu (%.1f%%)\n", stats.long_count,
-         stats.total_pulses ? stats.long_count * 100.0 / stats.total_pulses
-                            : 0);
-  printf("  Invalid:  %lu (%.1f%%)\n", stats.invalid_count,
-         stats.total_pulses ? stats.invalid_count * 100.0 / stats.total_pulses
-                            : 0);
-  printf("  Syncs:    %lu\n", stats.syncs);
-  printf("  Records:  %lu\n", stats.sector_records);
-  printf("  Unique:   %lu / %d\n", stats.unique_sectors,
-         DISK_SECTORS_PER_TRACK);
-  printf("  CRC err:  %lu\n", stats.crc_errors);
-  printf("  Adaptive: T2_max=%d  T3_max=%d\n", stats.T2_max, stats.T3_max);
-
-  print_histogram(&stats);
+  read_track_stats((uint8_t)cylinder, (uint8_t)head, &stats);
+  print_track_stats(&stats, "  ");
 }
 
 static void check(bool cond, const char *tag, int *pass, int *fail) {
@@ -1872,31 +1693,27 @@ static void check(bool cond, const char *tag, int *pass, int *fail) {
   }
 }
 
-static bool read_file_exact(const char *name, uint8_t *buf, uint32_t expected) {
-  f12_stat_t stat;
-  if (f12_stat(&fs, name, &stat) != F12_OK || stat.size != expected)
-    return false;
-  f12_file_t file;
-  if (f12_open(&fs, name, F12_OPEN_READ, &file) != F12_OK)
-    return false;
-  f12_result_t result = f12_read_full(&file, buf, expected);
-  bool close_ok = f12_close(&file) == F12_OK;
-  return close_ok && result.error == F12_OK && result.count == expected;
+static void check_status(disk_err_t status, const char *tag, int *pass, int *fail) {
+  if (status == DISK_OK) {
+    check(true, tag, pass, fail);
+    return;
+  }
+  printf("  FAIL: %s: %s\n", tag, disk_strerror(status));
+  (*fail)++;
 }
 
-static void mfm_health_check(int track, int side, const char *label, int *pass,
-                             int *fail) {
+static void mfm_health_check(uint8_t track, uint8_t side, const char *label,
+                             int *pass, int *fail) {
   track_stats_t stats;
   read_track_stats(track, side, &stats);
 
-  printf("  %s T%d/S%d: unique=%lu/%d records=%lu crc=%lu invalid=%lu/%lu\n",
+  printf("  %s T%u/S%u: unique=%lu/%u records=%lu crc=%lu invalid=%lu/%lu\n",
          label, track, side, stats.unique_sectors, DISK_SECTORS_PER_TRACK,
          stats.sector_records, stats.crc_errors, stats.invalid_count,
          stats.total_pulses);
 
   uint32_t invalid_limit = stats.total_pulses / 200;
-  if (invalid_limit < 1)
-    invalid_limit = 1;
+  if (invalid_limit < 1) invalid_limit = 1;
 
   char tag[96];
   snprintf(tag, sizeof(tag), "%s unique sectors", label);
@@ -1909,53 +1726,48 @@ static void mfm_health_check(int track, int side, const char *label, int *pass,
 
 static void cmd_test_full(int argc, char **argv) {
   uint32_t rounds = 6;
-  if (argc == 2) {
-    if (!parse_u32(argv[1], 1, 100, &rounds)) {
-      printf("Rounds must be an integer from 1 through 100.\n");
-      return;
-    }
+  if (argc == 2 && !parse_u32(argv[1], 1, 100, &rounds)) {
+    printf("Rounds must be an integer from 1 through 100.\n");
+    return;
   }
 
   printf("This will FORMAT the disk, run diagnostics, file I/O, and a full "
          "sector scan.\n");
   printf("Continue? [y/N] ");
+  if (!cli_confirm()) return;
 
-  if (!cli_confirm())
-    return;
-
-  f12_err_t start_error = unmount_filesystem();
-  if (start_error != F12_OK) {
-    printf("Cannot start test: %s\n", f12_strerror(start_error));
+  disk_err_t start_error = unmount_filesystem();
+  if (start_error != DISK_OK) {
+    printf("Cannot start test: %s\n", disk_strerror(start_error));
     return;
   }
 
   int pass = 0;
   int fail = 0;
-  f12_err_t cleanup;
+  disk_err_t cleanup;
 
   printf("\n--- Phase 1: GPIO and Flux Sanity ---\n");
   cmd_pins(0, NULL);
   cmd_status(0, NULL);
-  block_status_t home_status = floppy_seek(&floppy, 0);
-  check(home_status == BLOCK_OK, "home and clear media latch", &pass, &fail);
+  disk_err_t home_status = floppy_seek(&floppy, 0);
+  check_status(home_status, "home and clear media latch", &pass, &fail);
   uint32_t test_generation = 0;
-  block_status_t generation_status =
-      floppy_media_generation(&floppy, &test_generation);
-  bool generation_ready = generation_status == BLOCK_OK && test_generation != 0;
-  check(generation_ready, "capture nonzero media generation", &pass, &fail);
-  bool stats_reset = floppy_stats_reset(&floppy) == BLOCK_OK;
+  disk_err_t generation_status = floppy_media_generation(&floppy, &test_generation);
+  bool generation_ready = generation_status == DISK_OK;
+  check_status(generation_status, "capture media generation", &pass, &fail);
+  bool stats_reset = floppy_stats_reset(&floppy) == DISK_OK;
   check(stats_reset, "reset drive statistics", &pass, &fail);
 
-  block_status_t flux_status = generation_ready
-                                   ? floppy_flux_begin(&floppy, test_generation)
-                                   : BLOCK_ERR_INVALID;
-  check(flux_status == BLOCK_OK, "raw flux session starts", &pass, &fail);
-  if (flux_status == BLOCK_OK) {
-    check(floppy_seek(&floppy, 1) == BLOCK_ERR_BUSY,
+  disk_err_t flux_status = generation_ready
+                               ? floppy_flux_begin(&floppy, test_generation)
+                               : DISK_ERR_INVALID;
+  check(flux_status == DISK_OK, "raw flux session starts", &pass, &fail);
+  if (flux_status == DISK_OK) {
+    check(floppy_seek(&floppy, 1) == DISK_ERR_BUSY,
           "raw flux excludes head motion", &pass, &fail);
-    check(floppy_deinit(&floppy) == BLOCK_ERR_BUSY,
+    check(floppy_deinit(&floppy) == DISK_ERR_BUSY,
           "raw flux excludes teardown", &pass, &fail);
-    check(floppy_flux_end(&floppy) == BLOCK_OK, "raw flux session stops", &pass,
+    check(floppy_flux_end(&floppy) == DISK_OK, "raw flux session stops", &pass,
           &fail);
   }
 
@@ -1969,41 +1781,42 @@ static void cmd_test_full(int argc, char **argv) {
   uint32_t current_generation = 0;
   generation_status = floppy_media_generation(&floppy, &current_generation);
   bool generation_stable =
-      generation_status == BLOCK_OK && current_generation == test_generation;
+      generation_status == DISK_OK && current_generation == test_generation;
   check(generation_stable, "media generation remains stable", &pass, &fail);
 
-  if (home_status != BLOCK_OK || !generation_ready || !generation_stable ||
-      !stats_reset || !protection_ok || write_protected)
+  if (home_status != DISK_OK || !generation_ready || !generation_stable ||
+      !stats_reset || !protection_ok || write_protected) {
     goto done;
+  }
 
   printf("\n--- Phase 2: Full Format and Mount ---\n");
-  f12_err_t err = do_format("TESTFULL", true);
-  check(err == F12_OK, "full format", &pass, &fail);
-  if (err != F12_OK)
-    goto done;
+  disk_err_t err = do_format("TESTFULL", true);
+  check_status(err, "full format", &pass, &fail);
+  if (err != DISK_OK) goto done;
 
   err = do_mount();
-  check(err == F12_OK, "mount after full format", &pass, &fail);
-  if (err != F12_OK)
-    goto done;
+  check_status(err, "mount after full format", &pass, &fail);
+  if (err != DISK_OK) goto done;
   cmd_status(0, NULL);
 
   printf("\n--- Phase 3: MFM Signal Checks ---\n");
   mfm_health_check(0, 0, "outer", &pass, &fail);
-  mfm_health_check(DISK_CYLINDERS - 1, 0, "inner", &pass, &fail);
+  mfm_health_check(DISK_CYLINDERS - 1u, 0, "inner", &pass, &fail);
+  check_status(floppy_stats_reset(&floppy), "reset statistics after signal checks",
+               &pass, &fail);
 
   printf("\n--- Phase 4: Shell File Operations ---\n");
   const char text[] = "test-full hardware sequence\nformat mount write copy "
                       "move delete verify\n";
   uint32_t text_len = sizeof(text) - 1;
-  f12_err_t open_error = writer_open("TEST.TXT");
-  check(open_error == F12_OK, "open TEST.TXT for write", &pass, &fail);
-  if (open_error == F12_OK) {
-    f12_result_t write_result = f12_write_full(&owned_writer, text, text_len);
-    f12_err_t close_err =
-        write_result.error == F12_OK ? writer_commit() : writer_abort();
-    check(write_result.error == F12_OK && write_result.count == text_len &&
-              close_err == F12_OK,
+  disk_err_t open_error = writer_open("TEST.TXT");
+  check(open_error == DISK_OK, "open TEST.TXT for write", &pass, &fail);
+  if (open_error == DISK_OK) {
+    disk_result_t write_result = f12_write_full(&owned_writer, text, text_len);
+    disk_err_t close_err =
+        write_result.error == DISK_OK ? writer_commit() : writer_abort();
+    check(write_result.error == DISK_OK && write_result.count == text_len &&
+              close_err == DISK_OK,
           "write TEST.TXT", &pass, &fail);
   }
 
@@ -2020,7 +1833,7 @@ static void cmd_test_full(int argc, char **argv) {
   char *mv_args[] = {"mv", "COPY.TXT", "MOVED.TXT"};
   cmd_mv(3, mv_args);
   f12_stat_t st;
-  check(f12_stat(&fs, "COPY.TXT", &st) == F12_ERR_NOT_FOUND,
+  check(f12_stat(&fs, "COPY.TXT", &st) == DISK_ERR_NOT_FOUND,
         "COPY.TXT removed by mv", &pass, &fail);
   exact = read_file_exact("MOVED.TXT", work_buf, text_len);
   check(exact && memcmp(work_buf, text, text_len) == 0, "MOVED.TXT verified",
@@ -2028,7 +1841,7 @@ static void cmd_test_full(int argc, char **argv) {
 
   char *rm_args[] = {"rm", "MOVED.TXT"};
   cmd_rm(2, rm_args);
-  check(f12_stat(&fs, "MOVED.TXT", &st) == F12_ERR_NOT_FOUND, "rm MOVED.TXT",
+  check(f12_stat(&fs, "MOVED.TXT", &st) == DISK_ERR_NOT_FOUND, "rm MOVED.TXT",
         &pass, &fail);
 
   printf("\n--- Phase 5: Pattern Stress ---\n");
@@ -2046,21 +1859,20 @@ static void cmd_test_full(int argc, char **argv) {
 
   for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
     uint32_t written = 0;
-    f12_err_t close_err = F12_OK;
-    bool ok =
-        write_pattern_file_chunked(files[i].name, files[i].id, files[i].size,
-                                   files[i].chunk, &written, &close_err);
+    disk_err_t close_err = DISK_OK;
+    bool ok = write_pattern_file(files[i].name, files[i].id, files[i].size,
+                                 files[i].chunk, &written, &close_err);
     char tag[80];
     snprintf(tag, sizeof(tag), "write %s", files[i].name);
-    check(ok && written == files[i].size && close_err == F12_OK, tag, &pass,
+    check(ok && written == files[i].size && close_err == DISK_OK, tag, &pass,
           &fail);
   }
 
   for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
     char tag[80];
     snprintf(tag, sizeof(tag), "verify %s", files[i].name);
-    check(verify_pattern_file_chunked(files[i].name, files[i].id, files[i].size,
-                                      files[i].chunk, NULL),
+    check(verify_pattern_file(files[i].name, files[i].id, files[i].size,
+                              files[i].chunk),
           tag, &pass, &fail);
   }
 
@@ -2069,46 +1881,42 @@ static void cmd_test_full(int argc, char **argv) {
     uint32_t chunk = 1 + (round % 7u) * 73;
     uint32_t id = 2000u + round;
     uint32_t written = 0;
-    f12_err_t close_err = F12_OK;
-    bool ok = write_pattern_file_chunked("ROUND.BIN", id, size, chunk, &written,
-                                         &close_err);
+    disk_err_t close_err = DISK_OK;
+    bool ok = write_pattern_file("ROUND.BIN", id, size, chunk, &written, &close_err);
     char tag[96];
     snprintf(tag, sizeof(tag), "round %lu overwrite write",
              (unsigned long)round + 1u);
-    check(ok && written == size && close_err == F12_OK, tag, &pass, &fail);
+    check(ok && written == size && close_err == DISK_OK, tag, &pass, &fail);
 
     snprintf(tag, sizeof(tag), "round %lu overwrite verify",
              (unsigned long)round + 1u);
-    check(verify_pattern_file_chunked("ROUND.BIN", id, size, chunk + 31, NULL),
-          tag, &pass, &fail);
+    check(verify_pattern_file("ROUND.BIN", id, size, chunk + 31), tag, &pass, &fail);
   }
 
   err = f12_delete(&fs, "SMALL.BIN");
-  check(err == F12_OK, "delete SMALL.BIN", &pass, &fail);
+  check(err == DISK_OK, "delete SMALL.BIN", &pass, &fail);
   err = f12_delete(&fs, "MEDIUM.BIN");
-  check(err == F12_OK, "delete MEDIUM.BIN", &pass, &fail);
-  check(f12_stat(&fs, "SMALL.BIN", &st) == F12_ERR_NOT_FOUND, "SMALL.BIN gone",
+  check(err == DISK_OK, "delete MEDIUM.BIN", &pass, &fail);
+  check(f12_stat(&fs, "SMALL.BIN", &st) == DISK_ERR_NOT_FOUND, "SMALL.BIN gone",
         &pass, &fail);
-  check(f12_stat(&fs, "MEDIUM.BIN", &st) == F12_ERR_NOT_FOUND,
+  check(f12_stat(&fs, "MEDIUM.BIN", &st) == DISK_ERR_NOT_FOUND,
         "MEDIUM.BIN gone", &pass, &fail);
 
   uint32_t written = 0;
-  f12_err_t close_err = F12_OK;
-  bool ok = write_pattern_file_chunked("REFILL.BIN", 3000, 12000, 333, &written,
-                                       &close_err);
-  check(ok && written == 12000 && close_err == F12_OK, "write REFILL.BIN",
+  disk_err_t close_err = DISK_OK;
+  bool ok = write_pattern_file("REFILL.BIN", 3000, 12000, 333, &written, &close_err);
+  check(ok && written == 12000 && close_err == DISK_OK, "write REFILL.BIN",
         &pass, &fail);
-  check(verify_pattern_file_chunked("REFILL.BIN", 3000, 12000, 777, NULL),
-        "verify REFILL.BIN", &pass, &fail);
+  check(verify_pattern_file("REFILL.BIN", 3000, 12000, 777), "verify REFILL.BIN",
+        &pass, &fail);
 
   printf("\n--- Phase 6: Full Capacity and Fragmentation ---\n");
   uint16_t free_clusters = 0;
   err = f12_free_count(&fs, &free_clusters);
-  bool capacity_ready = err == F12_OK && free_clusters >= CAPACITY_FILE_COUNT;
+  bool capacity_ready = err == DISK_OK && free_clusters >= CAPACITY_FILE_COUNT;
   check(capacity_ready, "capacity workload has enough free clusters", &pass,
         &fail);
-  if (!capacity_ready)
-    goto done;
+  if (!capacity_ready) goto done;
 
   memset(capacity_files, 0, sizeof(capacity_files));
   uint32_t random_state = 0x6D2B79F5u;
@@ -2131,67 +1939,56 @@ static void cmd_test_full(int argc, char **argv) {
   }
   check(capacity_ok && remaining_clusters == 0u,
         "randomized files consume every free cluster", &pass, &fail);
-  if (!capacity_ok || remaining_clusters != 0u)
-    goto done;
+  if (!capacity_ok || remaining_clusters != 0u) goto done;
 
   free_clusters = 1u;
   err = f12_free_count(&fs, &free_clusters);
-  check(err == F12_OK && free_clusters == 0u, "disk reports zero free space",
+  check(err == DISK_OK && free_clusters == 0u, "disk reports zero free space",
         &pass, &fail);
-  if (err != F12_OK || free_clusters != 0u)
-    goto done;
+  if (err != DISK_OK || free_clusters != 0u) goto done;
 
   bool capacity_exact = capacity_verify();
-  check(capacity_exact, "all randomized full-disk files are exact", &pass,
-        &fail);
-  if (!capacity_exact)
-    goto done;
+  check(capacity_exact, "all randomized full-disk files are exact", &pass, &fail);
+  if (!capacity_exact) goto done;
 
-  f12_err_t overflow_open = writer_open("OVERFLOW.BIN");
-  f12_result_t overflow_write = {.error = F12_ERR_INVALID, .count = 0};
-  if (overflow_open == F12_OK) {
+  disk_err_t overflow_open = writer_open("OVERFLOW.BIN");
+  disk_result_t overflow_write = {.error = DISK_ERR_INVALID, .count = 0};
+  if (overflow_open == DISK_OK) {
     work_buf[0] = gen_pattern_byte(0xFFFFFFFFu, 0);
     overflow_write = f12_write_full(&owned_writer, work_buf, 1);
   }
-  f12_err_t overflow_abort = writer_abort();
+  disk_err_t overflow_abort = writer_abort();
   bool overflow_rejected =
-      overflow_open == F12_OK && overflow_write.error == F12_ERR_FULL &&
-      overflow_write.count == 0u && overflow_abort == F12_OK;
+      overflow_open == DISK_OK && overflow_write.error == DISK_ERR_FULL &&
+      overflow_write.count == 0u && overflow_abort == DISK_OK;
   check(overflow_rejected, "new-file write reports disk full", &pass, &fail);
-  if (!overflow_rejected)
-    goto done;
+  if (!overflow_rejected) goto done;
 
   free_clusters = 1u;
   err = f12_free_count(&fs, &free_clusters);
-  bool overflow_absent =
-      f12_stat(&fs, "OVERFLOW.BIN", &st) == F12_ERR_NOT_FOUND;
-  check(err == F12_OK && free_clusters == 0u && overflow_absent,
+  bool overflow_absent = f12_stat(&fs, "OVERFLOW.BIN", &st) == DISK_ERR_NOT_FOUND;
+  check(err == DISK_OK && free_clusters == 0u && overflow_absent,
         "failed full-disk file remains unpublished", &pass, &fail);
-  if (err != F12_OK || free_clusters != 0u || !overflow_absent)
-    goto done;
+  if (err != DISK_OK || free_clusters != 0u || !overflow_absent) goto done;
 
   const capacity_file_t *preserved = &capacity_files[0];
   char preserved_name[13];
   capacity_name(preserved, 0, preserved_name);
-  f12_err_t replace_open = writer_open(preserved_name);
-  f12_result_t replace_write = {.error = F12_ERR_INVALID, .count = 0};
-  if (replace_open == F12_OK) {
-    work_buf[0] =
-        (uint8_t)(gen_pattern_byte(preserved->id, 0) ^ (uint8_t)0xFFu);
+  disk_err_t replace_open = writer_open(preserved_name);
+  disk_result_t replace_write = {.error = DISK_ERR_INVALID, .count = 0};
+  if (replace_open == DISK_OK) {
+    work_buf[0] = (uint8_t)(gen_pattern_byte(preserved->id, 0) ^ (uint8_t)0xFFu);
     replace_write = f12_write_full(&owned_writer, work_buf, 1);
   }
-  f12_err_t replace_abort = writer_abort();
-  bool replace_rejected = replace_open == F12_OK &&
-                          replace_write.error == F12_ERR_FULL &&
-                          replace_write.count == 0u && replace_abort == F12_OK;
-  check(replace_rejected, "copy-on-write write reports disk full", &pass,
-        &fail);
-  check(replace_rejected && verify_pattern_file_chunked(
-                                preserved_name, preserved->id, preserved->size,
-                                preserved->chunk, NULL),
+  disk_err_t replace_abort = writer_abort();
+  bool replace_rejected = replace_open == DISK_OK &&
+                          replace_write.error == DISK_ERR_FULL &&
+                          replace_write.count == 0u && replace_abort == DISK_OK;
+  check(replace_rejected, "copy-on-write write reports disk full", &pass, &fail);
+  check(replace_rejected && verify_pattern_file(preserved_name, preserved->id,
+                                                preserved->size, preserved->chunk),
         "failed replacement preserves original file", &pass, &fail);
-  if (!replace_rejected)
-    goto done;
+  if (!replace_rejected) goto done;
 
   uint32_t freed_clusters = 0;
   uint32_t deleted_files = 0;
@@ -2199,24 +1996,21 @@ static void cmd_test_full(int argc, char **argv) {
   for (uint32_t i = 1u; i < CAPACITY_FILE_COUNT; i += 3u) {
     char name[13];
     capacity_name(&capacity_files[i], i, name);
-    if (f12_delete(&fs, name) != F12_OK) {
+    if (f12_delete(&fs, name) != DISK_OK) {
       delete_ok = false;
       break;
     }
     freed_clusters += capacity_cluster_count(capacity_files[i].size);
     deleted_files++;
   }
-  check(delete_ok, "delete randomized files across the full disk", &pass,
-        &fail);
-  if (!delete_ok)
-    goto done;
+  check(delete_ok, "delete randomized files across the full disk", &pass, &fail);
+  if (!delete_ok) goto done;
 
   free_clusters = 0;
   err = f12_free_count(&fs, &free_clusters);
-  check(err == F12_OK && free_clusters == freed_clusters,
+  check(err == DISK_OK && free_clusters == freed_clusters,
         "fragmented free-space count is exact", &pass, &fail);
-  if (err != F12_OK || free_clusters != freed_clusters)
-    goto done;
+  if (err != DISK_OK || free_clusters != freed_clusters) goto done;
 
   random_state = 0xB5297A4Du;
   remaining_clusters = freed_clusters;
@@ -2235,45 +2029,42 @@ static void cmd_test_full(int argc, char **argv) {
   }
   check(refill_ok && refill_number == deleted_files && remaining_clusters == 0u,
         "randomized refill consumes every fragmented cluster", &pass, &fail);
-  if (!refill_ok || refill_number != deleted_files || remaining_clusters != 0u)
+  if (!refill_ok || refill_number != deleted_files || remaining_clusters != 0u) {
     goto done;
+  }
 
   free_clusters = 1u;
   err = f12_free_count(&fs, &free_clusters);
-  check(err == F12_OK && free_clusters == 0u,
+  check(err == DISK_OK && free_clusters == 0u,
         "fragmented refill returns disk to full", &pass, &fail);
-  if (err != F12_OK || free_clusters != 0u)
-    goto done;
+  if (err != DISK_OK || free_clusters != 0u) goto done;
 
   printf("\n--- Phase 7: Remount Verify ---\n");
   err = unmount_filesystem();
-  if (err == F12_OK)
-    err = do_mount();
-  check(err == F12_OK, "remount after full-capacity stress", &pass, &fail);
-  if (err != F12_OK)
-    goto done;
-  check(verify_pattern_file_chunked("BYTEIO.BIN", 1000, 4096, 1, NULL),
+  if (err == DISK_OK) err = do_mount();
+  check_status(err, "remount after full-capacity stress", &pass, &fail);
+  if (err != DISK_OK) goto done;
+  check(verify_pattern_file("BYTEIO.BIN", 1000, 4096, 1),
         "BYTEIO.BIN survives remount", &pass, &fail);
-  check(verify_pattern_file_chunked("LARGE.BIN", 1003, 32768, 4096, NULL),
+  check(verify_pattern_file("LARGE.BIN", 1003, 32768, 4096),
         "LARGE.BIN survives remount", &pass, &fail);
-  check(verify_pattern_file_chunked("REFILL.BIN", 3000, 12000, 777, NULL),
+  check(verify_pattern_file("REFILL.BIN", 3000, 12000, 777),
         "REFILL.BIN survives remount", &pass, &fail);
-  check(capacity_verify(), "all fragmented files survive remount", &pass,
-        &fail);
+  check(capacity_verify(), "all fragmented files survive remount", &pass, &fail);
   free_clusters = 1u;
   err = f12_free_count(&fs, &free_clusters);
-  check(err == F12_OK && free_clusters == 0u, "full capacity survives remount",
+  check(err == DISK_OK && free_clusters == 0u, "full capacity survives remount",
         &pass, &fail);
 
   fat12_fsck_t report;
   err = f12_fsck(&fs, &report, false);
-  check(err == F12_OK && !fsck_dirty(&report),
+  check(err == DISK_OK && fat12_fsck_clean(&report),
         "filesystem is clean after remount", &pass, &fail);
 
   floppy_stats_t write_stats;
-  block_status_t stats_status = floppy_stats(&floppy, &write_stats);
-  check(stats_status == BLOCK_OK, "query write-path statistics", &pass, &fail);
-  if (stats_status == BLOCK_OK) {
+  disk_err_t stats_status = floppy_stats(&floppy, &write_stats);
+  check(stats_status == DISK_OK, "query write-path statistics", &pass, &fail);
+  if (stats_status == DISK_OK) {
     check(write_stats.dma_writes != 0, "verified DMA track writes observed",
           &pass, &fail);
     check(write_stats.underruns == 0 && write_stats.overruns == 0,
@@ -2283,7 +2074,7 @@ static void cmd_test_full(int argc, char **argv) {
   }
   current_generation = 0;
   generation_status = floppy_media_generation(&floppy, &current_generation);
-  check(generation_status == BLOCK_OK && current_generation == test_generation,
+  check(generation_status == DISK_OK && current_generation == test_generation,
         "media generation stable across writes and remount", &pass, &fail);
 
   printf("\n--- Phase 8: Full Disk Scan ---\n");
@@ -2297,13 +2088,16 @@ static void cmd_test_full(int argc, char **argv) {
   check(dump.retries.overruns == 0, "no flux ring overruns", &pass, &fail);
 
 done:
+  if (fail != 0) {
+    floppy_stats_t drive_stats;
+    if (floppy_stats(&floppy, &drive_stats) == DISK_OK) print_drive_stats(&drive_stats);
+  }
   cleanup = unmount_filesystem();
-  if (cleanup != F12_OK) {
-    printf("Cleanup failed: %s\n", f12_strerror(cleanup));
+  if (cleanup != DISK_OK) {
+    printf("Cleanup failed: %s\n", disk_strerror(cleanup));
     fail++;
   }
-  if (!drive_idle())
-    fail++;
+  if (!drive_idle()) fail++;
 
   printf("\n=== Test-Full Complete ===\n");
   printf("  Checks: %d passed, %d failed\n", pass, fail);
@@ -2314,15 +2108,15 @@ static void cmd_test_media(int argc, char **argv) {
   (void)argc;
   (void)argv;
 
-  f12_err_t error = writer_commit();
-  if (error != F12_OK) {
-    printf("Cannot start test: %s\n", f12_strerror(error));
+  disk_err_t error = writer_commit();
+  if (error != DISK_OK) {
+    printf("Cannot start test: %s\n", disk_strerror(error));
     return;
   }
 
-  block_status_t motor_status = floppy_motor_off(&floppy);
-  block_status_t select_status = floppy_select(&floppy, true);
-  if (motor_status != BLOCK_OK || select_status != BLOCK_OK) {
+  disk_err_t motor_status = floppy_motor_off(&floppy);
+  disk_err_t select_status = floppy_select(&floppy, true);
+  if (motor_status != DISK_OK || select_status != DISK_OK) {
     drive_status("Motor stop", motor_status);
     drive_status("Drive select", select_status);
     drive_idle();
@@ -2331,16 +2125,16 @@ static void cmd_test_media(int argc, char **argv) {
 
   f12_dir_t stale_dir;
   error = f12_opendir(&fs, "/", &stale_dir);
-  if (error != F12_OK) {
-    printf("Cannot open stale-handle probe: %s\n", f12_strerror(error));
+  if (error != DISK_OK) {
+    printf("Cannot open stale-handle probe: %s\n", disk_strerror(error));
     drive_idle();
     return;
   }
 
   uint32_t original_generation = 0;
-  block_status_t generation_status =
+  disk_err_t generation_status =
       floppy_media_generation(&floppy, &original_generation);
-  if (generation_status != BLOCK_OK || original_generation == 0) {
+  if (generation_status != DISK_OK) {
     drive_status("Media generation", generation_status);
     f12_closedir(&stale_dir);
     drive_idle();
@@ -2358,35 +2152,31 @@ static void cmd_test_media(int argc, char **argv) {
   int pass = 0;
   int fail = 0;
   bool changed = false;
-  block_status_t changed_status = floppy_disk_changed(&floppy, &changed);
+  disk_err_t changed_status = floppy_disk_changed(&floppy, &changed);
   uint32_t replacement_generation = 0;
   generation_status = floppy_media_generation(&floppy, &replacement_generation);
   uint32_t expected_generation = original_generation + 1u;
-  if (expected_generation == 0)
-    expected_generation = 1u;
-  bool generation_changed = generation_status == BLOCK_OK &&
+  if (expected_generation == 0) expected_generation = 1u;
+  bool generation_changed = generation_status == DISK_OK &&
                             replacement_generation == expected_generation;
-  check(changed_status == BLOCK_OK && changed, "disk-change latch asserted",
+  check(changed_status == DISK_OK && changed, "disk-change latch asserted",
         &pass, &fail);
   check(generation_changed, "media generation advanced exactly by event", &pass,
         &fail);
 
-  track_t stale_track = {.cylinder = 0, .head = 0};
-  block_status_t stale_read =
-      floppy_read_track(&floppy, original_generation, &stale_track);
-  check(stale_read == BLOCK_ERR_MEDIA_CHANGED,
+  disk_err_t stale_read = read_track(0, 0, original_generation);
+  check(stale_read == DISK_ERR_MEDIA_CHANGED,
         "stale hardware generation is rejected", &pass, &fail);
 
   bool mounted = true;
-  f12_err_t state_error = f12_is_mounted(&fs, &mounted);
-  check(state_error == F12_ERR_MEDIA_CHANGED && !mounted,
+  disk_err_t state_error = f12_is_mounted(&fs, &mounted);
+  check(state_error == DISK_ERR_MEDIA_CHANGED && !mounted,
         "mounted filesystem observes media change", &pass, &fail);
-  f12_err_t stale_close = f12_closedir(&stale_dir);
-  check(stale_close == F12_ERR_BAD_HANDLE,
+  disk_err_t stale_close = f12_closedir(&stale_dir);
+  check(stale_close == DISK_ERR_BAD_HANDLE,
         "stale filesystem handle is invalidated", &pass, &fail);
 
-  if (!generation_changed || state_error != F12_ERR_MEDIA_CHANGED)
-    goto done;
+  if (!generation_changed || state_error != DISK_ERR_MEDIA_CHANGED) goto done;
 
   printf("Insert another canonical 1.44 MB FAT12 disk, then enter y.\n");
   printf("Continue? [y/N] ");
@@ -2395,38 +2185,190 @@ static void cmd_test_media(int argc, char **argv) {
     return;
   }
 
-  block_status_t home_status = floppy_seek(&floppy, 0);
-  check(home_status == BLOCK_OK, "replacement disk homes successfully", &pass,
-        &fail);
+  disk_err_t home_status = floppy_seek(&floppy, 0);
+  check_status(home_status, "replacement disk homes successfully", &pass, &fail);
   changed = true;
   changed_status = floppy_disk_changed(&floppy, &changed);
-  check(changed_status == BLOCK_OK && !changed,
+  check(changed_status == DISK_OK && !changed,
         "disk-change latch clears after physical step", &pass, &fail);
-  if (home_status != BLOCK_OK || changed_status != BLOCK_OK || changed)
-    goto done;
+  if (home_status != DISK_OK || changed_status != DISK_OK || changed) goto done;
 
   error = do_mount();
-  check(error == F12_OK, "replacement filesystem mounts", &pass, &fail);
-  if (error == F12_OK) {
+  check(error == DISK_OK, "replacement filesystem mounts", &pass, &fail);
+  if (error == DISK_OK) {
     fat12_fsck_t report;
     error = f12_fsck(&fs, &report, false);
-    check(error == F12_OK && !fsck_dirty(&report),
+    check(error == DISK_OK && fat12_fsck_clean(&report),
           "replacement filesystem is clean", &pass, &fail);
   }
 
 done:
   mounted = false;
-  f12_err_t cleanup = f12_is_mounted(&fs, &mounted);
-  if (cleanup == F12_OK && mounted)
-    cleanup = f12_unmount(&fs);
-  if (cleanup != F12_OK) {
-    printf("Filesystem cleanup failed: %s\n", f12_strerror(cleanup));
+  disk_err_t cleanup = f12_is_mounted(&fs, &mounted);
+  if (cleanup == DISK_OK && mounted) cleanup = f12_unmount(&fs);
+  if (cleanup != DISK_OK) {
+    printf("Filesystem cleanup failed: %s\n", disk_strerror(cleanup));
     fail++;
   }
-  if (!drive_idle())
-    fail++;
+  if (!drive_idle()) fail++;
 
   printf("\n=== Test-Media Complete ===\n");
+  printf("  Checks: %d passed, %d failed\n", pass, fail);
+  printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
+}
+
+static bool track_patch_fat(track_t *track, uint16_t fat_start, uint16_t cluster,
+                            uint16_t value) {
+  uint16_t first;
+  if (!disk_chs_to_lba(track->cylinder, track->head, 0, &first)) return false;
+  fat12_entry_loc_t loc = fat12_entry_locate(cluster);
+  uint16_t lba = (uint16_t)(fat_start + loc.sector);
+  uint16_t hi_lba = loc.split ? (uint16_t)(lba + 1u) : lba;
+  if (lba < first || hi_lba >= first + DISK_SECTORS_PER_TRACK) return false;
+  uint8_t *lo = &track->data[lba - first][loc.offset];
+  uint8_t *hi = loc.split ? &track->data[hi_lba - first][0] : lo + 1;
+  fat12_entry_pack(cluster, value, lo, hi);
+  return true;
+}
+
+static bool patch_fat_track(bool both_copies, const fsck_scenario_patch_t *patches,
+                            size_t count) {
+  uint32_t generation;
+  if (!drive_generation(&generation)) return false;
+  if (!drive_status("FAT track read", read_track(0, 0, generation))) return false;
+  for (size_t index = 0; index < count; index++) {
+    bool patched = track_patch_fat(&work_track, FAT12_FAT2_START,
+                                   patches[index].cluster, patches[index].value);
+    if (both_copies) {
+      patched = patched && track_patch_fat(&work_track, FAT12_FAT1_START,
+                                           patches[index].cluster,
+                                           patches[index].value);
+    }
+    if (!patched) {
+      printf("FAT entry %u lies outside the FAT track.\n", patches[index].cluster);
+      return false;
+    }
+  }
+  return drive_status("FAT track write",
+                      floppy_write_track(&floppy, generation, &work_track));
+}
+
+static bool fsck_scenario_files_exact(uint32_t truncated_size) {
+  for (size_t index = 0; index < FSCK_SCENARIO_FILE_COUNT; index++) {
+    const fsck_scenario_file_t *file = &fsck_scenario_files[index];
+    uint32_t size = index == FSCK_SCENARIO_TRUNCATED_FILE ? truncated_size : file->size;
+    if (!verify_pattern_file(file->name, 4000u + (uint32_t)index, size,
+                             DISK_SECTOR_SIZE)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void cmd_test_fsck(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  printf("This will FORMAT the disk, damage its FAT, and run fsck repairs.\n");
+  printf("Continue? [y/N] ");
+  if (!cli_confirm()) return;
+
+  disk_err_t start_error = unmount_filesystem();
+  if (start_error != DISK_OK) {
+    printf("Cannot start test: %s\n", disk_strerror(start_error));
+    return;
+  }
+
+  int pass = 0;
+  int fail = 0;
+  disk_err_t cleanup;
+  fat12_fsck_t report;
+
+  printf("\n--- Phase 1: Format and Populate ---\n");
+  disk_err_t err = do_format("FSCKTEST", false);
+  check_status(err, "quick format", &pass, &fail);
+  if (err != DISK_OK) goto done;
+  err = do_mount();
+  check_status(err, "mount", &pass, &fail);
+  if (err != DISK_OK) goto done;
+  for (size_t index = 0; index < FSCK_SCENARIO_FILE_COUNT; index++) {
+    const fsck_scenario_file_t *file = &fsck_scenario_files[index];
+    uint32_t written = 0;
+    disk_err_t close_error = DISK_OK;
+    bool ok = write_pattern_file(file->name, 4000u + (uint32_t)index, file->size,
+                                 DISK_SECTOR_SIZE, &written, &close_error);
+    char tag[64];
+    snprintf(tag, sizeof(tag), "write %s", file->name);
+    check(ok && written == file->size, tag, &pass, &fail);
+    if (!ok) goto done;
+  }
+  err = f12_fsck(&fs, &report, false);
+  check(err == DISK_OK && fat12_fsck_clean(&report), "fresh filesystem is clean",
+        &pass, &fail);
+  if (err != DISK_OK) goto done;
+  err = unmount_filesystem();
+  check(err == DISK_OK, "unmount before raw damage", &pass, &fail);
+  if (err != DISK_OK) goto done;
+
+  printf("\n--- Phase 2: Structural Damage ---\n");
+  bool damaged = patch_fat_track(true, fsck_scenario_patches, FSCK_SCENARIO_PATCH_COUNT);
+  check(damaged, "crosslink, loop, short chain and lost cluster written", &pass, &fail);
+  if (!damaged) goto done;
+  err = do_mount();
+  check_status(err, "damaged filesystem mounts", &pass, &fail);
+  if (err != DISK_OK) goto done;
+  err = f12_fsck(&fs, &report, false);
+  check(err == DISK_OK, "fsck check completes", &pass, &fail);
+  if (err != DISK_OK) goto done;
+  print_fsck_report(&report);
+  check(fsck_scenario_damage_matches(&report), "damage report matches host suite",
+        &pass, &fail);
+  err = f12_fsck(&fs, &report, true);
+  check(err == DISK_OK, "fsck repair completes", &pass, &fail);
+  if (err != DISK_OK) goto done;
+  print_fsck_report(&report);
+  check(fsck_scenario_repair_matches(&report), "repair report matches host suite",
+        &pass, &fail);
+  err = f12_fsck(&fs, &report, false);
+  check(err == DISK_OK && fat12_fsck_clean(&report), "repair converges", &pass, &fail);
+  check(fsck_scenario_files_exact(FSCK_SCENARIO_TRUNCATED_SIZE),
+        "surviving data is exact after repair", &pass, &fail);
+  err = unmount_filesystem();
+  check(err == DISK_OK, "unmount before mirror damage", &pass, &fail);
+  if (err != DISK_OK) goto done;
+
+  printf("\n--- Phase 3: FAT Mirror Damage ---\n");
+  fsck_scenario_patch_t mirror = {FSCK_SCENARIO_MIRROR_CLUSTER,
+                                  FSCK_SCENARIO_MIRROR_VALUE};
+  damaged = patch_fat_track(false, &mirror, 1);
+  check(damaged, "second FAT copy damaged", &pass, &fail);
+  if (!damaged) goto done;
+  err = do_mount();
+  check_status(err, "mismatched filesystem mounts", &pass, &fail);
+  if (err != DISK_OK) goto done;
+  err = f12_fsck(&fs, &report, false);
+  check(err == DISK_OK, "mirror check completes", &pass, &fail);
+  if (err != DISK_OK) goto done;
+  print_fsck_report(&report);
+  check(fsck_scenario_mirror_matches(&report), "first FAT copy is authoritative",
+        &pass, &fail);
+  err = f12_fsck(&fs, &report, true);
+  check(err == DISK_OK && report.repaired_fat2 && !report.repaired_fat1,
+        "second FAT copy rewritten", &pass, &fail);
+  err = f12_fsck(&fs, &report, false);
+  check(err == DISK_OK && fat12_fsck_clean(&report), "mirror repair converges",
+        &pass, &fail);
+  check(fsck_scenario_files_exact(FSCK_SCENARIO_TRUNCATED_SIZE),
+        "data survives mirror repair", &pass, &fail);
+
+done:
+  cleanup = unmount_filesystem();
+  if (cleanup != DISK_OK) {
+    printf("Cleanup failed: %s\n", disk_strerror(cleanup));
+    fail++;
+  }
+  if (!drive_idle()) fail++;
+
+  printf("\n=== Test-Fsck Complete ===\n");
   printf("  Checks: %d passed, %d failed\n", pass, fail);
   printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
 }
@@ -2435,8 +2377,7 @@ static void cmd_rpm(int argc, char **argv) {
   (void)argc;
   (void)argv;
 
-  if (!drive_status("Drive select", floppy_select(&floppy, true)))
-    return;
+  if (!drive_status("Drive select", floppy_select(&floppy, true))) return;
   if (!drive_status("Motor start", floppy_motor_on(&floppy))) {
     drive_status("Drive deselect", floppy_select(&floppy, false));
     return;
@@ -2459,22 +2400,20 @@ static void cmd_rpm(int argc, char **argv) {
     bool now = gpio_get(drive_pins.index);
     if (now && !prev) {
       absolute_time_t t = get_absolute_time();
-      if (have_last) {
-        periods[got++] = (uint32_t)absolute_time_diff_us(last, t);
-      }
+      if (have_last) periods[got++] = (uint32_t)absolute_time_diff_us(last, t);
       last = t;
       have_last = true;
     }
     prev = now;
   }
 
-  uint32_t sum = 0, min = ~0u, max = 0;
+  uint32_t sum = 0;
+  uint32_t min = ~0u;
+  uint32_t max = 0;
   for (int i = 0; i < 5; i++) {
     sum += periods[i];
-    if (periods[i] < min)
-      min = periods[i];
-    if (periods[i] > max)
-      max = periods[i];
+    if (periods[i] < min) min = periods[i];
+    if (periods[i] > max) max = periods[i];
   }
   uint32_t avg = sum / 5;
   uint32_t rpm_x10 = avg ? 600000000u / avg : 0;
@@ -2483,13 +2422,11 @@ static void cmd_rpm(int argc, char **argv) {
 
   printf("  Period:    avg %lu us (min %lu, max %lu, spread %lu)\n", avg, min,
          max, max - min);
-  printf("  Speed:     %lu.%lu RPM (nominal 300.0)\n", rpm_x10 / 10,
-         rpm_x10 % 10);
+  printf("  Speed:     %lu.%lu RPM (nominal 300.0)\n", rpm_x10 / 10, rpm_x10 % 10);
   printf("  Deviation: %s%ld.%ld%%\n", dev_pm < 0 ? "-" : "+", dev_abs / 10,
          dev_abs % 10);
   if (dev_abs > 50) {
-    printf(
-        "  WARNING: more than 5%% off nominal -- writes may be unreliable\n");
+    printf("  WARNING: more than 5%% off nominal -- writes may be unreliable\n");
   } else if (dev_abs > 15) {
     printf("  NOTE: more than 1.5%% off nominal, within decoder tolerance\n");
   } else {
@@ -2507,24 +2444,22 @@ static void cmd_crashtest(int argc, char **argv) {
   printf("This will format the disk and overwrite TARGET.BIN until power is "
          "cut.\n");
   printf("Continue? [y/N] ");
+  if (!cli_confirm()) return;
 
-  if (!cli_confirm())
-    return;
-
-  f12_err_t unmount_error = unmount_filesystem();
-  if (unmount_error != F12_OK) {
-    printf("Cannot start test: %s\n", f12_strerror(unmount_error));
+  disk_err_t unmount_error = unmount_filesystem();
+  if (unmount_error != DISK_OK) {
+    printf("Cannot start test: %s\n", disk_strerror(unmount_error));
     return;
   }
 
-  f12_err_t error = do_format("CRASH", false);
-  if (error != F12_OK) {
-    printf("Format failed: %s\n", f12_strerror(error));
+  disk_err_t error = do_format("CRASH", false);
+  if (error != DISK_OK) {
+    printf("Format failed: %s\n", disk_strerror(error));
     return;
   }
   error = do_mount();
-  if (error != F12_OK) {
-    printf("Mount failed: %s\n", f12_strerror(error));
+  if (error != DISK_OK) {
+    printf("Mount failed: %s\n", disk_strerror(error));
     return;
   }
 
@@ -2540,28 +2475,25 @@ static void cmd_crashtest(int argc, char **argv) {
   state.filler_id = 9100;
 
   uint32_t written = 0;
-  f12_err_t close_error = F12_OK;
-  if (!write_pattern_file_chunked(CRASH_STABLE_FILE, state.stable_id,
-                                  state.stable_size, DISK_SECTOR_SIZE, &written,
-                                  &close_error) ||
+  disk_err_t close_error = DISK_OK;
+  if (!write_pattern_file(CRASH_STABLE_FILE, state.stable_id, state.stable_size,
+                          DISK_SECTOR_SIZE, &written, &close_error) ||
       written != state.stable_size) {
-    printf("Stable-file write failed: %s\n", f12_strerror(close_error));
+    printf("Stable-file write failed: %s\n", disk_strerror(close_error));
     goto cleanup;
   }
-  if (!write_pattern_file_chunked(CRASH_TARGET_FILE, state.target_old_id,
-                                  state.target_size, DISK_SECTOR_SIZE, &written,
-                                  &close_error) ||
+  if (!write_pattern_file(CRASH_TARGET_FILE, state.target_old_id, state.target_size,
+                          DISK_SECTOR_SIZE, &written, &close_error) ||
       written != state.target_size) {
-    printf("Baseline target write failed: %s\n", f12_strerror(close_error));
+    printf("Baseline target write failed: %s\n", disk_strerror(close_error));
     goto cleanup;
   }
 
   uint16_t available = 0;
   error = f12_free_count(&fs, &available);
-  uint32_t target_clusters =
-      (state.target_size + CLUSTER_SIZE - 1u) / CLUSTER_SIZE;
-  if (error != F12_OK) {
-    printf("Free-space query failed: %s\n", f12_strerror(error));
+  uint32_t target_clusters = (state.target_size + CLUSTER_SIZE - 1u) / CLUSTER_SIZE;
+  if (error != DISK_OK) {
+    printf("Free-space query failed: %s\n", disk_strerror(error));
     goto cleanup;
   }
   if (available <= target_clusters + 1u) {
@@ -2569,17 +2501,15 @@ static void cmd_crashtest(int argc, char **argv) {
            available, (unsigned long)(target_clusters + 1u));
     goto cleanup;
   }
-  state.filler_size =
-      ((uint32_t)available - target_clusters - 1u) * CLUSTER_SIZE;
+  state.filler_size = ((uint32_t)available - target_clusters - 1u) * CLUSTER_SIZE;
   if (!crash_state_store(&state)) {
     printf("Crash-state write failed.\n");
     goto cleanup;
   }
-  if (!write_pattern_file_chunked(CRASH_FILLER_FILE, state.filler_id,
-                                  state.filler_size, 8u * DISK_SECTOR_SIZE,
-                                  &written, &close_error) ||
+  if (!write_pattern_file(CRASH_FILLER_FILE, state.filler_id, state.filler_size,
+                          8u * DISK_SECTOR_SIZE, &written, &close_error) ||
       written != state.filler_size) {
-    printf("Filler write failed: %s\n", f12_strerror(close_error));
+    printf("Filler write failed: %s\n", disk_strerror(close_error));
     goto cleanup;
   }
 
@@ -2591,12 +2521,10 @@ static void cmd_crashtest(int argc, char **argv) {
 
   for (uint32_t round = 1;; round++) {
     uint32_t pattern = (round & 1u) ? state.target_new_id : state.target_old_id;
-    bool ok = write_pattern_file_chunked(CRASH_TARGET_FILE, pattern,
-                                         state.target_size, DISK_SECTOR_SIZE,
-                                         &written, &close_error);
+    bool ok = write_pattern_file(CRASH_TARGET_FILE, pattern, state.target_size,
+                                 DISK_SECTOR_SIZE, &written, &close_error);
     if (!ok || written != state.target_size) {
-      printf("Round %lu failed: %s\n", (unsigned long)round,
-             f12_strerror(close_error));
+      printf("Round %lu failed: %s\n", (unsigned long)round, disk_strerror(close_error));
       goto cleanup;
     }
     printf("Round %lu committed.\n", (unsigned long)round);
@@ -2608,8 +2536,7 @@ static void cmd_crashtest(int argc, char **argv) {
 
 cleanup:
   error = unmount_filesystem();
-  if (error != F12_OK)
-    printf("Filesystem cleanup failed: %s\n", f12_strerror(error));
+  if (error != DISK_OK) printf("Filesystem cleanup failed: %s\n", disk_strerror(error));
   drive_idle();
 }
 
@@ -2617,18 +2544,18 @@ static void cmd_crashcheck(int argc, char **argv) {
   (void)argc;
   (void)argv;
 
-  f12_err_t unmount_error = unmount_filesystem();
-  if (unmount_error != F12_OK) {
-    printf("Cannot remount: %s\n", f12_strerror(unmount_error));
+  disk_err_t unmount_error = unmount_filesystem();
+  if (unmount_error != DISK_OK) {
+    printf("Cannot remount: %s\n", disk_strerror(unmount_error));
     return;
   }
 
   int pass = 0;
   int fail = 0;
-  f12_err_t cleanup_error;
-  f12_err_t error = do_mount();
-  check(error == F12_OK, "disk mounts after power cut", &pass, &fail);
-  if (error != F12_OK) {
+  disk_err_t cleanup_error;
+  disk_err_t error = do_mount();
+  check_status(error, "disk mounts after power cut", &pass, &fail);
+  if (error != DISK_OK) {
     printf("Run 'crashtest' first.\n");
     goto cleanup;
   }
@@ -2636,51 +2563,43 @@ static void cmd_crashcheck(int argc, char **argv) {
   crash_state_t state;
   bool state_valid = crash_state_load(&state);
   check(state_valid, "crash state is exact and checksummed", &pass, &fail);
-  if (!state_valid)
-    goto cleanup;
+  if (!state_valid) goto cleanup;
 
   fat12_fsck_t report;
   error = f12_fsck(&fs, &report, false);
-  check(error == F12_OK, "fsck check completes", &pass, &fail);
-  if (error != F12_OK)
-    goto cleanup;
+  check(error == DISK_OK, "fsck check completes", &pass, &fail);
+  if (error != DISK_OK) goto cleanup;
   print_fsck_report(&report);
 
   error = f12_fsck(&fs, &report, true);
-  check(error == F12_OK, "fsck repair completes", &pass, &fail);
-  if (error != F12_OK)
-    goto cleanup;
+  check(error == DISK_OK, "fsck repair completes", &pass, &fail);
+  if (error != DISK_OK) goto cleanup;
   error = f12_fsck(&fs, &report, false);
-  check(error == F12_OK && !fsck_dirty(&report), "fsck repair converges", &pass,
-        &fail);
-  if (error != F12_OK || fsck_dirty(&report))
-    goto cleanup;
+  check(error == DISK_OK && fat12_fsck_clean(&report), "fsck repair converges",
+        &pass, &fail);
+  if (error != DISK_OK || !fat12_fsck_clean(&report)) goto cleanup;
 
-  check(verify_pattern_file_chunked(CRASH_STABLE_FILE, state.stable_id,
-                                    state.stable_size, DISK_SECTOR_SIZE, NULL),
+  check(verify_pattern_file(CRASH_STABLE_FILE, state.stable_id, state.stable_size,
+                            DISK_SECTOR_SIZE),
         "stable file is exact", &pass, &fail);
-  check(verify_pattern_file_chunked(CRASH_FILLER_FILE, state.filler_id,
-                                    state.filler_size, 8u * DISK_SECTOR_SIZE,
-                                    NULL),
+  check(verify_pattern_file(CRASH_FILLER_FILE, state.filler_id, state.filler_size,
+                            8u * DISK_SECTOR_SIZE),
         "filler file is exact", &pass, &fail);
 
-  bool old_exact =
-      verify_pattern_file_chunked(CRASH_TARGET_FILE, state.target_old_id,
-                                  state.target_size, DISK_SECTOR_SIZE, NULL);
-  bool new_exact =
-      verify_pattern_file_chunked(CRASH_TARGET_FILE, state.target_new_id,
-                                  state.target_size, DISK_SECTOR_SIZE, NULL);
+  bool old_exact = verify_pattern_file(CRASH_TARGET_FILE, state.target_old_id,
+                                       state.target_size, DISK_SECTOR_SIZE);
+  bool new_exact = verify_pattern_file(CRASH_TARGET_FILE, state.target_new_id,
+                                       state.target_size, DISK_SECTOR_SIZE);
   check(old_exact != new_exact, "target is exactly one recorded generation",
         &pass, &fail);
 
 cleanup:
   cleanup_error = unmount_filesystem();
-  if (cleanup_error != F12_OK) {
-    printf("Filesystem cleanup failed: %s\n", f12_strerror(cleanup_error));
+  if (cleanup_error != DISK_OK) {
+    printf("Filesystem cleanup failed: %s\n", disk_strerror(cleanup_error));
     fail++;
   }
-  if (!drive_idle())
-    fail++;
+  if (!drive_idle()) fail++;
 
   printf("\n=== Crashcheck Complete ===\n");
   printf("  Checks: %d passed, %d failed\n", pass, fail);
@@ -2691,64 +2610,45 @@ static diskdump_stats_t run_diskdump(bool verbose) {
   diskdump_stats_t stats;
   memset(&stats, 0, sizeof(stats));
 
-  int total_valid = 0;
-  int total_invalid = 0;
   uint32_t disk_checksum = 5381u;
-  uint8_t sector[DISK_SECTOR_SIZE];
   uint32_t generation;
-  if (!drive_generation(&generation))
-    return stats;
-
-  if (!drive_status("Statistics reset", floppy_stats_reset(&floppy))) {
-    return stats;
-  }
+  if (!drive_generation(&generation)) return stats;
+  if (!drive_status("Statistics reset", floppy_stats_reset(&floppy))) return stats;
 
   if (verbose) {
-    printf("  %-8s %-6s %-10s %-10s\n", "TRACK", "SIDE", "DECODED", "ERRORS");
+    printf("  %-8s %-6s %-10s %-10s\n", "TRACK", "SIDE", "DECODED", "STATUS");
     printf("  %-8s %-6s %-10s %-10s\n", "-----", "----", "-------", "------");
   }
 
   for (uint8_t track = 0; track < DISK_CYLINDERS; track++) {
     for (uint8_t side = 0; side < DISK_HEADS; side++) {
-      int decoded = 0;
-      int errors = 0;
-
-      for (uint8_t sector_number = 0; sector_number < DISK_SECTORS_PER_TRACK;
-           sector_number++) {
-        block_status_t status = floppy_read_sector(&floppy, generation, track,
-                                                   side, sector_number, sector);
-        if (status == BLOCK_OK) {
-          decoded++;
-          disk_checksum =
-              checksum_extend(disk_checksum, sector, DISK_SECTOR_SIZE);
-        } else {
-          errors++;
+      disk_err_t status = read_track(track, side, generation);
+      unsigned decoded = track_sectors(&work_track);
+      unsigned errors = DISK_SECTORS_PER_TRACK - decoded;
+      for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
+        if (track_has(&work_track, sector)) {
+          disk_checksum = checksum_extend(disk_checksum, work_track.data[sector],
+                                          DISK_SECTOR_SIZE);
         }
       }
-
-      total_valid += decoded;
-      total_invalid += errors;
-
-      if (verbose || decoded != DISK_SECTORS_PER_TRACK || errors != 0) {
-        printf("  T%02u      %u      %2d/%-2u      %d\n", track, side, decoded,
-               DISK_SECTORS_PER_TRACK, errors);
+      stats.total_valid += (int)decoded;
+      stats.total_invalid += (int)errors;
+      if (verbose || status != DISK_OK) {
+        printf("  T%02u      %u      %2u/%-2u      %s\n", track, side, decoded,
+               DISK_SECTORS_PER_TRACK, disk_strerror(status));
       }
     }
   }
 
-  stats.total_valid = total_valid;
-  stats.total_invalid = total_invalid;
   stats.checksum = disk_checksum;
-  if (!drive_status("Statistics query",
-                    floppy_stats(&floppy, &stats.retries))) {
+  if (!drive_status("Statistics query", floppy_stats(&floppy, &stats.retries))) {
     stats.total_invalid++;
   }
 
-  printf("\n  Total decoded: %d / %u\n", total_valid, DISK_SECTOR_COUNT);
-  printf("  Errors:        %d\n", total_invalid);
+  printf("\n  Total decoded: %d / %u\n", stats.total_valid, DISK_SECTOR_COUNT);
+  printf("  Errors:        %d\n", stats.total_invalid);
   printf("  Disk checksum: 0x%08lX\n", disk_checksum);
   print_drive_stats(&stats.retries);
-
   return stats;
 }
 
@@ -2769,7 +2669,6 @@ static void cmd_mfmscan(int argc, char **argv) {
   (void)argv;
 
   track_stats_t stats;
-
   struct {
     uint8_t track;
     uint8_t side;
@@ -2783,27 +2682,7 @@ static void cmd_mfmscan(int argc, char **argv) {
   for (size_t t = 0; t < sizeof(targets) / sizeof(targets[0]); t++) {
     printf("\n  === %s cylinder %u ===\n", targets[t].label, targets[t].track);
     read_track_stats(targets[t].track, targets[t].side, &stats);
-
-    printf("    Pulses:   %lu total\n", stats.total_pulses);
-    printf("    Short:    %lu (%.1f%%)\n", stats.short_count,
-           stats.total_pulses ? stats.short_count * 100.0 / stats.total_pulses
-                              : 0);
-    printf("    Medium:   %lu (%.1f%%)\n", stats.medium_count,
-           stats.total_pulses ? stats.medium_count * 100.0 / stats.total_pulses
-                              : 0);
-    printf("    Long:     %lu (%.1f%%)\n", stats.long_count,
-           stats.total_pulses ? stats.long_count * 100.0 / stats.total_pulses
-                              : 0);
-    printf("    Invalid:  %lu (%.1f%%)\n", stats.invalid_count,
-           stats.total_pulses ? stats.invalid_count * 100.0 / stats.total_pulses
-                              : 0);
-    printf("    Syncs:    %lu\n", stats.syncs);
-    printf("    Records:  %lu\n", stats.sector_records);
-    printf("    Unique:   %lu / %d\n", stats.unique_sectors,
-           DISK_SECTORS_PER_TRACK);
-    printf("    CRC err:  %lu\n", stats.crc_errors);
-    printf("    Adaptive: T2_max=%d  T3_max=%d\n", stats.T2_max, stats.T3_max);
-    print_histogram(&stats);
+    print_track_stats(&stats, "    ");
   }
 
   printf("\n  === Per-Track Summary (side 0) ===\n");
@@ -2814,7 +2693,6 @@ static void cmd_mfmscan(int argc, char **argv) {
 
   uint32_t total_sectors = 0;
   uint32_t total_crc = 0;
-
   for (uint8_t track = 0; track < DISK_CYLINDERS; track++) {
     read_track_stats(track, 0, &stats);
     printf("  T%02u    %-8lu %-8lu %-8lu %-8lu %-5lu %-5lu %-5lu\n", track,
@@ -2832,124 +2710,96 @@ static void cmd_mfmscan(int argc, char **argv) {
 static void cmd_version(int argc, char **argv) {
   (void)argc;
   (void)argv;
-#if defined(PICO_RP2040) && PICO_RP2040
-  const char *board = "RP2040 (Pico)";
-#elif defined(PICO_RP2350) && PICO_RP2350
-  const char *board = "RP2350 (Pico 2)";
-#else
-#error unsupported Raspberry Pi silicon
-#endif
   printf("Pico Floppy %s\n", FW_VERSION);
-  printf("  board:     %s\n", board);
-  printf("  sys clock: %lu MHz\n",
-         (unsigned long)(clock_get_hz(clk_sys) / 1000000));
+  printf("  board:     %s\n", BOARD_NAME);
+  printf("  sys clock: %lu MHz\n", (unsigned long)(clock_get_hz(clk_sys) / 1000000));
 }
 
 static void cmd_reboot(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  f12_err_t error = unmount_filesystem();
-  if (error != F12_OK) {
-    printf("Reboot refused: %s\n", f12_strerror(error));
+  disk_err_t error = unmount_filesystem();
+  if (error != DISK_OK) {
+    printf("Reboot refused: %s\n", disk_strerror(error));
     return;
   }
-  block_status_t drive_error = floppy_deinit(&floppy);
-  if (drive_error != BLOCK_OK) {
-    printf("Reboot refused: %s\n", block_status_text(drive_error));
+  error = floppy_deinit(&floppy);
+  if (error != DISK_OK) {
+    printf("Reboot refused: %s\n", disk_strerror(error));
     return;
   }
   printf("Rebooting...\n");
   sleep_ms(100);
   watchdog_reboot(0, 0, 0);
-  for (;;)
-    tight_loop_contents();
+  for (;;) tight_loop_contents();
 }
 
 int main(void) {
-  const uint32_t target_clock_khz = 144000u;
-#if defined(PICO_RP2040) && PICO_RP2040
-  vreg_set_voltage(VREG_VOLTAGE_1_20);
-  sleep_ms(2);
-#elif defined(PICO_RP2350) && PICO_RP2350
-#else
-#error unsupported Raspberry Pi silicon
-#endif
-  bool clock_ready = set_sys_clock_khz(target_clock_khz, true);
+  bool clock_ready = board_clock_init();
   stdio_init_all();
   sleep_ms(2000);
 
   printf("\r\n\r\n=== Pico Floppy Shell ===\r\n");
-  if (!clock_ready || clock_get_hz(clk_sys) != target_clock_khz * 1000u) {
-    printf(
-        "Clock initialization failed: requested %lu kHz, running %lu kHz\r\n",
-        (unsigned long)target_clock_khz,
-        (unsigned long)(clock_get_hz(clk_sys) / 1000u));
-    for (;;)
-      tight_loop_contents();
+  print_reset_cause();
+  if (!clock_ready) {
+    printf("Clock initialization failed: requested %lu kHz, running %lu kHz\r\n",
+           (unsigned long)BOARD_SYS_CLOCK_KHZ,
+           (unsigned long)(clock_get_hz(clk_sys) / 1000u));
+    for (;;) tight_loop_contents();
   }
   cmd_version(0, NULL);
 
-  block_status_t drive_error = floppy_init(&floppy, drive_pins);
-  if (drive_error != BLOCK_OK) {
-    printf("Drive initialization failed: %s\r\n",
-           block_status_text(drive_error));
-    for (;;)
-      tight_loop_contents();
+  disk_err_t error = floppy_init(&floppy, drive_pins);
+  if (error != DISK_OK) {
+    printf("Drive initialization failed: %s\r\n", disk_strerror(error));
+    for (;;) tight_loop_contents();
   }
 
-  f12_err_t init_error = f12_init(&fs, floppy_device(&floppy));
-  if (init_error != F12_OK) {
-    printf("Filesystem initialization failed: %s\r\n",
-           f12_strerror(init_error));
-    block_status_t cleanup_error = floppy_deinit(&floppy);
-    if (cleanup_error != BLOCK_OK) {
-      printf("Drive cleanup failed: %s\r\n", block_status_text(cleanup_error));
+  error = f12_init(&fs, floppy_device(&floppy));
+  if (error != DISK_OK) {
+    printf("Filesystem initialization failed: %s\r\n", disk_strerror(error));
+    disk_err_t cleanup_error = floppy_deinit(&floppy);
+    if (cleanup_error != DISK_OK) {
+      printf("Drive cleanup failed: %s\r\n", disk_strerror(cleanup_error));
     }
-    for (;;)
-      tight_loop_contents();
+    for (;;) tight_loop_contents();
   }
 
   printf("Drive initialized (HD mode)\r\n");
   printf("Type 'help' for commands, 'mount' when disk is ready.\r\n\r\n");
 
   char *argv[MAX_ARGS];
-
   for (;;) {
     print_prompt();
     int len = cli_readline(cmd_buf);
-    if (len == CLI_INPUT_CANCELLED)
-      continue;
+    if (len == CLI_INPUT_CANCELLED) continue;
     if (len == CLI_INPUT_OVERFLOW) {
       printf("Command line too long.\n");
       continue;
     }
-    if (len == 0)
-      continue;
+    if (len == 0) continue;
 
     int argc = tokenize(cmd_buf, argv, MAX_ARGS);
     if (argc < 0) {
       printf("Too many arguments.\n");
       continue;
     }
-    if (argc == 0)
-      continue;
+    if (argc == 0) continue;
 
     const cmd_entry_t *cmd = find_command(argv[0]);
     if (!cmd) {
       printf("Unknown command '%s'. Type 'help' for commands.\n", argv[0]);
       continue;
     }
-
     if (argc < cmd->min_args || argc > cmd->max_args) {
       print_usage(cmd);
       continue;
     }
-
     if (cmd->needs_mount) {
       bool mounted;
-      f12_err_t error = f12_is_mounted(&fs, &mounted);
-      if (error != F12_OK) {
-        printf("Filesystem state check failed: %s\n", f12_strerror(error));
+      error = f12_is_mounted(&fs, &mounted);
+      if (error != DISK_OK) {
+        printf("Filesystem state check failed: %s\n", disk_strerror(error));
         continue;
       }
       if (!mounted) {
@@ -2957,9 +2807,7 @@ int main(void) {
         continue;
       }
     }
-
     cmd->fn(argc, argv);
   }
-
   return 0;
 }
