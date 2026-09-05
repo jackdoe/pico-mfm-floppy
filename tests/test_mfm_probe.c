@@ -1,5 +1,6 @@
 #include "sim_floppy.h"
 #include "mfm_probe.h"
+#include "pico/stdlib.h"
 #include "pico/time.h"
 
 static pio_sim_drive_t drive;
@@ -24,13 +25,17 @@ TEST(test_all_patterns_survive_driver_write_seek_and_motor_restart) {
       for (unsigned pattern = 0; pattern < MFM_TEST_PATTERNS; pattern++) {
         track_t expected;
         setup_track(&expected, cylinders[c], head);
+        uint32_t generation = sim_generation(&floppy);
         ASSERT(mfm_test_fill(&expected, pattern, 0));
         ASSERT_EQ(
-            floppy_write_track(&floppy, sim_generation(&floppy), &expected),
+            floppy_write_track(&floppy, generation, &expected),
             DISK_OK);
         ASSERT_EQ(floppy_seek(&floppy, cylinders[c] == 0 ? 79 : 0), DISK_OK);
         ASSERT_EQ(floppy_motor_off(&floppy), DISK_OK);
-        ASSERT_EQ(capture(&expected), DISK_OK);
+        sleep_ms(1000);
+        ASSERT_EQ(mfm_probe_track(&floppy, generation, expected.cylinder,
+                                  expected.head, &expected, &probe), DISK_OK);
+        ASSERT_EQ(probe.stage, MFM_PROBE_COMPLETE);
         ASSERT(mfm_probe_clean(&probe));
         ASSERT_EQ(probe.decoder.sectors_read,
                   DISK_SECTORS_PER_TRACK * MFM_PROBE_REVOLUTIONS);
@@ -41,6 +46,29 @@ TEST(test_all_patterns_survive_driver_write_seek_and_motor_restart) {
         ASSERT_EQ(floppy.stats.underruns, 0);
       }
     }
+  }
+}
+
+TEST(test_media_change_while_motor_is_off_rejects_original_generation) {
+  for (unsigned stuck = 0; stuck < 2; stuck++) {
+    track_t expected;
+    setup_track(&expected, 0, 0);
+    ASSERT_EQ(floppy_seek(&floppy, 79), DISK_OK);
+    uint32_t generation = sim_generation(&floppy);
+    ASSERT_EQ(floppy_motor_off(&floppy), DISK_OK);
+    drive.disk_changed = true;
+    drive.disk_change_stuck = stuck != 0;
+    sleep_ms(1000);
+    ASSERT_EQ(mfm_probe_track(&floppy, generation, 0, 0, &expected, &probe),
+              DISK_ERR_MEDIA_CHANGED);
+    ASSERT_EQ(probe.stage, stuck ? MFM_PROBE_SEEK : MFM_PROBE_FLUX_BEGIN);
+    ASSERT_EQ(probe.revolutions, 0);
+    ASSERT_EQ(drive.flux_sample_reads, 0);
+    ASSERT_EQ(drive.write_gate_assertions, 0);
+    ASSERT_EQ(floppy.stats.media_changes, 1);
+    ASSERT(sim_generation(&floppy) != generation);
+    ASSERT_EQ(floppy.operation, FLOPPY_OPERATION_IDLE);
+    ASSERT(!floppy.flux_active);
   }
 }
 
@@ -148,6 +176,7 @@ TEST(test_media_change_during_capture_is_reported) {
   setup_track(&expected, 0, 0);
   drive.disk_change_after_samples = 1000;
   ASSERT_EQ(capture(&expected), DISK_ERR_MEDIA_CHANGED);
+  ASSERT_EQ(probe.stage, MFM_PROBE_CAPTURE);
   ASSERT(!mfm_probe_clean(&probe));
   ASSERT(!floppy.flux_active);
   ASSERT_EQ(floppy.operation, FLOPPY_OPERATION_IDLE);
@@ -168,6 +197,7 @@ TEST(test_pattern_rounds_distinguish_stale_random_data) {
 int main(void) {
   pio_sim_init(&drive);
   RUN_TEST(test_all_patterns_survive_driver_write_seek_and_motor_restart);
+  RUN_TEST(test_media_change_while_motor_is_off_rejects_original_generation);
   RUN_TEST(test_wrong_cylinder_and_head_are_not_counted_as_valid_sectors);
   RUN_TEST(test_a_good_revolution_cannot_hide_a_missing_sector_on_another);
   RUN_TEST(test_crc_valid_wrong_data_is_rejected);

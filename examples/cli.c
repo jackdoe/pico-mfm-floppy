@@ -14,7 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define FW_VERSION "0.4.1"
+#define FW_VERSION "0.4.2"
 #define CMD_BUF_SIZE 256
 #define IO_BUF_SIZE DISK_SECTOR_SIZE
 #define WORK_BUF_SIZE (8u * DISK_SECTOR_SIZE)
@@ -98,6 +98,7 @@ static void cmd_crashcheck(int argc, char **argv);
 static void cmd_rpm(int argc, char **argv);
 static void cmd_test_full(int argc, char **argv);
 static void cmd_test_mfm(int argc, char **argv);
+static void cmd_test_control(int argc, char **argv);
 static void cmd_test_media(int argc, char **argv);
 static void cmd_test_fsck(int argc, char **argv);
 static void cmd_diskdump(int argc, char **argv);
@@ -139,6 +140,8 @@ static const cmd_entry_t commands[] = {
      "Run destructive hardware tests"},
     {"test-mfm", cmd_test_mfm, false, 1, 2, "[rounds]",
      "Run destructive MFM pattern and restart tests"},
+    {"test-control", cmd_test_control, false, 1, 2, "[rounds]",
+     "Test seeking and motor restarts without writing"},
     {"test-media", cmd_test_media, true, 1, 1, "",
      "Run interactive media-change tests"},
     {"test-fsck", cmd_test_fsck, false, 1, 1, "",
@@ -607,6 +610,7 @@ static double percent(uint32_t part, uint32_t total) {
 }
 
 static void print_track_stats(const mfm_probe_t *probe, const char *indent) {
+  printf("%sProbe stage: %s\n", indent, mfm_probe_stage_name(probe->stage));
   mfm_probe_counts_t counts = mfm_probe_counts(probe);
   printf("%sPulses:   %lu total\n", indent, (unsigned long)counts.total);
   printf("%sShort:    %lu (%.1f%%)\n", indent, (unsigned long)counts.short_count,
@@ -1730,19 +1734,26 @@ static bool run_mfm_patterns(uint32_t rounds, int *pass, int *fail) {
             check(false, "prepare test pattern", pass, fail);
             return false;
           }
+          const char *stage = "statistics reset";
           error = floppy_stats_reset(&floppy);
           if (error == DISK_OK) {
+            stage = "write / verification";
             error = floppy_write_track(&floppy, generation, &work_track);
           }
           if (error == DISK_OK) {
+            stage = "seek away";
             error = floppy_seek(&floppy, cylinders[c] == 0 ? DISK_CYLINDERS - 1u : 0);
           }
-          if (error == DISK_OK) error = floppy_motor_off(&floppy);
+          if (error == DISK_OK) {
+            stage = "motor stop";
+            error = floppy_motor_off(&floppy);
+          }
           if (error == DISK_OK) sleep_ms(1000);
           memset(&signal_probe, 0, sizeof(signal_probe));
           if (error == DISK_OK) {
             error = mfm_probe_track(&floppy, generation, cylinders[c], head,
                                     &work_track, &signal_probe);
+            stage = mfm_probe_stage_name(signal_probe.stage);
           }
           floppy_stats_t stats = {0};
           disk_err_t stats_error = floppy_stats(&floppy, &stats);
@@ -1765,6 +1776,9 @@ static bool run_mfm_patterns(uint32_t rounds, int *pass, int *fail) {
                        stats.media_changes == 0;
           check(clean, "pattern survives seek and motor restart", pass, fail);
           if (!clean) {
+            printf("    Stage: %s; DISK_CHANGE GP%u=%d, MOTOR_ENABLE=%d, DRIVE_SELECT=%d\n",
+                   stage, drive_pins.disk_change, gpio_get(drive_pins.disk_change),
+                   gpio_get(drive_pins.motor_enable), gpio_get(drive_pins.drive_select));
             if (signal_probe.decoder.cell_q8 != 0) {
               print_track_stats(&signal_probe, "    ");
             } else {
@@ -1777,6 +1791,81 @@ static bool run_mfm_patterns(uint32_t rounds, int *pass, int *fail) {
     }
   }
   return true;
+}
+
+static bool control_checkpoint(const char *stage, disk_err_t error,
+                                uint32_t expected_generation) {
+  uint32_t generation = 0;
+  disk_err_t query = floppy_media_generation(&floppy, &generation);
+  if (error == DISK_OK) error = query;
+  if (error == DISK_OK && generation != expected_generation)
+    error = DISK_ERR_MEDIA_CHANGED;
+  printf("  %-24s %s; generation=%lu/%lu GP%u=%d motor=%d select=%d side=%d\n",
+         stage, disk_strerror(error), (unsigned long)generation,
+         (unsigned long)expected_generation, drive_pins.disk_change,
+         gpio_get(drive_pins.disk_change), gpio_get(drive_pins.motor_enable),
+         gpio_get(drive_pins.drive_select), gpio_get(drive_pins.side_select));
+  return error == DISK_OK;
+}
+
+static bool control_watch(uint32_t generation) {
+  uint32_t samples = 0;
+  uint32_t low_samples = 0;
+  uint32_t edges = 0;
+  bool previous = gpio_get(drive_pins.disk_change);
+  absolute_time_t deadline = make_timeout_time_ms(1000);
+  while (!time_reached(deadline)) {
+    bool high = gpio_get(drive_pins.disk_change);
+    samples++;
+    if (!high) low_samples++;
+    if (high != previous) edges++;
+    previous = high;
+    if (low_samples == 1u && !high) {
+      uint32_t observed;
+      disk_err_t error = floppy_media_generation(&floppy, &observed);
+      if (error != DISK_OK) return false;
+    }
+    sleep_us(50);
+  }
+  printf("  Motor-off GP%u: low=%lu/%lu samples, edges=%lu (50 us polling over 1 s)\n",
+         drive_pins.disk_change, (unsigned long)low_samples,
+         (unsigned long)samples, (unsigned long)edges);
+  return control_checkpoint("motor-off observation",
+                            low_samples ? DISK_ERR_MEDIA_CHANGED : DISK_OK,
+                            generation);
+}
+
+static void cmd_test_control(int argc, char **argv) {
+  uint32_t rounds = 10;
+  if (argc == 2 && !parse_u32(argv[1], 1, 100, &rounds)) {
+    printf("Rounds must be an integer from 1 through 100.\n");
+    return;
+  }
+  if (owned_writer.token.id != 0) {
+    printf("A file commit is pending; run 'commit' before this test.\n");
+    return;
+  }
+  printf("  Control test: no disk writes. Leave the disk inserted. GPIO levels are raw: 0=LOW, 1=HIGH.\n");
+  disk_err_t error = floppy_seek(&floppy, 0);
+  uint32_t generation = 0;
+  if (error == DISK_OK) error = floppy_media_generation(&floppy, &generation);
+  bool clean = control_checkpoint("home / establish media", error, generation);
+  for (uint32_t round = 0; clean && round < rounds; round++) {
+    printf("  Round %lu/%lu\n", (unsigned long)(round + 1u), (unsigned long)rounds);
+    for (uint8_t head = 0; clean && head < DISK_HEADS; head++) {
+      clean = control_checkpoint("side select", floppy_side_select(&floppy, head), generation);
+      if (!clean) break;
+      clean = control_checkpoint("seek to 79", floppy_seek(&floppy, 79), generation);
+      if (!clean) break;
+      clean = control_checkpoint("motor stop", floppy_motor_off(&floppy), generation);
+      if (!clean) break;
+      clean = control_watch(generation);
+      if (!clean) break;
+      clean = control_checkpoint("restart / seek to 0", floppy_seek(&floppy, 0), generation);
+    }
+  }
+  if (!drive_idle()) clean = false;
+  printf("  Control test: %s\n", clean ? "ALL PASSED" : "FAILED");
 }
 
 static void cmd_test_mfm(int argc, char **argv) {

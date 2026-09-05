@@ -5,6 +5,20 @@ const char *const mfm_test_pattern_names[MFM_TEST_PATTERNS] = {
     "00", "FF", "55", "AA", "92", "49", "random",
 };
 
+const char *mfm_probe_stage_name(mfm_probe_stage_t stage) {
+  switch (stage) {
+    case MFM_PROBE_NOT_STARTED: return "not started";
+    case MFM_PROBE_VALIDATE: return "validate";
+    case MFM_PROBE_SEEK: return "seek / motor qualification";
+    case MFM_PROBE_SIDE_SELECT: return "side select";
+    case MFM_PROBE_FLUX_BEGIN: return "flux begin / generation check";
+    case MFM_PROBE_CAPTURE: return "capture";
+    case MFM_PROBE_FLUX_END: return "flux stop";
+    case MFM_PROBE_COMPLETE: return "complete";
+  }
+  return "unknown";
+}
+
 unsigned mfm_probe_sector_count(uint32_t sectors) {
   unsigned count = 0;
   while (sectors) {
@@ -48,17 +62,24 @@ disk_err_t mfm_probe_track(floppy_t *floppy, uint32_t generation,
                            const track_t *expected, mfm_probe_t *probe) {
   if (!probe) return DISK_ERR_INVALID;
   memset(probe, 0, sizeof(*probe));
+  probe->stage = MFM_PROBE_VALIDATE;
   mfm_init(&probe->decoder);
   if (!disk_ch_valid(cylinder, head) ||
       (expected && (expected->cylinder != cylinder || expected->head != head ||
                     expected->valid != DISK_TRACK_VALID))) {
     return DISK_ERR_INVALID;
   }
+  probe->stage = MFM_PROBE_SEEK;
   disk_err_t error = floppy_seek(floppy, cylinder);
-  if (error == DISK_OK) error = floppy_side_select(floppy, head);
-  if (error == DISK_OK) error = floppy_flux_begin(floppy, generation);
+  if (error != DISK_OK) return error;
+  probe->stage = MFM_PROBE_SIDE_SELECT;
+  error = floppy_side_select(floppy, head);
+  if (error != DISK_OK) return error;
+  probe->stage = MFM_PROBE_FLUX_BEGIN;
+  error = floppy_flux_begin(floppy, generation);
   if (error != DISK_OK) return error;
 
+  probe->stage = MFM_PROBE_CAPTURE;
   floppy_pulse_t pulses[64];
   mfm_sector_t sector;
   bool primed = false;
@@ -107,7 +128,9 @@ disk_err_t mfm_probe_track(floppy_t *floppy, uint32_t generation,
       }
     }
   }
+  if (error == DISK_OK) probe->stage = MFM_PROBE_FLUX_END;
   disk_err_t cleanup = floppy_flux_end(floppy);
+  if (error == DISK_OK && cleanup == DISK_OK) probe->stage = MFM_PROBE_COMPLETE;
   return error != DISK_OK ? error : cleanup;
 }
 

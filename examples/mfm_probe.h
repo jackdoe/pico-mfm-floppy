@@ -8,7 +8,19 @@
 #define MFM_PROBE_REVOLUTIONS 3u
 #define MFM_TEST_PATTERNS 7u
 
+typedef enum {
+  MFM_PROBE_NOT_STARTED,
+  MFM_PROBE_VALIDATE,
+  MFM_PROBE_SEEK,
+  MFM_PROBE_SIDE_SELECT,
+  MFM_PROBE_FLUX_BEGIN,
+  MFM_PROBE_CAPTURE,
+  MFM_PROBE_FLUX_END,
+  MFM_PROBE_COMPLETE,
+} mfm_probe_stage_t;
+
 typedef struct {
+  mfm_probe_stage_t stage;
   mfm_t decoder;
   uint32_t histogram[MFM_PROBE_BINS];
   uint32_t oversized;
@@ -31,6 +43,7 @@ typedef struct {
 extern const char *const mfm_test_pattern_names[MFM_TEST_PATTERNS];
 
 unsigned mfm_probe_sector_count(uint32_t sectors);
+const char *mfm_probe_stage_name(mfm_probe_stage_t stage);
 mfm_probe_counts_t mfm_probe_counts(const mfm_probe_t *probe);
 bool mfm_probe_clean(const mfm_probe_t *probe);
 disk_err_t mfm_probe_track(floppy_t *floppy, uint32_t generation,
