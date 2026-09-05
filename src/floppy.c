@@ -464,6 +464,10 @@ disk_result_t floppy_flux_read(floppy_t *f, floppy_pulse_t *pulses, size_t capac
       .start_ms = f->operation_start_ms,
       .limit_ms = f->operation_limit_ms,
   };
+  if (deadline_elapsed(&deadline)) {
+    result.error = DISK_ERR_TIMEOUT;
+    return result;
+  }
   result.error = floppy_flux_next_internal(f, &deadline, f->flux_generation, pulses);
   if (result.error != DISK_OK) return result;
   result.count = 1;
@@ -1128,7 +1132,7 @@ static bool flux_tx_emit(void *ctx, uint8_t pulse) {
   }
   uint8_t *buffer = (uint8_t *)tx->floppy->flux_ring +
                     tx->fill_half * FLOPPY_TX_HALF_BYTES;
-  buffer[tx->fill++] = pulse;
+  buffer[tx->fill++] = (uint8_t)(pulse - FLOPPY_WRITE_PIO_OVERHEAD);
   tx->produced++;
   if (tx->fill == FLOPPY_TX_HALF_BYTES && !flux_tx_submit(tx)) return false;
   return true;

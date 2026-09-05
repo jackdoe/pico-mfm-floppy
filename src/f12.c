@@ -3,17 +3,11 @@
 
 #define F12_SIGNATURE 0x46313246u
 
-static uint64_t f12_next_generation(uint64_t generation) {
-  generation++;
-  return generation ? generation : 1u;
-}
+static uint64_t f12_id_source;
 
-static uint64_t f12_incarnation_source;
-
-static uint64_t f12_next_incarnation(void) {
-  f12_incarnation_source++;
-  if (f12_incarnation_source == 0) f12_incarnation_source++;
-  return f12_incarnation_source;
+static uint64_t f12_next_id(void) {
+  if (f12_id_source == UINT64_MAX) return 0;
+  return ++f12_id_source;
 }
 
 static bool f12_valid(const f12_t *fs) {
@@ -26,23 +20,17 @@ static disk_result_t f12_result(disk_err_t error, size_t count) {
 }
 
 static void f12_release_file_slot(f12_file_slot_t *slot) {
-  slot->active = false;
-  slot->mode = 0;
-  slot->generation = f12_next_generation(slot->generation);
-  memset(&slot->name, 0, sizeof(slot->name));
-  memset(&slot->io, 0, sizeof(slot->io));
+  memset(slot, 0, sizeof(*slot));
 }
 
 static void f12_release_dir_slot(f12_dir_slot_t *slot) {
-  slot->active = false;
-  slot->index = 0;
-  slot->generation = f12_next_generation(slot->generation);
+  memset(slot, 0, sizeof(*slot));
 }
 
 static void f12_invalidate(f12_t *fs) {
   for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) {
     f12_file_slot_t *slot = &fs->files[i];
-    if (slot->active && slot->mode == F12_OPEN_WRITE) {
+    if (slot->id != 0 && slot->mode == F12_OPEN_WRITE) {
       fat12_forget_write(&slot->io.writer);
     }
     f12_release_file_slot(slot);
@@ -76,24 +64,28 @@ static disk_err_t f12_check_writable(f12_t *fs) {
 
 static bool f12_writer_open(const f12_t *fs) {
   for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) {
-    if (fs->files[i].active && fs->files[i].mode == F12_OPEN_WRITE) return true;
+    if (fs->files[i].id != 0 && fs->files[i].mode == F12_OPEN_WRITE) return true;
+  }
+  return false;
+}
+
+static bool f12_directories_open(const f12_t *fs) {
+  for (size_t i = 0; i < F12_MAX_OPEN_DIRS; i++) {
+    if (fs->dirs[i].id != 0) return true;
   }
   return false;
 }
 
 static bool f12_operations_open(const f12_t *fs) {
   for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) {
-    if (fs->files[i].active) return true;
+    if (fs->files[i].id != 0) return true;
   }
-  for (size_t i = 0; i < F12_MAX_OPEN_DIRS; i++) {
-    if (fs->dirs[i].active) return true;
-  }
-  return false;
+  return f12_directories_open(fs);
 }
 
 static bool f12_name_open(const f12_t *fs, const fat12_name_t *name) {
   for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) {
-    if (fs->files[i].active &&
+    if (fs->files[i].id != 0 &&
         memcmp(&fs->files[i].name, name, sizeof(*name)) == 0) {
       return true;
     }
@@ -101,32 +93,27 @@ static bool f12_name_open(const f12_t *fs, const fat12_name_t *name) {
   return false;
 }
 
-static f12_file_slot_t *f12_file_slot(f12_file_t *file) {
-  if (!file || !f12_valid(file->token.fs) ||
-      file->token.fs->state != F12_STATE_MOUNTED ||
-      file->token.slot >= F12_MAX_OPEN_FILES ||
-      file->token.incarnation != file->token.fs->incarnation) {
-    return NULL;
-  }
-  f12_file_slot_t *slot = &file->token.fs->files[file->token.slot];
-  if (!slot->active || slot->generation != file->token.slot_generation) {
-    return NULL;
-  }
-  return slot;
+static bool f12_token_valid(const f12_token_t *token) {
+  return token && token->id != 0 && f12_valid(token->fs) &&
+         token->fs->state == F12_STATE_MOUNTED;
 }
 
-static f12_dir_slot_t *f12_dir_slot(f12_dir_t *dir) {
-  if (!dir || !f12_valid(dir->token.fs) ||
-      dir->token.fs->state != F12_STATE_MOUNTED ||
-      dir->token.slot >= F12_MAX_OPEN_DIRS ||
-      dir->token.incarnation != dir->token.fs->incarnation) {
-    return NULL;
+static f12_file_slot_t *f12_file_slot(const f12_file_t *file) {
+  if (!file || !f12_token_valid(&file->token)) return NULL;
+  for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) {
+    f12_file_slot_t *slot = &file->token.fs->files[i];
+    if (slot->id == file->token.id) return slot;
   }
-  f12_dir_slot_t *slot = &dir->token.fs->dirs[dir->token.slot];
-  if (!slot->active || slot->generation != dir->token.slot_generation) {
-    return NULL;
+  return NULL;
+}
+
+static f12_dir_slot_t *f12_dir_slot(const f12_dir_t *dir) {
+  if (!dir || !f12_token_valid(&dir->token)) return NULL;
+  for (size_t i = 0; i < F12_MAX_OPEN_DIRS; i++) {
+    f12_dir_slot_t *slot = &dir->token.fs->dirs[i];
+    if (slot->id == dir->token.id) return slot;
   }
-  return slot;
+  return NULL;
 }
 
 static const char *f12_path(const char *path) {
@@ -156,14 +143,10 @@ disk_err_t f12_init(f12_t *fs, disk_device_t device) {
       !device.write_protected) {
     return DISK_ERR_INVALID;
   }
-  uint64_t incarnation = f12_next_incarnation();
   memset(fs, 0, sizeof(*fs));
   cache_init(&fs->cache, device);
-  fs->incarnation = incarnation;
   fs->signature = F12_SIGNATURE;
   fs->signature_inverse = ~F12_SIGNATURE;
-  for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) fs->files[i].generation = 1;
-  for (size_t i = 0; i < F12_MAX_OPEN_DIRS; i++) fs->dirs[i].generation = 1;
   return DISK_OK;
 }
 
@@ -255,7 +238,14 @@ disk_err_t f12_fsck(f12_t *fs, fat12_fsck_t *report, bool repair) {
       fat12_busy(&fs->fat)) {
     return DISK_ERR_CONFLICT;
   }
-  return f12_finish(fs, fat12_fsck(&fs->fat, report, repair));
+  error = fat12_fsck(&fs->fat, report, repair);
+  if (error == DISK_OK && repair) {
+    cache_clear(&fs->cache);
+    fat12_fsck_t verified;
+    error = fat12_fsck(&fs->fat, &verified, false);
+    if (error == DISK_OK && !fat12_fsck_clean(&verified)) error = DISK_ERR_CORRUPT;
+  }
+  return f12_finish(fs, error);
 }
 
 disk_err_t f12_is_mounted(f12_t *fs, bool *mounted) {
@@ -284,18 +274,21 @@ disk_err_t f12_open(f12_t *fs, const char *path, f12_open_mode_t mode,
   if (error != DISK_OK) return error;
   if ((mode == F12_OPEN_READ && f12_writer_open(fs) && f12_name_open(fs, &parsed)) ||
       (mode == F12_OPEN_WRITE &&
-       (f12_writer_open(fs) || fat12_busy(&fs->fat) || f12_name_open(fs, &parsed)))) {
+       (f12_writer_open(fs) || fat12_busy(&fs->fat) ||
+        f12_directories_open(fs) || f12_name_open(fs, &parsed)))) {
     return DISK_ERR_CONFLICT;
   }
 
   size_t index = F12_MAX_OPEN_FILES;
   for (size_t i = 0; i < F12_MAX_OPEN_FILES; i++) {
-    if (!fs->files[i].active) {
+    if (fs->files[i].id == 0) {
       index = i;
       break;
     }
   }
   if (index == F12_MAX_OPEN_FILES) return DISK_ERR_TOO_MANY;
+  uint64_t id = f12_next_id();
+  if (id == 0) return DISK_ERR_FULL;
 
   f12_file_slot_t *slot = &fs->files[index];
   if (mode == F12_OPEN_READ) {
@@ -309,15 +302,12 @@ disk_err_t f12_open(f12_t *fs, const char *path, f12_open_mode_t mode,
   }
   if (error != DISK_OK) return f12_finish(fs, error);
 
-  slot->generation = f12_next_generation(slot->generation);
+  slot->id = id;
   slot->name = parsed;
   slot->mode = mode;
-  slot->active = true;
   *out = (f12_file_t){.token = {
       .fs = fs,
-      .incarnation = fs->incarnation,
-      .slot_generation = slot->generation,
-      .slot = (uint16_t)index,
+      .id = id,
   }};
   return DISK_OK;
 }
@@ -390,7 +380,7 @@ disk_err_t f12_seek(f12_file_t *file, uint32_t offset) {
 
 disk_err_t f12_tell(const f12_file_t *file, uint32_t *offset) {
   if (!offset) return DISK_ERR_INVALID;
-  f12_file_slot_t *slot = f12_file_slot((f12_file_t *)file);
+  f12_file_slot_t *slot = f12_file_slot(file);
   if (!slot) return DISK_ERR_BAD_HANDLE;
   disk_err_t error = f12_check_mounted(file->token.fs);
   if (error != DISK_OK) return error;
@@ -465,22 +455,21 @@ disk_err_t f12_opendir(f12_t *fs, const char *path, f12_dir_t *dir) {
 
   size_t index = F12_MAX_OPEN_DIRS;
   for (size_t i = 0; i < F12_MAX_OPEN_DIRS; i++) {
-    if (!fs->dirs[i].active) {
+    if (fs->dirs[i].id == 0) {
       index = i;
       break;
     }
   }
   if (index == F12_MAX_OPEN_DIRS) return DISK_ERR_TOO_MANY;
+  uint64_t id = f12_next_id();
+  if (id == 0) return DISK_ERR_FULL;
 
   f12_dir_slot_t *slot = &fs->dirs[index];
-  slot->generation = f12_next_generation(slot->generation);
+  slot->id = id;
   slot->index = 0;
-  slot->active = true;
   *dir = (f12_dir_t){.token = {
       .fs = fs,
-      .incarnation = fs->incarnation,
-      .slot_generation = slot->generation,
-      .slot = (uint16_t)index,
+      .id = id,
   }};
   return DISK_OK;
 }
@@ -497,8 +486,11 @@ disk_err_t f12_readdir(f12_dir_t *dir, f12_stat_t *stat) {
     fat12_dirent_t entry;
     error = fat12_read_root_entry(&fs->fat, slot->index, &entry);
     if (error != DISK_OK) return f12_finish(fs, error);
+    if (fat12_entry_is_end(&entry)) {
+      slot->index = FAT12_ROOT_ENTRIES;
+      return DISK_END;
+    }
     slot->index++;
-    if (fat12_entry_is_end(&entry)) return DISK_END;
     if (!fat12_entry_valid(&entry) || (entry.attr & FAT12_ATTR_VOLUME_ID) != 0) {
       continue;
     }

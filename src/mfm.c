@@ -46,20 +46,15 @@ static void mfm_encode_pulse(mfm_encode_t *e, uint8_t timing) {
     e->held_valid = true;
     return;
   }
-  uint8_t out = e->held;
-  if (!e->held_first && out == MFM_PULSE_SHORT) {
-    bool prev_long = e->last_out == MFM_PULSE_LONG;
-    bool next_long = timing == MFM_PULSE_LONG;
-    if (prev_long && !next_long) {
-      out = (uint8_t)((int)out - e->precomp_shift);
-    } else if (next_long && !prev_long) {
-      out = (uint8_t)((int)out + e->precomp_shift);
-    }
+  int shift = 0;
+  if (e->held == MFM_PULSE_SHORT && timing > MFM_PULSE_SHORT) {
+    shift = -e->precomp_shift;
+  } else if (e->held > MFM_PULSE_SHORT && timing == MFM_PULSE_SHORT) {
+    shift = e->precomp_shift;
   }
-  mfm_encode_out(e, out);
-  e->last_out = out;
+  mfm_encode_out(e, (uint8_t)((int)e->held + shift - e->edge_shift));
+  e->edge_shift = (int8_t)shift;
   e->held = timing;
-  e->held_first = false;
 }
 
 static void mfm_encode_cells(mfm_encode_t *e) {
@@ -161,10 +156,9 @@ size_t mfm_encode_track(mfm_encode_t *e, const track_t *track) {
     return e->pos;
   }
   if (track->cylinder >= MFM_PRECOMP_START_TRACK) {
-    e->precomp_shift = MFM_PRECOMP_SHIFT +
-                       ((int)track->cylinder - (int)MFM_PRECOMP_START_TRACK) / 13;
+    e->precomp_shift = MFM_PRECOMP_SHIFT;
     e->held_valid = false;
-    e->held_first = true;
+    e->edge_shift = 0;
   }
   mfm_encode_gap(e, 80);
   for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK && !e->stopped; sector++) {
@@ -173,16 +167,19 @@ size_t mfm_encode_track(mfm_encode_t *e, const track_t *track) {
   }
   if (e->precomp_shift) {
     e->precomp_shift = 0;
-    if (e->held_valid && !e->stopped) mfm_encode_out(e, e->held);
+    if (e->held_valid && !e->stopped) {
+      mfm_encode_out(e, (uint8_t)((int)e->held - e->edge_shift));
+    }
     e->held_valid = false;
   }
   return e->pos;
 }
 
-static void mfm_set_cell(mfm_t *m, uint16_t t_cell) {
-  m->t_cell = t_cell;
-  m->T2_max = (uint16_t)((uint32_t)t_cell * 5u / 4u);
-  m->T3_max = (uint16_t)((uint32_t)t_cell * 7u / 4u);
+static void mfm_set_cell(mfm_t *m, uint32_t cell_q8) {
+  uint32_t minimum = MFM_PULSE_FLOOR * 256u;
+  uint32_t maximum = MFM_CELL_TICKS * 5u / 4u * 256u;
+  m->cell_q8 = cell_q8 < minimum ? minimum
+                : cell_q8 > maximum ? maximum : cell_q8;
 }
 
 static void mfm_hunt(mfm_t *m) {
@@ -203,20 +200,18 @@ static void mfm_abort(mfm_t *m) {
 }
 
 static int mfm_classify(mfm_t *m, uint16_t delta) {
-  if (delta < MFM_PULSE_FLOOR) return -1;
-  if (delta <= m->T2_max) {
-    if ((m->state == MFM_DATA || m->state == MFM_CLOCK) && m->t_cell > 0 &&
-        delta <= m->t_cell + (m->t_cell >> 3)) {
-      int difference = (int)delta - (int)m->t_cell;
-      int adjustment = difference >= 0 ? (difference + 8) / 16
-                                       : -((-difference + 7) / 16);
-      mfm_set_cell(m, (uint16_t)((int)m->t_cell + adjustment));
+  if (delta < MFM_PULSE_FLOOR || delta >= MFM_PULSE_CEILING) return -1;
+  int pulse = delta <= mfm_short_limit(m) ? MFM_SHORT
+                : delta <= mfm_medium_limit(m) ? MFM_MEDIUM : MFM_LONG;
+  if (m->state == MFM_DATA || m->state == MFM_CLOCK) {
+    uint32_t observed = (uint32_t)delta * 512u / ((uint32_t)pulse + 2u);
+    int32_t difference = (int32_t)observed - (int32_t)m->cell_q8;
+    int32_t limit = (int32_t)(m->cell_q8 / 8u);
+    if (difference >= -limit && difference <= limit) {
+      mfm_set_cell(m, (uint32_t)((int32_t)m->cell_q8 + difference / 16));
     }
-    return MFM_SHORT;
   }
-  if (delta <= m->T3_max) return MFM_MEDIUM;
-  if (delta < MFM_PULSE_CEILING) return MFM_LONG;
-  return -1;
+  return pulse;
 }
 
 static bool mfm_push_bit(mfm_t *m, int bit) {
@@ -235,7 +230,7 @@ static bool mfm_push_bit(mfm_t *m, int bit) {
 void mfm_init(mfm_t *m) {
   if (!m) return;
   memset(m, 0, sizeof(*m));
-  mfm_set_cell(m, MFM_CELL_TICKS);
+  mfm_set_cell(m, MFM_CELL_TICKS * 256u);
   mfm_abort(m);
 }
 
@@ -255,8 +250,8 @@ bool mfm_feed(mfm_t *m, uint16_t delta, mfm_sector_t *out) {
   if (pulse < 0) {
     if (m->state != MFM_HUNT || m->record_state != MFM_EXPECT_ID) {
       m->format_errors++;
-      mfm_abort(m);
     }
+    mfm_abort(m);
     return false;
   }
 
@@ -274,7 +269,8 @@ bool mfm_feed(mfm_t *m, uint16_t delta, mfm_sector_t *out) {
         return false;
       }
       if (m->short_count >= MFM_MIN_PREAMBLE) {
-        mfm_set_cell(m, (uint16_t)(m->preamble_sum / m->short_count));
+        mfm_set_cell(m, (uint32_t)((uint64_t)m->preamble_sum * 256u / m->short_count));
+        pulse = mfm_classify(m, delta);
         if (pulse == mfm_sync_pattern[0]) {
           m->state = MFM_SYNCING;
           m->sync_stage = 1;

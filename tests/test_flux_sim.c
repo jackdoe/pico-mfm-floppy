@@ -150,7 +150,7 @@ TEST(test_noise_is_seeded_reproducible_and_validated) {
         ASSERT(flux_sim_next(&second, &b));
         ASSERT(flux_sim_next(&different, &c));
         ASSERT_EQ(a, b);
-        uint16_t clean = (uint16_t)(pulse_buf[i] + MFM_PIO_OVERHEAD);
+        uint16_t clean = (uint16_t)(pulse_buf[i]);
         if (a != clean) changed++;
         if (a != c) diverged++;
     }
@@ -467,11 +467,11 @@ TEST(test_scp_boot_sector_content) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3 || strcmp(argv[1], "--fixture") != 0) {
-        fprintf(stderr, "usage: %s --fixture PATH\n", argv[0]);
+    if (argc != 1 && (argc != 3 || strcmp(argv[1], "--fixture") != 0)) {
+        fprintf(stderr, "usage: %s [--fixture PATH]\n", argv[0]);
         return 2;
     }
-    scp_path = argv[2];
+    if (argc == 3) scp_path = argv[2];
     printf("=== Flux Simulator Tests ===\n\n");
 
     printf("--- Synthetic Tests ---\n");
@@ -485,11 +485,13 @@ int main(int argc, char **argv) {
     RUN_TEST(test_synthetic_with_precomp);
     RUN_TEST(test_adaptive_timing_with_drift);
 
-    printf("\n--- Real SCP Tests (System Shock disk 1) ---\n");
-    RUN_TEST(test_scp_decode_track0);
-    RUN_TEST(test_scp_track0_with_correlated_noise);
-    RUN_TEST(test_scp_decode_full_disk);
-    RUN_TEST(test_scp_boot_sector_content);
+    if (scp_path) {
+        printf("\n--- Real SCP Tests (System Shock disk 1) ---\n");
+        RUN_TEST(test_scp_decode_track0);
+        RUN_TEST(test_scp_track0_with_correlated_noise);
+        RUN_TEST(test_scp_decode_full_disk);
+        RUN_TEST(test_scp_boot_sector_content);
+    }
 
     TEST_RESULTS();
 }

@@ -98,7 +98,6 @@ typedef struct {
   uint32_t bytes_written;
   disk_err_t error;
   fat12_writer_phase_t phase;
-  bool replacing_existing;
   bool consumed_end;
   uint8_t cluster_buf[FAT12_SECTORS_PER_CLUSTER * DISK_SECTOR_SIZE];
 } fat12_writer_t;

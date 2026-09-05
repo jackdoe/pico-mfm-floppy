@@ -14,9 +14,7 @@ typedef struct f12 f12_t;
 
 typedef struct {
   f12_t *fs;
-  uint64_t incarnation;
-  uint64_t slot_generation;
-  uint16_t slot;
+  uint64_t id;
 } f12_token_t;
 
 typedef enum {
@@ -62,15 +60,13 @@ typedef struct {
     fat12_file_t reader;
     fat12_writer_t writer;
   } io;
-  uint64_t generation;
+  uint64_t id;
   f12_open_mode_t mode;
-  bool active;
 } f12_file_slot_t;
 
 typedef struct {
-  uint64_t generation;
+  uint64_t id;
   uint16_t index;
-  bool active;
 } f12_dir_slot_t;
 
 struct f12 {
@@ -78,7 +74,6 @@ struct f12 {
   fat12_t fat;
   f12_file_slot_t files[F12_MAX_OPEN_FILES];
   f12_dir_slot_t dirs[F12_MAX_OPEN_DIRS];
-  uint64_t incarnation;
   uint32_t signature;
   uint32_t signature_inverse;
   f12_state_t state;

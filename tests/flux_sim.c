@@ -128,7 +128,7 @@ bool flux_sim_from_track(flux_sim_t *sim, const uint8_t *pulse_buf, size_t pulse
     if (!flux_rev_ensure(&sim->rev, (uint32_t)pulse_count)) return false;
 
     for (size_t i = 0; i < pulse_count; i++) {
-        sim->rev.deltas[i] = pulse_buf[i] + MFM_PIO_OVERHEAD;
+        sim->rev.deltas[i] = pulse_buf[i];
     }
 
     sim->rev.count = (uint32_t)pulse_count;
@@ -213,7 +213,7 @@ uint8_t *scp_encode_disk(
             uint32_t flux_count = (uint32_t)enc.pos;
             uint32_t duration = 0;
             for (size_t i = 0; i < enc.pos; i++) {
-                duration += (encode_buf[i] + MFM_PIO_OVERHEAD) * 5 / 3;
+                duration += (uint32_t)encode_buf[i] * 5u / 3u;
             }
 
             if (write_pos > UINT32_MAX) {
@@ -238,7 +238,7 @@ uint8_t *scp_encode_disk(
                 return NULL;
             }
             for (size_t i = 0; i < enc.pos; i++) {
-                uint32_t scp_val = (encode_buf[i] + MFM_PIO_OVERHEAD) * 5 / 3;
+                uint32_t scp_val = (uint32_t)encode_buf[i] * 5u / 3u;
                 if (scp_val > 0xFFFF) scp_val = 0xFFFF;
                 write_be16(flux_out + i * 2, (uint16_t)scp_val);
             }

@@ -1,0 +1,5 @@
+add_library(floppy_rpc STATIC rpc.c rpc_client.c rpc_server.c)
+target_link_libraries(floppy_rpc PUBLIC floppy_core)
+target_include_directories(floppy_rpc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(floppy_rpc PRIVATE ${FLOPPY_C_OPTIONS})
+set_target_properties(floppy_rpc PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)

@@ -56,6 +56,21 @@ TEST(test_stale_generation_rejects_read_without_flux) {
   ASSERT_EQ(drive.flux_sample_reads, before);
 }
 
+TEST(test_raw_deadline_applies_even_when_flux_is_already_buffered) {
+  sim_setup(&drive, &floppy);
+  install_flux();
+  ASSERT_EQ(floppy_flux_begin(&floppy, sim_generation(&floppy)), DISK_OK);
+  floppy_pulse_t pulses[8];
+  ASSERT_EQ(floppy_flux_read(&floppy, pulses, 2).error, DISK_OK);
+  ASSERT(floppy.read.half_valid);
+  pico_test_time_us += 5100000u;
+  disk_result_t result = floppy_flux_read(&floppy, pulses, 8);
+  ASSERT_EQ(result.error, DISK_ERR_TIMEOUT);
+  ASSERT_EQ(result.count, 0);
+  ASSERT_EQ(floppy_flux_end(&floppy), DISK_OK);
+  ASSERT_EQ(floppy.operation, FLOPPY_OPERATION_IDLE);
+}
+
 TEST(test_absolute_deadline_survives_millisecond_wrap) {
   sim_setup(&drive, &floppy);
   pico_test_time_us = ((uint64_t)UINT32_MAX - 2u) * 1000u;
@@ -72,6 +87,7 @@ int main(void) {
   RUN_TEST(test_continuous_flux_with_stuck_index_is_bounded);
   RUN_TEST(test_write_track_times_out_without_index_before_gate);
   RUN_TEST(test_stale_generation_rejects_read_without_flux);
+  RUN_TEST(test_raw_deadline_applies_even_when_flux_is_already_buffered);
   RUN_TEST(test_absolute_deadline_survives_millisecond_wrap);
   ASSERT_EQ(floppy_deinit(&floppy), DISK_OK);
   pio_sim_free(&drive);

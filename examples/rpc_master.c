@@ -6,7 +6,7 @@
 #include "hardware/spi.h"
 
 #include "disk.h"
-#include "rpc.h"
+#include "rpc_client.h"
 #include "spi_link.h"
 
 #define T_FAST 15000u
@@ -19,6 +19,7 @@ static uint8_t tag;
 static uint32_t polls;
 static uint32_t good;
 static bool desync;
+static uint64_t pending_file;
 static uint8_t req_buf[RPC_MAX_MSG];
 static uint8_t resp_buf[RPC_MAX_MSG + 1u];
 static char write_buf[32768];
@@ -105,7 +106,7 @@ static bool rpc_call(uint8_t op, const uint8_t *req, uint16_t req_len,
   tag++;
 
   uint8_t hdr[RPC_HDR] = {tag, op, 0, 0};
-  rpc_store16(hdr + 2, req_len);
+  store_le16(hdr + 2, req_len);
   if (!send_bytes(hdr, RPC_HDR, T_FAST) ||
       (req_len && !send_bytes(req, req_len, T_FAST))) {
     desync = true;
@@ -115,9 +116,10 @@ static bool rpc_call(uint8_t op, const uint8_t *req, uint16_t req_len,
   for (;;) {
     uint8_t rhdr[RPC_HDR];
     if (!recv_bytes(rhdr, RPC_HDR, timeout_ms)) break;
-    uint16_t rlen = rpc_load16(rhdr + 2);
+    uint16_t rlen = load_le16(rhdr + 2);
     if (rlen > RPC_MAX_MSG || !recv_bytes(resp, rlen, timeout_ms)) break;
     if (rhdr[0] != tag) continue;
+    if (rhdr[1] > DISK_ERR_LAST) break;
     *status = (disk_err_t)rhdr[1];
     *resp_len = rlen;
     return true;
@@ -125,6 +127,23 @@ static bool rpc_call(uint8_t op, const uint8_t *req, uint16_t req_len,
   desync = true;
   return false;
 }
+
+static disk_result_t file_exchange(void *ctx, uint8_t op,
+                                   const uint8_t *request, size_t length,
+                                   uint8_t *response, size_t capacity) {
+  (void)ctx;
+  disk_err_t status;
+  uint32_t received;
+  if (!rpc_call(op, request, (uint16_t)length, &status, resp_buf, &received,
+                T_MOUNT)) {
+    return (disk_result_t){.error = DISK_ERR_TIMEOUT};
+  }
+  if (received > capacity) return (disk_result_t){.error = DISK_ERR_CORRUPT};
+  if (received != 0) memcpy(response, resp_buf, received);
+  return (disk_result_t){status, received};
+}
+
+static rpc_client_t client = {.exchange = file_exchange};
 
 static int call_simple(uint8_t op, const uint8_t *req, uint16_t req_len,
                        uint32_t timeout_ms) {
@@ -183,25 +202,34 @@ static uint16_t path_request(uint8_t *out, const char *path) {
   return (uint16_t)n;
 }
 
-static int file_open(const char *path, char mode) {
-  req_buf[0] = (uint8_t)mode;
-  uint16_t n = path_request(&req_buf[1], path);
-  int r = call_simple(RPC_OPEN, req_buf, (uint16_t)(n + 1u), T_FAST);
-  return r < 1 ? -1 : resp_buf[0];
+static bool file_open(const char *path, f12_open_mode_t mode) {
+  if (pending_file != 0) {
+    printf("a file is still open; use close or abort first\n");
+    return false;
+  }
+  disk_err_t error = rpc_file_open(&client, path, mode, &pending_file);
+  if (error != DISK_OK) printf("error: %s\n", disk_strerror(error));
+  return error == DISK_OK;
 }
 
-static void file_close(int handle) {
-  uint8_t byte = (uint8_t)handle;
-  call_simple(RPC_CLOSE, &byte, 1, T_MOUNT);
-}
-
-static int file_read(int handle, uint8_t *dst, uint16_t want) {
-  uint8_t req[3] = {(uint8_t)handle, 0, 0};
-  rpc_store16(req + 1, want);
-  int r = call_simple(RPC_READ, req, 3, T_MOUNT);
-  if (r < 0) return -1;
-  memcpy(dst, resp_buf, (size_t)r);
-  return r;
+static bool file_finish(bool abort) {
+  if (pending_file == 0) return true;
+  disk_err_t error = DISK_OK;
+  for (unsigned attempt = 0; attempt < 3; attempt++) {
+    error = abort ? rpc_file_abort(&client, pending_file)
+                  : rpc_file_close(&client, pending_file);
+    if (!disk_err_is_io(error) || error == DISK_ERR_MEDIA_CHANGED) break;
+  }
+  if (error == DISK_OK || error == DISK_ERR_BAD_HANDLE ||
+      error == DISK_ERR_MEDIA_CHANGED || error == DISK_ERR_NOT_MOUNTED ||
+      error == DISK_ERR_NOT_INITIALIZED) {
+    pending_file = 0;
+  }
+  if (error != DISK_OK) {
+    printf("error: %s\n", disk_strerror(error));
+    if (pending_file != 0) printf("file retained; use %s to retry\n", abort ? "abort" : "close");
+  }
+  return error == DISK_OK;
 }
 
 static void hexdump_row(uint32_t offset, const uint8_t *data, int count) {
@@ -219,28 +247,36 @@ static void hexdump_row(uint32_t offset, const uint8_t *data, int count) {
 }
 
 static void cmd_cat(const char *path, bool hex) {
-  int handle = file_open(path, 'r');
-  if (handle < 0) return;
+  if (!file_open(path, F12_OPEN_READ)) return;
   uint8_t data[RPC_CHUNK];
   uint32_t offset = 0;
   for (;;) {
-    int r = file_read(handle, data, RPC_CHUNK);
-    if (r <= 0) break;
+    disk_result_t result = rpc_file_read(&client, pending_file, data, sizeof(data));
+    int count = (int)result.count;
     if (!hex) {
-      for (int i = 0; i < r; i++) putchar(data[i]);
+      for (int i = 0; i < count; i++) putchar(data[i]);
     } else {
-      for (int i = 0; i < r; i += 16) {
-        hexdump_row(offset + (uint32_t)i, data + i, r - i < 16 ? r - i : 16);
+      for (int i = 0; i < count; i += 16) {
+        hexdump_row(offset + (uint32_t)i, data + i,
+                    count - i < 16 ? count - i : 16);
       }
     }
-    offset += (uint32_t)r;
-    if (r < (int)RPC_CHUNK) break;
+    offset += (uint32_t)result.count;
+    if (result.error != DISK_OK && result.error != DISK_END) {
+      printf("\nerror after %lu bytes: %s\n", (unsigned long)offset,
+             disk_strerror(result.error));
+    }
+    if (result.error != DISK_OK || result.count == 0) break;
   }
   if (!hex) printf("\n");
-  file_close(handle);
+  file_finish(false);
 }
 
 static void cmd_write(const char *path) {
+  if (pending_file != 0) {
+    printf("a file is still open; use close or abort first\n");
+    return;
+  }
   printf("enter text, end with '.' on its own line\n");
   uint32_t n = 0;
   char line[256];
@@ -257,29 +293,28 @@ static void cmd_write(const char *path) {
     write_buf[n++] = '\n';
   }
 
-  int handle = file_open(path, 'w');
-  if (handle < 0) return;
+  if (!file_open(path, F12_OPEN_WRITE)) return;
   uint32_t offset = 0;
   while (offset < n) {
-    uint16_t chunk = (uint16_t)(n - offset > RPC_CHUNK ? RPC_CHUNK : n - offset);
-    req_buf[0] = (uint8_t)handle;
-    memcpy(&req_buf[1], write_buf + offset, chunk);
-    if (call_simple(RPC_WRITE, req_buf, (uint16_t)(chunk + 1u), T_MOUNT) < 0) {
-      file_close(handle);
+    size_t chunk = n - offset > RPC_CHUNK ? RPC_CHUNK : n - offset;
+    disk_result_t result = rpc_file_write(&client, pending_file,
+                                          write_buf + offset, chunk);
+    offset += (uint32_t)result.count;
+    if (result.error != DISK_OK) {
+      printf("error after %lu bytes: %s\n", (unsigned long)offset,
+             disk_strerror(result.error));
+      file_finish(true);
       return;
     }
-    offset += chunk;
   }
-  file_close(handle);
-  printf("wrote %lu bytes\n", (unsigned long)n);
+  if (file_finish(false)) printf("wrote %lu bytes\n", (unsigned long)n);
 }
 
 static void print_stat(const uint8_t *entry) {
-  char name[14];
-  memcpy(name, &entry[6], 13);
-  name[13] = 0;
-  printf("  %-13s %8lu  attr=%02x%s\n", name, (unsigned long)rpc_load32(entry),
-         entry[4], entry[5] ? "  <dir>" : "");
+  f12_stat_t stat;
+  rpc_decode_stat(entry, &stat);
+  printf("  %-13s %8lu  attr=%02x%s\n", stat.name, (unsigned long)stat.size,
+         stat.attr, (stat.attr & FAT12_ATTR_DIRECTORY) != 0 ? "  <dir>" : "");
 }
 
 static void cmd_ls(void) {
@@ -289,7 +324,7 @@ static void cmd_ls(void) {
   uint32_t total = 0;
   for (int offset = 0; offset + (int)RPC_STAT_SIZE <= r; offset += (int)RPC_STAT_SIZE) {
     print_stat(resp_buf + offset);
-    total += rpc_load32(resp_buf + offset);
+    total += load_le32(resp_buf + offset);
     count++;
   }
   printf("%d files, %lu bytes\n", count, (unsigned long)total);
@@ -297,11 +332,21 @@ static void cmd_ls(void) {
 
 static void cmd_fsck(bool fix) {
   uint8_t flag = fix ? 1 : 0;
-  int r = call_simple(RPC_FSCK, &flag, 1, T_FSCK);
-  if (r < 1) return;
-  printf("%s\n", (const char *)resp_buf + 1);
-  if (resp_buf[0] == 0) printf("clean\n");
-  else printf("%s\n", fix ? "repaired" : "DIRTY -- run 'fsck fix' to repair");
+  int length = call_simple(RPC_FSCK, &flag, 1, T_FSCK);
+  if (length < 0) return;
+  if (length != RPC_FSCK_SIZE) {
+    printf("error: invalid fsck response\n");
+    return;
+  }
+  fat12_fsck_t report;
+  rpc_decode_fsck(resp_buf, &report);
+  printf("files=%u dirs=%u lost=%u broken=%u crosslinked=%u loops=%u "
+         "fat_mismatch=%u freed=%u\n",
+         report.files, report.directories, report.lost_clusters,
+         report.broken_chains, report.crosslinked, report.loops,
+         report.fat_mismatch, report.freed);
+  if (fix) printf("repair verified clean\n");
+  else printf("%s\n", fat12_fsck_clean(&report) ? "clean" : "DIRTY -- run 'fsck fix' to repair");
 }
 
 static void cmd_help(void) {
@@ -311,6 +356,8 @@ static void cmd_help(void) {
   printf("  cat <file>            print file\n");
   printf("  hexdump <file>        hex dump file\n");
   printf("  write <file>          write file (end with . line)\n");
+  printf("  close                 retry closing the pending file\n");
+  printf("  abort                 discard the pending write\n");
   printf("  rm <file>             delete file\n");
   printf("  mv <from> <to>        rename file\n");
   printf("  stat <file>           file info\n");
@@ -356,6 +403,10 @@ int main(void) {
       cmd_cat(argv[1], true);
     } else if (!strcmp(argv[0], "write") && argc >= 2) {
       cmd_write(argv[1]);
+    } else if (!strcmp(argv[0], "close")) {
+      if (file_finish(false)) printf("closed\n");
+    } else if (!strcmp(argv[0], "abort")) {
+      if (file_finish(true)) printf("aborted\n");
     } else if (!strcmp(argv[0], "rm") && argc >= 2) {
       uint16_t n = path_request(req_buf, argv[1]);
       if (call_simple(RPC_DELETE, req_buf, n, T_MOUNT) >= 0) printf("deleted\n");

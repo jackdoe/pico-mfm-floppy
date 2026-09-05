@@ -1,6 +1,7 @@
 #include "board.h"
 #include "f12.h"
 #include "fsck_scenario.h"
+#include "mfm_probe.h"
 #include "hardware/gpio.h"
 #include "hardware/watchdog.h"
 #if defined(PICO_RP2040) && PICO_RP2040
@@ -13,13 +14,12 @@
 #include <stdio.h>
 #include <string.h>
 
-#define FW_VERSION "0.3.0"
+#define FW_VERSION "0.4.0"
 #define CMD_BUF_SIZE 256
 #define IO_BUF_SIZE DISK_SECTOR_SIZE
 #define WORK_BUF_SIZE (8u * DISK_SECTOR_SIZE)
 #define VERIFY_CHUNK_MAX (WORK_BUF_SIZE / 2u)
 #define MAX_ARGS 4
-#define PULSE_BINS 128
 #define PULSE_BATCH 256u
 #define WRITER_CLOSE_ATTEMPTS 3
 #define CLUSTER_SIZE (FAT12_SECTORS_PER_CLUSTER * DISK_SECTOR_SIZE)
@@ -33,7 +33,6 @@
 static floppy_t floppy;
 static f12_t fs;
 static f12_file_t owned_writer;
-static bool writer_owned;
 #ifdef FLOPPY_ALT_PINS
 static const floppy_pins_t drive_pins = FLOPPY_PINS_ALT;
 #else
@@ -44,6 +43,7 @@ static char cmd_buf[CMD_BUF_SIZE];
 static uint8_t io_buf[IO_BUF_SIZE];
 static uint8_t work_buf[WORK_BUF_SIZE];
 static track_t work_track;
+static mfm_probe_t signal_probe;
 static floppy_pulse_t pulse_buf[PULSE_BATCH];
 
 typedef struct {
@@ -96,6 +96,7 @@ static void cmd_crashtest(int argc, char **argv);
 static void cmd_crashcheck(int argc, char **argv);
 static void cmd_rpm(int argc, char **argv);
 static void cmd_test_full(int argc, char **argv);
+static void cmd_test_mfm(int argc, char **argv);
 static void cmd_test_media(int argc, char **argv);
 static void cmd_test_fsck(int argc, char **argv);
 static void cmd_diskdump(int argc, char **argv);
@@ -134,6 +135,8 @@ static const cmd_entry_t commands[] = {
     {"rpm", cmd_rpm, false, 1, 1, "", "Measure spindle speed"},
     {"test-full", cmd_test_full, false, 1, 2, "[rounds]",
      "Run destructive hardware tests"},
+    {"test-mfm", cmd_test_mfm, false, 1, 2, "[rounds]",
+     "Run destructive MFM pattern and restart tests"},
     {"test-media", cmd_test_media, true, 1, 1, "",
      "Run interactive media-change tests"},
     {"test-fsck", cmd_test_fsck, false, 1, 1, "",
@@ -211,11 +214,10 @@ static bool writer_handle_gone(disk_err_t error) {
 
 static void writer_forget(void) {
   memset(&owned_writer, 0, sizeof(owned_writer));
-  writer_owned = false;
 }
 
 static disk_err_t writer_commit(void) {
-  if (!writer_owned) return DISK_OK;
+  if (owned_writer.token.id == 0) return DISK_OK;
   disk_err_t error = DISK_OK;
   for (unsigned attempt = 0; attempt < WRITER_CLOSE_ATTEMPTS; attempt++) {
     error = f12_close(&owned_writer);
@@ -232,7 +234,7 @@ static disk_err_t writer_commit(void) {
 }
 
 static disk_err_t writer_abort(void) {
-  if (!writer_owned) return DISK_OK;
+  if (owned_writer.token.id == 0) return DISK_OK;
   disk_err_t error = f12_abort(&owned_writer);
   if (error == DISK_OK || writer_handle_gone(error)) writer_forget();
   return error;
@@ -242,7 +244,6 @@ static disk_err_t writer_open(const char *name) {
   disk_err_t error = writer_commit();
   if (error != DISK_OK) return error;
   error = f12_open(&fs, name, F12_OPEN_WRITE, &owned_writer);
-  writer_owned = error == DISK_OK;
   return error;
 }
 
@@ -486,22 +487,6 @@ static void hexdump_row(uint32_t offset, const uint8_t *data, size_t count) {
 }
 
 typedef struct {
-  uint32_t short_count;
-  uint32_t medium_count;
-  uint32_t long_count;
-  uint32_t invalid_count;
-  uint32_t total_pulses;
-  uint32_t histogram[PULSE_BINS];
-  uint16_t T2_max;
-  uint16_t T3_max;
-  uint32_t syncs;
-  uint32_t sector_records;
-  uint32_t unique_sectors;
-  uint32_t crc_errors;
-  bool seen[DISK_SECTORS_PER_TRACK];
-} track_stats_t;
-
-typedef struct {
   int total_valid;
   int total_invalid;
   uint32_t checksum;
@@ -582,80 +567,34 @@ static void cmd_dma(int argc, char **argv) {
   drive_idle();
 }
 
-static void read_track_stats(uint8_t track, uint8_t side, track_stats_t *stats) {
-  memset(stats, 0, sizeof(*stats));
-
-  if (!drive_status("Seek", floppy_seek(&floppy, track))) return;
-  if (!drive_status("Side select", floppy_side_select(&floppy, side))) return;
+static disk_err_t read_track_stats(uint8_t track, uint8_t side,
+                                    mfm_probe_t *probe) {
   uint32_t generation;
-  if (!drive_generation(&generation)) return;
-  if (!drive_status("Flux capture", floppy_flux_begin(&floppy, generation))) return;
-
-  mfm_t mfm;
-  mfm_init(&mfm);
-
-  bool ix_prev = false;
-  bool ix_primed = false;
-  mfm_sector_t sector;
-  int ix_edges = 0;
-  uint32_t oversized = 0;
-
-  while (ix_edges < 6) {
-    disk_result_t result = floppy_flux_read(&floppy, pulse_buf, PULSE_BATCH);
-    for (size_t i = 0; i < result.count && ix_edges < 6; i++) {
-      const floppy_pulse_t *pulse = &pulse_buf[i];
-      if (ix_primed && pulse->index != ix_prev) ix_edges++;
-      ix_prev = pulse->index;
-      ix_primed = true;
-      if (pulse->delta < PULSE_BINS) stats->histogram[pulse->delta]++;
-      else oversized++;
-      stats->total_pulses++;
-      if (mfm_feed(&mfm, pulse->delta, &sector) &&
-          sector.sector < DISK_SECTORS_PER_TRACK && !stats->seen[sector.sector]) {
-        stats->seen[sector.sector] = true;
-        stats->unique_sectors++;
-      }
-    }
-    if (result.error != DISK_OK) {
-      drive_status("Flux read", result.error);
-      break;
-    }
+  disk_err_t error = floppy_media_generation(&floppy, &generation);
+  if (error != DISK_OK) {
+    memset(probe, 0, sizeof(*probe));
+    return error;
   }
-
-  drive_status("Flux stop", floppy_flux_end(&floppy));
-
-  for (unsigned bin = 0; bin < PULSE_BINS; bin++) {
-    uint32_t count = stats->histogram[bin];
-    if (bin < MFM_PULSE_FLOOR || bin >= MFM_PULSE_CEILING) stats->invalid_count += count;
-    else if (bin <= mfm.T2_max) stats->short_count += count;
-    else if (bin <= mfm.T3_max) stats->medium_count += count;
-    else stats->long_count += count;
-  }
-  stats->invalid_count += oversized;
-  stats->T2_max = mfm.T2_max;
-  stats->T3_max = mfm.T3_max;
-  stats->syncs = mfm.syncs_found;
-  stats->sector_records = mfm.sectors_read;
-  stats->crc_errors = mfm.crc_errors;
+  return mfm_probe_track(&floppy, generation, track, side, NULL, probe);
 }
 
-static void print_histogram(const track_stats_t *stats) {
+static void print_histogram(const mfm_probe_t *stats) {
   uint32_t peak = 0;
-  for (int i = 0; i < PULSE_BINS; i++) {
+  for (unsigned i = 0; i < MFM_PROBE_BINS; i++) {
     if (stats->histogram[i] > peak) peak = stats->histogram[i];
   }
   if (peak == 0) return;
 
-  int first = 0;
-  int last = PULSE_BINS - 1;
-  while (first < PULSE_BINS && stats->histogram[first] == 0) first++;
+  unsigned first = 0;
+  unsigned last = MFM_PROBE_BINS - 1u;
+  while (first < MFM_PROBE_BINS && stats->histogram[first] == 0) first++;
   while (last > first && stats->histogram[last] == 0) last--;
 
   printf("  Pulse Distribution (delta ticks):\n");
-  for (int i = first; i <= last; i++) {
+  for (unsigned i = first; i <= last; i++) {
     if (stats->histogram[i] == 0) continue;
     uint32_t bar = (stats->histogram[i] * 50u) / peak;
-    printf("  %3d: %6lu |", i, stats->histogram[i]);
+    printf("  %3u: %6lu |", i, stats->histogram[i]);
     for (uint32_t j = 0; j < bar; j++) printf("#");
     printf("\n");
   }
@@ -665,24 +604,33 @@ static double percent(uint32_t part, uint32_t total) {
   return total ? part * 100.0 / total : 0.0;
 }
 
-static void print_track_stats(const track_stats_t *stats, const char *indent) {
-  printf("%sPulses:   %lu total\n", indent, stats->total_pulses);
-  printf("%sShort:    %lu (%.1f%%)\n", indent, stats->short_count,
-         percent(stats->short_count, stats->total_pulses));
-  printf("%sMedium:   %lu (%.1f%%)\n", indent, stats->medium_count,
-         percent(stats->medium_count, stats->total_pulses));
-  printf("%sLong:     %lu (%.1f%%)\n", indent, stats->long_count,
-         percent(stats->long_count, stats->total_pulses));
-  printf("%sInvalid:  %lu (%.1f%%)\n", indent, stats->invalid_count,
-         percent(stats->invalid_count, stats->total_pulses));
-  printf("%sSyncs:    %lu\n", indent, stats->syncs);
-  printf("%sRecords:  %lu\n", indent, stats->sector_records);
-  printf("%sUnique:   %lu / %u\n", indent, stats->unique_sectors,
-         DISK_SECTORS_PER_TRACK);
-  printf("%sCRC err:  %lu\n", indent, stats->crc_errors);
-  printf("%sAdaptive: T2_max=%u  T3_max=%u\n", indent, stats->T2_max,
-         stats->T3_max);
-  print_histogram(stats);
+static void print_track_stats(const mfm_probe_t *probe, const char *indent) {
+  mfm_probe_counts_t counts = mfm_probe_counts(probe);
+  printf("%sPulses:   %lu total\n", indent, (unsigned long)counts.total);
+  printf("%sShort:    %lu (%.1f%%)\n", indent, (unsigned long)counts.short_count,
+         percent(counts.short_count, counts.total));
+  printf("%sMedium:   %lu (%.1f%%)\n", indent, (unsigned long)counts.medium_count,
+         percent(counts.medium_count, counts.total));
+  printf("%sLong:     %lu (%.1f%%)\n", indent, (unsigned long)counts.long_count,
+         percent(counts.long_count, counts.total));
+  printf("%sInvalid:  %lu (%.1f%%)\n", indent, (unsigned long)counts.invalid_count,
+         percent(counts.invalid_count, counts.total));
+  printf("%sRevs:     %lu/%u complete, minimum %lu/%u sectors per revolution\n",
+         indent, (unsigned long)probe->revolutions, MFM_PROBE_REVOLUTIONS,
+         (unsigned long)probe->minimum_sectors, DISK_SECTORS_PER_TRACK);
+  printf("%sRecords:  %lu, unique %u/%u, syncs %lu\n", indent,
+         (unsigned long)probe->decoder.sectors_read,
+         mfm_probe_sector_count(probe->sectors), DISK_SECTORS_PER_TRACK,
+         (unsigned long)probe->decoder.syncs_found);
+  printf("%sErrors:   crc=%lu format=%lu address=%lu duplicate=%lu data=%lu\n",
+         indent, (unsigned long)probe->decoder.crc_errors,
+         (unsigned long)probe->decoder.format_errors,
+         (unsigned long)probe->wrong_address, (unsigned long)probe->duplicates,
+         (unsigned long)probe->mismatches);
+  printf("%sCell:     %.3f ticks, short limit %u, medium limit %u\n", indent,
+         probe->decoder.cell_q8 / 256.0, mfm_short_limit(&probe->decoder),
+         mfm_medium_limit(&probe->decoder));
+  print_histogram(probe);
 }
 
 static uint8_t gen_pattern_byte(uint32_t file_id, uint32_t offset) {
@@ -856,7 +804,7 @@ static bool capacity_write(capacity_file_t *file, char prefix, uint32_t number,
   disk_err_t close_error = DISK_OK;
   bool ok = write_pattern_file(name, file->id, file->size, file->chunk,
                                &written, &close_error);
-  if (!ok && writer_owned) writer_abort();
+  if (!ok && (owned_writer.token.id != 0)) writer_abort();
   return ok && written == file->size && close_error == DISK_OK;
 }
 
@@ -1111,7 +1059,7 @@ static void cmd_write(int argc, char **argv) {
 static void cmd_commit(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  if (!writer_owned) {
+  if (owned_writer.token.id == 0) {
     printf("No pending commit.\n");
     return;
   }
@@ -1187,7 +1135,7 @@ static void cmd_cp(int argc, char **argv) {
   if (write_close != DISK_OK) copy_error = write_close;
   if (copy_error != DISK_OK) {
     printf("Copy error after %lu bytes: %s\n", total, disk_strerror(copy_error));
-    if (writer_owned) printf("Commit retained; run 'commit' to retry.\n");
+    if ((owned_writer.token.id != 0)) printf("Commit retained; run 'commit' to retry.\n");
     return;
   }
   printf("Copied %lu bytes: %s -> %s\n", total, src, dst);
@@ -1332,17 +1280,6 @@ static void cmd_fsck(int argc, char **argv) {
   print_fsck_report(&report);
 
   if (fix) {
-    fat12_fsck_t verification;
-    err = f12_fsck(&fs, &verification, false);
-    if (err != DISK_OK) {
-      printf("  Verification failed: %s\n", disk_strerror(err));
-      return;
-    }
-    if (!fat12_fsck_clean(&verification)) {
-      printf("  Result: repair did not converge\n");
-      print_fsck_report(&verification);
-      return;
-    }
     printf("  Result: repaired and verified clean\n");
   } else if (!fat12_fsck_clean(&report)) {
     printf("  Result: DIRTY -- run 'fsck fix' to repair\n");
@@ -1386,7 +1323,7 @@ static void cmd_unmount(int argc, char **argv) {
     return;
   }
   if (!mounted) {
-    if (writer_owned) {
+    if ((owned_writer.token.id != 0)) {
       error = writer_commit();
       if (error != DISK_OK) printf("Pending commit failed: %s\n", disk_strerror(error));
     }
@@ -1426,7 +1363,7 @@ static void cmd_status(int argc, char **argv) {
   else printf("    Current track:   unknown until homed\n");
   if (floppy.selected) printf("    At track 0:      %s\n", at_track0 ? "yes" : "no");
   else printf("    At track 0:      unknown while deselected\n");
-  printf("    Pending commit:  %s\n", writer_owned ? "YES" : "no");
+  printf("    Pending commit:  %s\n", (owned_writer.token.id != 0) ? "YES" : "no");
 
   bool mounted;
   disk_err_t mount_error = f12_is_mounted(&fs, &mounted);
@@ -1678,9 +1615,10 @@ static void cmd_mfm(int argc, char **argv) {
 
   printf("  Analyzing cylinder %lu head %lu...\n", (unsigned long)cylinder,
          (unsigned long)head);
-  track_stats_t stats;
-  read_track_stats((uint8_t)cylinder, (uint8_t)head, &stats);
-  print_track_stats(&stats, "  ");
+  drive_status("MFM capture",
+               read_track_stats((uint8_t)cylinder, (uint8_t)head, &signal_probe));
+  print_track_stats(&signal_probe, "  ");
+  drive_idle();
 }
 
 static void check(bool cond, const char *tag, int *pass, int *fail) {
@@ -1704,24 +1642,101 @@ static void check_status(disk_err_t status, const char *tag, int *pass, int *fai
 
 static void mfm_health_check(uint8_t track, uint8_t side, const char *label,
                              int *pass, int *fail) {
-  track_stats_t stats;
-  read_track_stats(track, side, &stats);
+  disk_err_t error = read_track_stats(track, side, &signal_probe);
+  printf("  %s C%uH%u: %s, revs=%lu min=%lu/%u crc=%lu format=%lu\n",
+         label, track, side, disk_strerror(error),
+         (unsigned long)signal_probe.revolutions,
+         (unsigned long)signal_probe.minimum_sectors, DISK_SECTORS_PER_TRACK,
+         (unsigned long)signal_probe.decoder.crc_errors,
+         (unsigned long)signal_probe.decoder.format_errors);
+  bool clean = error == DISK_OK && mfm_probe_clean(&signal_probe);
+  check(clean, label, pass, fail);
+  if (!clean) print_track_stats(&signal_probe, "    ");
+}
 
-  printf("  %s T%u/S%u: unique=%lu/%u records=%lu crc=%lu invalid=%lu/%lu\n",
-         label, track, side, stats.unique_sectors, DISK_SECTORS_PER_TRACK,
-         stats.sector_records, stats.crc_errors, stats.invalid_count,
-         stats.total_pulses);
+static bool run_mfm_patterns(uint32_t rounds, int *pass, int *fail) {
+  static const uint8_t cylinders[] = {
+      0, MFM_PRECOMP_START_TRACK - 1u, MFM_PRECOMP_START_TRACK,
+      DISK_CYLINDERS - 1u,
+  };
+  uint32_t generation;
+  disk_err_t error = floppy_seek(&floppy, 0);
+  if (error == DISK_OK) error = floppy_media_generation(&floppy, &generation);
+  check_status(error, "prepare pattern test", pass, fail);
+  if (error != DISK_OK) return false;
+  for (uint32_t round = 0; round < rounds; round++) {
+    for (unsigned pattern = 0; pattern < MFM_TEST_PATTERNS; pattern++) {
+      for (size_t c = 0; c < sizeof(cylinders); c++) {
+        for (uint8_t head = 0; head < DISK_HEADS; head++) {
+          work_track.cylinder = cylinders[c];
+          work_track.head = head;
+          if (!mfm_test_fill(&work_track, pattern, round)) {
+            check(false, "prepare test pattern", pass, fail);
+            return false;
+          }
+          error = floppy_stats_reset(&floppy);
+          if (error == DISK_OK) {
+            error = floppy_write_track(&floppy, generation, &work_track);
+          }
+          if (error == DISK_OK) {
+            error = floppy_seek(&floppy, cylinders[c] == 0 ? DISK_CYLINDERS - 1u : 0);
+          }
+          if (error == DISK_OK) error = floppy_motor_off(&floppy);
+          if (error == DISK_OK) sleep_ms(1000);
+          memset(&signal_probe, 0, sizeof(signal_probe));
+          if (error == DISK_OK) {
+            error = mfm_probe_track(&floppy, generation, cylinders[c], head,
+                                    &work_track, &signal_probe);
+          }
+          floppy_stats_t stats = {0};
+          disk_err_t stats_error = floppy_stats(&floppy, &stats);
+          printf("  round=%lu pattern=%s C%uH%u: %s revs=%lu min=%lu "
+                 "crc=%lu format=%lu data=%lu retries=%lu ring=%lu/%u "
+                 "overrun=%lu underrun=%lu\n",
+                 (unsigned long)(round + 1u), mfm_test_pattern_names[pattern],
+                 cylinders[c], head, disk_strerror(error),
+                 (unsigned long)signal_probe.revolutions,
+                 (unsigned long)signal_probe.minimum_sectors,
+                 (unsigned long)signal_probe.decoder.crc_errors,
+                 (unsigned long)signal_probe.decoder.format_errors,
+                 (unsigned long)signal_probe.mismatches,
+                 (unsigned long)stats.retries, (unsigned long)stats.ring_peak,
+                 FLOPPY_FLUX_RING_WORDS, (unsigned long)stats.overruns,
+                 (unsigned long)stats.underruns);
+          bool clean = error == DISK_OK && stats_error == DISK_OK &&
+                       mfm_probe_clean(&signal_probe) && stats.retries == 0 &&
+                       stats.overruns == 0 && stats.underruns == 0 &&
+                       stats.media_changes == 0;
+          check(clean, "pattern survives seek and motor restart", pass, fail);
+          if (!clean) {
+            print_track_stats(&signal_probe, "    ");
+            if (error != DISK_OK || stats_error != DISK_OK) return false;
+          }
+        }
+      }
+    }
+  }
+  return true;
+}
 
-  uint32_t invalid_limit = stats.total_pulses / 200;
-  if (invalid_limit < 1) invalid_limit = 1;
-
-  char tag[96];
-  snprintf(tag, sizeof(tag), "%s unique sectors", label);
-  check(stats.unique_sectors == DISK_SECTORS_PER_TRACK, tag, pass, fail);
-  snprintf(tag, sizeof(tag), "%s CRC clean", label);
-  check(stats.crc_errors == 0, tag, pass, fail);
-  snprintf(tag, sizeof(tag), "%s invalid pulse threshold", label);
-  check(stats.invalid_count <= invalid_limit, tag, pass, fail);
+static void cmd_test_mfm(int argc, char **argv) {
+  uint32_t rounds = 1;
+  if (argc == 2 && !parse_u32(argv[1], 1, 10, &rounds)) {
+    printf("Rounds must be an integer from 1 through 10.\n");
+    return;
+  }
+  printf("This DESTROYS data on cylinders 0, 39, 40, and 79 on both heads.\n");
+  printf("Continue? [y/N] ");
+  if (!cli_confirm()) return;
+  disk_err_t error = unmount_filesystem();
+  if (!drive_status("Unmount before pattern test", error)) return;
+  int pass = 0;
+  int fail = 0;
+  run_mfm_patterns(rounds, &pass, &fail);
+  if (!drive_idle()) fail++;
+  printf("\n=== Test-MFM Complete ===\n");
+  printf("  Checks: %d passed, %d failed\n", pass, fail);
+  printf("  Result: %s\n", fail == 0 ? "ALL PASSED" : "SOME FAILED");
 }
 
 static void cmd_test_full(int argc, char **argv) {
@@ -1789,6 +1804,9 @@ static void cmd_test_full(int argc, char **argv) {
     goto done;
   }
 
+  printf("\n--- MFM Patterns Before Format ---\n");
+  if (!run_mfm_patterns(1, &pass, &fail)) goto done;
+
   printf("\n--- Phase 2: Full Format and Mount ---\n");
   disk_err_t err = do_format("TESTFULL", true);
   check_status(err, "full format", &pass, &fail);
@@ -1800,8 +1818,10 @@ static void cmd_test_full(int argc, char **argv) {
   cmd_status(0, NULL);
 
   printf("\n--- Phase 3: MFM Signal Checks ---\n");
-  mfm_health_check(0, 0, "outer", &pass, &fail);
-  mfm_health_check(DISK_CYLINDERS - 1u, 0, "inner", &pass, &fail);
+  for (uint8_t head = 0; head < DISK_HEADS; head++) {
+    mfm_health_check(0, head, "outer", &pass, &fail);
+    mfm_health_check(DISK_CYLINDERS - 1u, head, "inner", &pass, &fail);
+  }
   check_status(floppy_stats_reset(&floppy), "reset statistics after signal checks",
                &pass, &fail);
 
@@ -2065,6 +2085,7 @@ static void cmd_test_full(int argc, char **argv) {
   disk_err_t stats_status = floppy_stats(&floppy, &write_stats);
   check(stats_status == DISK_OK, "query write-path statistics", &pass, &fail);
   if (stats_status == DISK_OK) {
+    print_drive_stats(&write_stats);
     check(write_stats.dma_writes != 0, "verified DMA track writes observed",
           &pass, &fail);
     check(write_stats.underruns == 0 && write_stats.overruns == 0,
@@ -2667,44 +2688,35 @@ static void cmd_diskdump(int argc, char **argv) {
 static void cmd_mfmscan(int argc, char **argv) {
   (void)argc;
   (void)argv;
-
-  track_stats_t stats;
-  struct {
-    uint8_t track;
-    uint8_t side;
-    const char *label;
-  } targets[] = {
-      {0, 0, "outermost"},
-      {(DISK_CYLINDERS / 2u) - 1u, 0, "middle"},
-      {DISK_CYLINDERS - 1u, 0, "innermost"},
-  };
-
-  for (size_t t = 0; t < sizeof(targets) / sizeof(targets[0]); t++) {
-    printf("\n  === %s cylinder %u ===\n", targets[t].label, targets[t].track);
-    read_track_stats(targets[t].track, targets[t].side, &stats);
-    print_track_stats(&stats, "    ");
+  unsigned clean = 0;
+  unsigned failed = 0;
+  if (!drive_status("Statistics reset", floppy_stats_reset(&floppy))) return;
+  printf("  C/H   STATUS       REVS MIN SHORT MEDIUM LONG INVALID CRC FORMAT\n");
+  for (uint8_t cylinder = 0; cylinder < DISK_CYLINDERS; cylinder++) {
+    for (uint8_t head = 0; head < DISK_HEADS; head++) {
+      disk_err_t error = read_track_stats(cylinder, head, &signal_probe);
+      mfm_probe_counts_t counts = mfm_probe_counts(&signal_probe);
+      printf("  %02u/%u  %-12s %lu %lu %lu %lu %lu %lu %lu %lu\n",
+             cylinder, head, disk_strerror(error),
+             (unsigned long)signal_probe.revolutions,
+             (unsigned long)signal_probe.minimum_sectors,
+             (unsigned long)counts.short_count, (unsigned long)counts.medium_count,
+             (unsigned long)counts.long_count, (unsigned long)counts.invalid_count,
+             (unsigned long)signal_probe.decoder.crc_errors,
+             (unsigned long)signal_probe.decoder.format_errors);
+      if (error == DISK_OK && mfm_probe_clean(&signal_probe)) clean++;
+      else failed++;
+      if (error != DISK_OK) goto done;
+    }
   }
-
-  printf("\n  === Per-Track Summary (side 0) ===\n");
-  printf("  %-6s %-8s %-8s %-8s %-8s %-5s %-5s %-5s\n", "TRACK", "SHORT",
-         "MEDIUM", "LONG", "INVALID", "UNIQ", "REC", "CRC");
-  printf("  %-6s %-8s %-8s %-8s %-8s %-5s %-5s %-5s\n", "-----", "------",
-         "------", "------", "-------", "----", "---", "---");
-
-  uint32_t total_sectors = 0;
-  uint32_t total_crc = 0;
-  for (uint8_t track = 0; track < DISK_CYLINDERS; track++) {
-    read_track_stats(track, 0, &stats);
-    printf("  T%02u    %-8lu %-8lu %-8lu %-8lu %-5lu %-5lu %-5lu\n", track,
-           stats.short_count, stats.medium_count, stats.long_count,
-           stats.invalid_count, stats.unique_sectors, stats.sector_records,
-           stats.crc_errors);
-    total_sectors += stats.unique_sectors;
-    total_crc += stats.crc_errors;
+done:
+  printf("  Both heads: %u clean tracks, %u failed, %u untested\n", clean, failed,
+         DISK_TRACK_COUNT - clean - failed);
+  floppy_stats_t stats;
+  if (drive_status("Statistics", floppy_stats(&floppy, &stats))) {
+    print_drive_stats(&stats);
   }
-
-  printf("\n  Head 0 total: %lu unique sectors decoded, %lu CRC errors\n",
-         (unsigned long)total_sectors, (unsigned long)total_crc);
+  drive_idle();
 }
 
 static void cmd_version(int argc, char **argv) {

@@ -223,7 +223,7 @@ bool pio_sim_replace_track(pio_sim_drive_t *drive, const track_t *track) {
     return false;
   }
   for (size_t i = 0; i < encoder.pos; i++) {
-    deltas[i] = pulses[i] + MFM_PIO_OVERHEAD;
+    deltas[i] = pulses[i];
   }
   free(pulses);
   pio_sim_track_t *destination = &drive->tracks[track->cylinder][track->head];
@@ -284,7 +284,7 @@ static void pio_sim_commit_write(void) {
     uint16_t *deltas = malloc(allocation);
     if (!deltas) return;
     for (uint32_t i = 0; i < prefix; i++) {
-      deltas[i] = g_drive->write_capture[i] + MFM_PIO_OVERHEAD;
+      deltas[i] = g_drive->write_capture[i] + FLOPPY_WRITE_PIO_OVERHEAD;
     }
     if (suffix != 0) {
       memcpy(deltas + prefix, track->deltas + old_start,
@@ -316,11 +316,11 @@ static void pio_sim_commit_write(void) {
   uint16_t *deltas = malloc(allocation);
   if (!deltas) return;
   for (uint32_t i = 0; i < g_drive->write_capture_count; i++) {
-    deltas[i] = g_drive->write_capture[i] + MFM_PIO_OVERHEAD;
+    deltas[i] = g_drive->write_capture[i] + FLOPPY_WRITE_PIO_OVERHEAD;
   }
   for (size_t i = 0; i < duplicate_count; i++) {
     deltas[g_drive->write_capture_count + i] =
-        duplicate_pulses[i] + MFM_PIO_OVERHEAD;
+        duplicate_pulses[i];
   }
   free(track->deltas);
   track->deltas = deltas;
@@ -618,7 +618,7 @@ static void pio_sim_capture(uint8_t pulse) {
       g_drive->write_capture_count >= g_drive->disk_change_after_pulses) {
     g_drive->disk_changed = true;
   }
-  uint32_t delta = pulse + MFM_PIO_OVERHEAD;
+  uint32_t delta = pulse + FLOPPY_WRITE_PIO_OVERHEAD;
   if (g_drive->write_elapsed_cycles > UINT32_MAX - delta) {
     g_drive->write_elapsed_cycles = UINT32_MAX;
   } else {

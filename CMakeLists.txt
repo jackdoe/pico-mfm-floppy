@@ -6,50 +6,24 @@ include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 
 project(floppy C CXX ASM)
 
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
+include(cmake/project_options.cmake)
 set(CMAKE_C_EXTENSIONS ON)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 pico_sdk_init()
 
-set(FLOPPY_WARNINGS
-    -Wall
-    -Wextra
-    -Werror
-    -Wpedantic
-    -Wconversion
-    -Wsign-conversion
-    -Wshadow
-    -Wformat=2
-    -Wundef
-    -Wstrict-prototypes)
+add_subdirectory(src)
+add_subdirectory(examples)
 
-set(FLOPPY_C_OPTIONS
-    -std=c11
-    ${FLOPPY_WARNINGS})
-
-set(FLOPPY_SOURCES
-    ${CMAKE_CURRENT_LIST_DIR}/src/crc.c
-    ${CMAKE_CURRENT_LIST_DIR}/src/disk.c
-    ${CMAKE_CURRENT_LIST_DIR}/src/cache.c
-    ${CMAKE_CURRENT_LIST_DIR}/src/floppy.c
-    ${CMAKE_CURRENT_LIST_DIR}/src/f12.c
-    ${CMAKE_CURRENT_LIST_DIR}/src/fat12.c
-    ${CMAKE_CURRENT_LIST_DIR}/src/mfm.c)
-
-set_property(SOURCE ${FLOPPY_SOURCES} APPEND PROPERTY
+add_library(floppy_lib STATIC src/floppy.c)
+set_property(SOURCE src/floppy.c APPEND PROPERTY
     COMPILE_OPTIONS ${FLOPPY_C_OPTIONS})
 
-add_library(floppy_lib STATIC ${FLOPPY_SOURCES})
-
-target_include_directories(floppy_lib PUBLIC
-    ${CMAKE_CURRENT_LIST_DIR}/src
-)
-
 target_link_libraries(floppy_lib PUBLIC
+    floppy_core
     pico_stdlib
     hardware_gpio
     hardware_pio
@@ -75,6 +49,9 @@ function(add_floppy_example name source)
 endfunction()
 
 add_floppy_example(floppy_cli examples/cli.c)
+target_sources(floppy_cli PRIVATE examples/mfm_probe.c)
+set_property(SOURCE examples/mfm_probe.c APPEND PROPERTY
+    COMPILE_OPTIONS ${FLOPPY_C_OPTIONS})
 target_link_libraries(floppy_cli PRIVATE hardware_watchdog)
 
 option(FLOPPY_ALT_PINS "Use the alternate GPIO pin mapping in the CLI example" OFF)
@@ -83,7 +60,7 @@ if(FLOPPY_ALT_PINS)
 endif()
 
 add_floppy_example(floppy_rpc_slave examples/rpc_slave.c)
-target_link_libraries(floppy_rpc_slave PRIVATE hardware_spi)
+target_link_libraries(floppy_rpc_slave PRIVATE hardware_spi floppy_rpc)
 
 add_floppy_example(floppy_rpc_master examples/rpc_master.c)
-target_link_libraries(floppy_rpc_master PRIVATE hardware_spi)
+target_link_libraries(floppy_rpc_master PRIVATE hardware_spi floppy_rpc)

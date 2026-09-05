@@ -10,10 +10,9 @@
 #define MFM_READ_PIO_HZ (3u * MFM_TICK_HZ)
 #define MFM_WRITE_PIO_HZ MFM_TICK_HZ
 #define MFM_CELL_TICKS 48u
-#define MFM_PIO_OVERHEAD 19u
-#define MFM_PULSE_SHORT (MFM_CELL_TICKS - MFM_PIO_OVERHEAD)
-#define MFM_PULSE_MEDIUM (MFM_CELL_TICKS * 3u / 2u - MFM_PIO_OVERHEAD)
-#define MFM_PULSE_LONG (MFM_CELL_TICKS * 2u - MFM_PIO_OVERHEAD)
+#define MFM_PULSE_SHORT (MFM_CELL_TICKS)
+#define MFM_PULSE_MEDIUM (MFM_CELL_TICKS * 3u / 2u)
+#define MFM_PULSE_LONG (MFM_CELL_TICKS * 2u)
 #define MFM_PULSE_FLOOR (MFM_CELL_TICKS * 4u / 5u)
 #define MFM_PULSE_CEILING (MFM_CELL_TICKS * 5u / 2u)
 #define MFM_MIN_PREAMBLE 60u
@@ -47,9 +46,8 @@ typedef struct {
   bool stopped;
   int precomp_shift;
   uint8_t held;
-  uint8_t last_out;
+  int8_t edge_shift;
   bool held_valid;
-  bool held_first;
 } mfm_encode_t;
 
 void mfm_encode_init(mfm_encode_t *encoder, uint8_t *buf, size_t size);
@@ -84,15 +82,13 @@ typedef struct {
 typedef struct {
   mfm_state_t state;
   mfm_record_state_t record_state;
-  uint16_t T2_max;
-  uint16_t T3_max;
   uint8_t byte_acc;
   uint8_t bit_count;
   uint16_t buf_pos;
   uint16_t bytes_expected;
   uint16_t crc;
   uint8_t sync_stage;
-  uint16_t t_cell;
+  uint32_t cell_q8;
   uint16_t short_count;
   uint32_t preamble_sum;
   uint8_t pending_cylinder;
@@ -105,6 +101,14 @@ typedef struct {
   uint32_t format_errors;
   uint8_t buf[DISK_SECTOR_SIZE + 3u];
 } mfm_t;
+
+static inline uint16_t mfm_short_limit(const mfm_t *decoder) {
+  return (uint16_t)(decoder->cell_q8 * 5u / (4u * 256u));
+}
+
+static inline uint16_t mfm_medium_limit(const mfm_t *decoder) {
+  return (uint16_t)(decoder->cell_q8 * 7u / (4u * 256u));
+}
 
 void mfm_init(mfm_t *decoder);
 void mfm_reset(mfm_t *decoder);

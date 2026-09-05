@@ -3,10 +3,6 @@
 #include "../src/mfm.h"
 #include <string.h>
 
-static uint16_t pulse_delta(uint8_t pulse) {
-  return pulse + MFM_PIO_OVERHEAD;
-}
-
 static void encode_address(mfm_encode_t *encoder, uint8_t cylinder, uint8_t head,
                            uint8_t sector, uint8_t size_code, bool bad_crc) {
   uint8_t address[] = {MFM_ADDR_MARK, cylinder, head, sector, size_code};
@@ -33,7 +29,7 @@ static bool decode_all(mfm_t *decoder, const uint8_t *pulses, size_t count,
                        mfm_sector_t *sector) {
   bool found = false;
   for (size_t i = 0; i < count; i++) {
-    if (mfm_feed(decoder, pulse_delta(pulses[i]), sector)) found = true;
+    if (mfm_feed(decoder, pulses[i], sector)) found = true;
   }
   return found;
 }
@@ -49,6 +45,69 @@ static void fill_track(track_t *track, uint8_t cylinder, uint8_t head, uint32_t 
       track->data[sector][byte] = (uint8_t)(seed >> 24);
     }
   }
+}
+
+static uint16_t reference_mfm_word(uint8_t byte, bool previous) {
+  uint16_t data = 0;
+  for (unsigned bit = 0; bit < 8; bit++) {
+    data |= (uint16_t)(((uint32_t)byte >> bit & 1u) << (bit * 2u));
+  }
+  uint16_t clocks = (uint16_t)(~(((uint32_t)data << 1u) | ((uint32_t)data >> 1u)) & 0xAAAAu);
+  if (previous) clocks &= 0x7FFFu;
+  return (uint16_t)(data | clocks);
+}
+
+static void reference_word_intervals(uint16_t word, unsigned *position,
+                                     unsigned *previous, uint8_t *out,
+                                     size_t *count) {
+  for (int bit = 15; bit >= 0; bit--) {
+    *position += MFM_CELL_TICKS / 2u;
+    if ((word & (1u << bit)) == 0) continue;
+    unsigned interval = *position - *previous;
+    out[(*count)++] = (uint8_t)(interval);
+    *previous = *position;
+  }
+}
+
+TEST(test_encoder_matches_bitcell_oracle_for_every_byte_pair) {
+  for (uint32_t pair = 0; pair <= UINT16_MAX; pair++) {
+    uint8_t data[] = {0, (uint8_t)(pair >> 8), (uint8_t)pair};
+    uint8_t expected[32];
+    unsigned position = MFM_CELL_TICKS / 2u;
+    unsigned previous = 0;
+    size_t count = 0;
+    bool previous_bit = false;
+    for (size_t i = 0; i < sizeof(data); i++) {
+      reference_word_intervals(reference_mfm_word(data[i], previous_bit),
+                               &position, &previous, expected, &count);
+      previous_bit = (data[i] & 1u) != 0;
+    }
+    uint8_t actual[32];
+    mfm_encode_t encoder;
+    mfm_encode_init(&encoder, actual, sizeof(actual));
+    mfm_encode_bytes(&encoder, data, sizeof(data));
+    ASSERT_EQ(encoder.pos, count);
+    ASSERT_MEM_EQ(actual, expected, count);
+  }
+}
+
+TEST(test_sync_matches_three_missing_clock_a1_words) {
+  uint8_t expected[128];
+  unsigned position = MFM_CELL_TICKS / 2u;
+  unsigned previous = 0;
+  size_t count = 0;
+  for (unsigned i = 0; i < 12; i++) {
+    reference_word_intervals(0xAAAAu, &position, &previous, expected, &count);
+  }
+  for (unsigned i = 0; i < 3; i++) {
+    reference_word_intervals(0x4489u, &position, &previous, expected, &count);
+  }
+  uint8_t actual[128];
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, actual, sizeof(actual));
+  mfm_encode_sync(&encoder);
+  ASSERT_EQ(encoder.pos, count);
+  ASSERT_MEM_EQ(actual, expected, count);
 }
 
 TEST(test_encoder_sync) {
@@ -72,7 +131,7 @@ TEST(test_crc) {
   ASSERT_EQ(crc16(marks, sizeof(marks), 0xFFFF), MFM_CRC_INIT);
   ASSERT_EQ(MFM_PULSE_FLOOR, 38);
   ASSERT_EQ(MFM_PULSE_CEILING, 120);
-  ASSERT_EQ(MFM_PULSE_SHORT + MFM_PIO_OVERHEAD, MFM_CELL_TICKS);
+  ASSERT_EQ(MFM_PULSE_SHORT, MFM_CELL_TICKS);
   ASSERT_EQ(MFM_READ_PIO_HZ, 72000000u);
 }
 
@@ -130,7 +189,7 @@ TEST(test_roundtrip_with_jitter) {
   for (size_t i = 0; i < encoder.pos; i++) {
     seed = seed * 1103515245u + 12345u;
     int jitter = (int)((seed >> 16) % 11u) - 5;
-    uint16_t delta = (uint16_t)((int)pulse_delta(pulses[i]) + jitter);
+    uint16_t delta = (uint16_t)((int)pulses[i] + jitter);
     if (mfm_feed(&decoder, delta, &sector)) found = true;
   }
   ASSERT(found);
@@ -150,7 +209,7 @@ TEST(test_roundtrip_full_track) {
   mfm_init(&decoder);
   uint32_t seen = 0;
   for (size_t i = 0; i < encoder.pos; i++) {
-    if (!mfm_feed(&decoder, pulse_delta(pulses[i]), &sector)) continue;
+    if (!mfm_feed(&decoder, pulses[i], &sector)) continue;
     ASSERT_EQ(sector.cylinder, track.cylinder);
     ASSERT_EQ(sector.head, track.head);
     ASSERT_MEM_EQ(sector.data, track.data[sector.sector], DISK_SECTOR_SIZE);
@@ -402,13 +461,36 @@ TEST(test_encoder_rejects_invalid_inputs) {
 }
 
 static void reference_precomp(uint8_t *pulses, size_t count, uint8_t cylinder) {
-  int shift = MFM_PRECOMP_SHIFT + ((int)cylinder - (int)MFM_PRECOMP_START_TRACK) / 13;
-  for (size_t i = 1; i + 1 < count; i++) {
-    if (pulses[i] != MFM_PULSE_SHORT) continue;
-    bool previous_long = pulses[i - 1] == MFM_PULSE_LONG;
-    bool next_long = pulses[i + 1] == MFM_PULSE_LONG;
-    if (previous_long == next_long) continue;
-    pulses[i] = (uint8_t)(pulses[i] + (previous_long ? -shift : shift));
+  static uint8_t bits[DISK_SECTOR_SIZE * DISK_SECTORS_PER_TRACK * 32u];
+  static uint32_t edges[200000];
+  memset(bits, 0, sizeof(bits));
+  bits[0] = 1;
+  uint32_t position = 0;
+  for (size_t i = 0; i < count; i++) {
+    unsigned ticks = pulses[i];
+    ASSERT_EQ(ticks % (MFM_CELL_TICKS / 2u), 0);
+    position += ticks / (MFM_CELL_TICKS / 2u);
+    ASSERT(position + 2u < sizeof(bits));
+    bits[position] = 1;
+    edges[i] = position;
+  }
+  int shift = cylinder >= MFM_PRECOMP_START_TRACK ? MFM_PRECOMP_SHIFT : 0;
+  int previous = 0;
+  for (size_t i = 0; i < count; i++) {
+    uint32_t edge = edges[i];
+    unsigned window = 0;
+    for (uint32_t bit = edge - 2u; bit <= edge + 2u; bit++) {
+      window = (window << 1u) | bits[bit];
+    }
+    int adjusted = (int)(edge * (MFM_CELL_TICKS / 2u));
+    if (i + 1u < count) {
+      if (window == 0x14u) adjusted -= shift;
+      if (window == 0x05u) adjusted += shift;
+    }
+    int interval = adjusted - previous;
+    ASSERT(interval > 0 && interval <= UINT8_MAX);
+    pulses[i] = (uint8_t)interval;
+    previous = adjusted;
   }
 }
 
@@ -432,6 +514,35 @@ TEST(test_streaming_precomp_matches_reference) {
     ASSERT_EQ(mfm_encode_track(&encoder, &track), count);
     ASSERT_MEM_EQ(actual, expected, count);
   }
+}
+
+TEST(test_precompensation_moves_edges_without_accumulating_drift) {
+  static uint8_t nominal[200000];
+  static uint8_t compensated[200000];
+  track_t track;
+  fill_track(&track, 79, 0, 1234);
+  mfm_encode_t encoder;
+  mfm_encode_init(&encoder, nominal, sizeof(nominal));
+  mfm_encode_gap(&encoder, 80);
+  for (uint8_t sector = 0; sector < DISK_SECTORS_PER_TRACK; sector++) {
+    mfm_encode_sector(&encoder, track.cylinder, track.head, sector, track.data[sector]);
+    mfm_encode_gap(&encoder, 54);
+  }
+  size_t count = encoder.pos;
+  mfm_encode_init(&encoder, compensated, sizeof(compensated));
+  ASSERT_EQ(mfm_encode_track(&encoder, &track), count);
+  int limit = MFM_PRECOMP_SHIFT;
+  int displacement = 0;
+  bool early = false;
+  bool late = false;
+  for (size_t i = 0; i < count; i++) {
+    displacement += (int)compensated[i] - (int)nominal[i];
+    ASSERT(displacement >= -limit && displacement <= limit);
+    early |= displacement < 0;
+    late |= displacement > 0;
+  }
+  ASSERT(early && late);
+  ASSERT_EQ(displacement, 0);
 }
 
 typedef struct {
@@ -475,6 +586,56 @@ TEST(test_emit_can_stop_encoder) {
   ASSERT_EQ(capture.count, sizeof(pulses));
 }
 
+TEST(test_decoder_tracks_slow_changes_in_all_pulse_classes) {
+  static const uint8_t patterns[] = {0x00, 0xFF, 0x55, 0x42};
+  for (size_t pattern = 0; pattern < sizeof(patterns); pattern++) {
+    uint8_t data[DISK_SECTOR_SIZE];
+    memset(data, patterns[pattern], sizeof(data));
+    uint8_t pulses[16384];
+    mfm_encode_t encoder;
+    mfm_encode_init(&encoder, pulses, sizeof(pulses));
+    mfm_encode_sector(&encoder, 0, 0, 0, data);
+    mfm_encode_gap(&encoder, 10);
+    for (int direction = -1; direction <= 1; direction += 2) {
+      mfm_t decoder;
+      mfm_sector_t sector;
+      mfm_init(&decoder);
+      bool found = false;
+      for (size_t i = 0; i < encoder.pos; i++) {
+        int32_t change = (int32_t)(1600u * i / encoder.pos) * direction;
+        uint32_t scale = (uint32_t)(10000 + change);
+        uint16_t delta = (uint16_t)((pulses[i] * scale + 5000u) / 10000u);
+        if (mfm_feed(&decoder, delta, &sector)) found = true;
+      }
+      ASSERT(found);
+      ASSERT_MEM_EQ(data, sector.data, sizeof(data));
+      uint32_t expected = direction > 0 ? 56u : 40u;
+      ASSERT(decoder.cell_q8 >= (expected - 2u) * 256u);
+      ASSERT(decoder.cell_q8 <= (expected + 2u) * 256u);
+      ASSERT_EQ(decoder.crc_errors, 0);
+    }
+  }
+}
+
+TEST(test_invalid_pulses_break_preamble_continuity) {
+  static const uint16_t invalid[] = {0, MFM_PULSE_FLOOR - 1u, MFM_PULSE_CEILING, UINT16_MAX};
+  for (size_t j = 0; j < sizeof(invalid) / sizeof(invalid[0]); j++) {
+    mfm_t decoder;
+    mfm_sector_t sector;
+    mfm_init(&decoder);
+    for (size_t i = 0; i < MFM_MIN_PREAMBLE - 1u; i++) {
+      ASSERT(!mfm_feed(&decoder, MFM_CELL_TICKS, &sector));
+    }
+    ASSERT(!mfm_feed(&decoder, invalid[j], &sector));
+    ASSERT_EQ(decoder.short_count, 0);
+    ASSERT_EQ(decoder.preamble_sum, 0);
+    ASSERT(!mfm_feed(&decoder, MFM_CELL_TICKS, &sector));
+    ASSERT(!mfm_feed(&decoder, MFM_CELL_TICKS * 3u / 2u, &sector));
+    ASSERT_EQ(decoder.state, MFM_HUNT);
+    ASSERT_EQ(decoder.syncs_found, 0);
+  }
+}
+
 TEST(test_decoder_null_inputs_fail_closed) {
   mfm_init(NULL);
   mfm_reset(NULL);
@@ -488,6 +649,8 @@ TEST(test_decoder_null_inputs_fail_closed) {
 
 int main(void) {
   printf("=== MFM Encoder/Decoder Tests ===\n\n");
+  RUN_TEST(test_encoder_matches_bitcell_oracle_for_every_byte_pair);
+  RUN_TEST(test_sync_matches_three_missing_clock_a1_words);
   RUN_TEST(test_encoder_sync);
   RUN_TEST(test_crc);
   RUN_TEST(test_roundtrip_sector);
@@ -508,9 +671,12 @@ int main(void) {
   RUN_TEST(test_data_without_address_is_rejected);
   RUN_TEST(test_encoder_buffer_overflow_stops);
   RUN_TEST(test_encoder_rejects_invalid_inputs);
+  RUN_TEST(test_precompensation_moves_edges_without_accumulating_drift);
   RUN_TEST(test_streaming_precomp_matches_reference);
   RUN_TEST(test_emit_mode_matches_linear_mode);
   RUN_TEST(test_emit_can_stop_encoder);
+  RUN_TEST(test_decoder_tracks_slow_changes_in_all_pulse_classes);
+  RUN_TEST(test_invalid_pulses_break_preamble_continuity);
   RUN_TEST(test_decoder_null_inputs_fail_closed);
   TEST_RESULTS();
 }

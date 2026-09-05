@@ -1,7 +1,8 @@
 #ifndef RPC_H
 #define RPC_H
 
-#include <stdint.h>
+#include "f12.h"
+#include "internal/byteorder.h"
 
 #define RPC_PING 1u
 #define RPC_MOUNT 2u
@@ -20,31 +21,18 @@
 #define RPC_STATUS 15u
 #define RPC_MOTOR 16u
 #define RPC_SELECT 17u
+#define RPC_ABORT 18u
 
 #define RPC_HDR 4u
 #define RPC_CHUNK 512u
 #define RPC_MAX_MSG 8192u
-#define RPC_STAT_SIZE 19u
+#define RPC_HANDLE_SIZE 8u
+#define RPC_STAT_SIZE 18u
+#define RPC_FSCK_SIZE 36u
 
-static inline uint16_t rpc_load16(const uint8_t *p) {
-  return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
-}
-
-static inline uint32_t rpc_load32(const uint8_t *p) {
-  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-         ((uint32_t)p[3] << 24);
-}
-
-static inline void rpc_store16(uint8_t *p, uint16_t value) {
-  p[0] = (uint8_t)value;
-  p[1] = (uint8_t)(value >> 8);
-}
-
-static inline void rpc_store32(uint8_t *p, uint32_t value) {
-  p[0] = (uint8_t)value;
-  p[1] = (uint8_t)(value >> 8);
-  p[2] = (uint8_t)(value >> 16);
-  p[3] = (uint8_t)(value >> 24);
-}
+void rpc_encode_stat(uint8_t out[RPC_STAT_SIZE], const f12_stat_t *stat);
+void rpc_decode_stat(const uint8_t in[RPC_STAT_SIZE], f12_stat_t *stat);
+void rpc_encode_fsck(uint8_t out[RPC_FSCK_SIZE], const fat12_fsck_t *report);
+void rpc_decode_fsck(const uint8_t in[RPC_FSCK_SIZE], fat12_fsck_t *report);
 
 #endif

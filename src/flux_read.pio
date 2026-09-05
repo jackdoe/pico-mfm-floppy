@@ -4,8 +4,10 @@
 wait_high:
     jmp x-- wait_high_next
 wait_high_next:
-    jmp pin wait_low
+    jmp pin wait_low_entry
     jmp wait_high
+wait_low_entry:
+    nop
 wait_low:
     jmp x-- wait_low_next
 wait_low_next:

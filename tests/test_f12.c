@@ -667,6 +667,27 @@ TEST(test_unmount_preserves_open_handle_ownership) {
   ASSERT_EQ(f12_unmount(&fs), DISK_OK);
 }
 
+static disk_err_t write_with_persisted_corruption(void *ctx, uint32_t generation,
+                                                 const track_t *track) {
+  disk_err_t error = vdisk_write_track(ctx, generation, track);
+  if (error == DISK_OK) vdisk_set_fat_entry(ctx, 100, 0x0FFF);
+  return error;
+}
+
+TEST(test_repair_requires_clean_metadata_read_back_from_disk) {
+  prepare();
+  vdisk_set_fat_entry(&disk, 100, 0x0FFF);
+  cache_clear(&fs.cache);
+  fs.cache.device.write_track = write_with_persisted_corruption;
+  fat12_fsck_t report;
+  ASSERT_EQ(f12_fsck(&fs, &report, true), DISK_ERR_CORRUPT);
+  ASSERT_EQ(report.lost_clusters, 1);
+  ASSERT_EQ(report.freed, 1);
+  fs.cache.device.write_track = vdisk_write_track;
+  ASSERT_EQ(f12_fsck(&fs, &report, true), DISK_OK);
+  ASSERT_EQ(f12_unmount(&fs), DISK_OK);
+}
+
 TEST(test_fsck_conflict_and_clean) {
   prepare();
   fat12_fsck_t report;
@@ -705,21 +726,80 @@ TEST(test_format_device_error_is_verbatim) {
             DISK_ERR_VERIFY);
 }
 
-TEST(test_slot_generations_skip_zero_on_wrap) {
+TEST(test_handle_ids_isolate_contexts_and_kinds) {
+  static f12_t other;
   prepare();
-  fs.files[0].generation = UINT64_MAX;
-  f12_file_t file;
-  ASSERT_EQ(f12_open(&fs, "WRAP.BIN", F12_OPEN_WRITE, &file), DISK_OK);
-  ASSERT_EQ(file.token.slot, 0);
-  ASSERT_EQ(file.token.slot_generation, 1);
-  ASSERT_EQ(f12_abort(&file), DISK_OK);
+  write_file("ID.BIN", "i", 1);
+  ASSERT_EQ(f12_init(&other, vdisk_device(&disk)), DISK_OK);
+  ASSERT_EQ(f12_mount(&other), DISK_OK);
+  f12_file_t first;
+  f12_file_t second;
+  f12_dir_t directory;
+  ASSERT_EQ(f12_open(&fs, "ID.BIN", F12_OPEN_READ, &first), DISK_OK);
+  ASSERT_EQ(f12_open(&other, "ID.BIN", F12_OPEN_READ, &second), DISK_OK);
+  ASSERT_EQ(f12_opendir(&fs, "/", &directory), DISK_OK);
+  ASSERT(first.token.id != 0);
+  ASSERT(second.token.id != first.token.id);
+  ASSERT(directory.token.id != first.token.id);
+  ASSERT(directory.token.id != second.token.id);
 
-  fs.dirs[0].generation = UINT64_MAX;
-  f12_dir_t dir;
-  ASSERT_EQ(f12_opendir(&fs, "/", &dir), DISK_OK);
-  ASSERT_EQ(dir.token.slot, 0);
-  ASSERT_EQ(dir.token.slot_generation, 1);
-  ASSERT_EQ(f12_closedir(&dir), DISK_OK);
+  uint8_t byte;
+  f12_file_t forged = first;
+  forged.token.fs = &other;
+  ASSERT_EQ(f12_read(&forged, &byte, 1).error, DISK_ERR_BAD_HANDLE);
+  forged.token = directory.token;
+  ASSERT_EQ(f12_read(&forged, &byte, 1).error, DISK_ERR_BAD_HANDLE);
+  f12_dir_t wrong_kind = {.token = first.token};
+  f12_stat_t stat;
+  ASSERT_EQ(f12_readdir(&wrong_kind, &stat), DISK_ERR_BAD_HANDLE);
+  forged.token = first.token;
+  forged.token.id = 0;
+  ASSERT_EQ(f12_close(&forged), DISK_ERR_BAD_HANDLE);
+  ASSERT_EQ(f12_close(&first), DISK_OK);
+  ASSERT_EQ(f12_close(&second), DISK_OK);
+  ASSERT_EQ(f12_closedir(&directory), DISK_OK);
+  ASSERT_EQ(f12_unmount(&other), DISK_OK);
+  ASSERT_EQ(f12_unmount(&fs), DISK_OK);
+}
+
+TEST(test_directory_excludes_writers_in_both_orders) {
+  prepare();
+  write_file("KEPT.BIN", "k", 1);
+  f12_dir_t directory;
+  f12_file_t writer;
+  f12_file_t reader;
+  ASSERT_EQ(f12_opendir(&fs, "/", &directory), DISK_OK);
+  ASSERT_EQ(f12_open(&fs, "NEW.BIN", F12_OPEN_WRITE, &writer),
+            DISK_ERR_CONFLICT);
+  ASSERT_EQ(f12_open(&fs, "KEPT.BIN", F12_OPEN_READ, &reader), DISK_OK);
+  ASSERT_EQ(f12_close(&reader), DISK_OK);
+  ASSERT_EQ(f12_closedir(&directory), DISK_OK);
+  ASSERT_EQ(f12_open(&fs, "NEW.BIN", F12_OPEN_WRITE, &writer), DISK_OK);
+  ASSERT_EQ(f12_opendir(&fs, "/", &directory), DISK_ERR_CONFLICT);
+  ASSERT_EQ(f12_abort(&writer), DISK_OK);
+  ASSERT_EQ(f12_opendir(&fs, "/", &directory), DISK_OK);
+  ASSERT_EQ(f12_closedir(&directory), DISK_OK);
+  ASSERT_EQ(f12_unmount(&fs), DISK_OK);
+}
+
+TEST(test_directory_end_does_not_expose_entries_after_terminator) {
+  prepare();
+  write_file("KEPT.BIN", "k", 1);
+  ASSERT_EQ(f12_unmount(&fs), DISK_OK);
+  uint8_t *root = disk.data[FAT12_ROOT_START];
+  memcpy(root + FAT12_DIR_ENTRY_SIZE * 3u, root + FAT12_DIR_ENTRY_SIZE,
+         FAT12_DIR_ENTRY_SIZE);
+  ASSERT_EQ(root[FAT12_DIR_ENTRY_SIZE * 2u], FAT12_DIRENT_END);
+  ASSERT_EQ(f12_mount(&fs), DISK_OK);
+  f12_dir_t directory;
+  ASSERT_EQ(f12_opendir(&fs, "/", &directory), DISK_OK);
+  f12_stat_t stat;
+  ASSERT_EQ(f12_readdir(&directory, &stat), DISK_OK);
+  ASSERT_STR_EQ(stat.name, "KEPT.BIN");
+  for (size_t i = 0; i < FAT12_ROOT_ENTRIES; i++) {
+    ASSERT_EQ(f12_readdir(&directory, &stat), DISK_END);
+  }
+  ASSERT_EQ(f12_closedir(&directory), DISK_OK);
   ASSERT_EQ(f12_unmount(&fs), DISK_OK);
 }
 
@@ -767,10 +847,13 @@ int main(void) {
   RUN_TEST(test_abort_discards_uncommitted_writer);
   RUN_TEST(test_failed_close_is_retryable_and_not_abortable);
   RUN_TEST(test_unmount_preserves_open_handle_ownership);
+  RUN_TEST(test_repair_requires_clean_metadata_read_back_from_disk);
   RUN_TEST(test_fsck_conflict_and_clean);
   RUN_TEST(test_mount_reports_device_errors_verbatim);
   RUN_TEST(test_format_device_error_is_verbatim);
-  RUN_TEST(test_slot_generations_skip_zero_on_wrap);
+  RUN_TEST(test_handle_ids_isolate_contexts_and_kinds);
+  RUN_TEST(test_directory_excludes_writers_in_both_orders);
+  RUN_TEST(test_directory_end_does_not_expose_entries_after_terminator);
   RUN_TEST(test_strerror_is_total);
   TEST_RESULTS();
 }

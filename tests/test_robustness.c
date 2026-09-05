@@ -125,10 +125,6 @@ TEST(test_fat12_fsck_distinguishes_loop) {
   ASSERT_EQ(report.broken_chains, 1);
 }
 
-static uint16_t pulse_delta(uint8_t pulse) {
-  return pulse + MFM_PIO_OVERHEAD;
-}
-
 static void encode_address(mfm_encode_t *encoder, uint8_t cylinder, uint8_t head,
                            uint8_t sector, uint8_t size_code, bool corrupt) {
   uint8_t address[] = {MFM_ADDR_MARK, cylinder, head, sector, size_code};
@@ -152,7 +148,7 @@ TEST(test_mfm_rejects_non_512_records_and_bad_address_crc) {
     mfm_sector_t sector;
     mfm_init(&decoder);
     for (size_t i = 0; i < encoder.pos; i++) {
-      ASSERT(!mfm_feed(&decoder, pulse_delta(pulses[i]), &sector));
+      ASSERT(!mfm_feed(&decoder, pulses[i], &sector));
     }
     ASSERT(decoder.format_errors > 0);
     ASSERT_EQ(decoder.record_state, MFM_EXPECT_ID);
@@ -165,7 +161,7 @@ TEST(test_mfm_rejects_non_512_records_and_bad_address_crc) {
   mfm_sector_t sector;
   mfm_init(&decoder);
   for (size_t i = 0; i < encoder.pos; i++) {
-    ASSERT(!mfm_feed(&decoder, pulse_delta(pulses[i]), &sector));
+    ASSERT(!mfm_feed(&decoder, pulses[i], &sector));
   }
   ASSERT_EQ(decoder.crc_errors, 1);
 }
@@ -196,7 +192,7 @@ TEST(test_mfm_truncated_record_never_emits) {
   mfm_sector_t sector;
   mfm_init(&decoder);
   for (size_t i = 0; i < encoder.pos / 2u; i++) {
-    ASSERT(!mfm_feed(&decoder, pulse_delta(pulses[i]), &sector));
+    ASSERT(!mfm_feed(&decoder, pulses[i], &sector));
   }
   ASSERT_EQ(decoder.sectors_read, 0);
 }

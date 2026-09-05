@@ -64,7 +64,7 @@ static inline uint32_t sim_track_load(pio_sim_track_t *track, const uint8_t *pul
   track->count = (uint32_t)count;
   uint64_t cycles = 0;
   for (size_t i = 0; i < count; i++) {
-    track->deltas[i] = (uint16_t)(pulses[i] + MFM_PIO_OVERHEAD);
+    track->deltas[i] = (uint16_t)(pulses[i]);
     cycles += track->deltas[i];
   }
   ASSERT(cycles < UINT32_MAX - 48000u);

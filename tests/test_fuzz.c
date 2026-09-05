@@ -185,10 +185,6 @@ void fuzz_mfm_encoder_zero_buffer(void) {
   printf("  Passed\n");
 }
 
-static uint16_t pulse_to_delta(uint8_t pulse) {
-  return pulse + MFM_PIO_OVERHEAD;
-}
-
 void fuzz_mfm_roundtrip(int iterations) {
   printf("Fuzzing MFM encode/decode roundtrip (%d iterations)...\n", iterations);
 
@@ -219,7 +215,7 @@ void fuzz_mfm_roundtrip(int iterations) {
     bool got_sector = false;
 
     for (size_t i = 0; i < enc.pos; i++) {
-      if (mfm_feed(&m, pulse_to_delta(pulse_buf[i]), &s_out)) {
+      if (mfm_feed(&m, pulse_buf[i], &s_out)) {
         got_sector = true;
       }
     }
