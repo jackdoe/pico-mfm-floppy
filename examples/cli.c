@@ -14,7 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define FW_VERSION "0.4.0"
+#define FW_VERSION "0.4.1"
 #define CMD_BUF_SIZE 256
 #define IO_BUF_SIZE DISK_SECTOR_SIZE
 #define WORK_BUF_SIZE (8u * DISK_SECTOR_SIZE)
@@ -92,6 +92,7 @@ static void cmd_flux(int argc, char **argv);
 static void cmd_seek(int argc, char **argv);
 static void cmd_dump(int argc, char **argv);
 static void cmd_mfm(int argc, char **argv);
+static void cmd_mfmbench(int argc, char **argv);
 static void cmd_crashtest(int argc, char **argv);
 static void cmd_crashcheck(int argc, char **argv);
 static void cmd_rpm(int argc, char **argv);
@@ -132,6 +133,7 @@ static const cmd_entry_t commands[] = {
     {"dump", cmd_dump, false, 3, 4, "<cylinder> <head> [sector]",
      "Dump raw sectors"},
     {"mfm", cmd_mfm, false, 3, 3, "<cylinder> <head>", "Analyze MFM signal"},
+    {"mfmbench", cmd_mfmbench, false, 1, 1, "", "Measure decoder throughput without disk I/O"},
     {"rpm", cmd_rpm, false, 1, 1, "", "Measure spindle speed"},
     {"test-full", cmd_test_full, false, 1, 2, "[rounds]",
      "Run destructive hardware tests"},
@@ -1621,6 +1623,60 @@ static void cmd_mfm(int argc, char **argv) {
   drive_idle();
 }
 
+static void cmd_mfmbench(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  const unsigned repetitions = 64;
+  printf("  Decoder benchmark at %lu MHz; no disk I/O\n",
+         (unsigned long)(clock_get_hz(clk_sys) / 1000000u));
+  printf("  Load is decoder time / encoded flux duration; excludes driver and IRQ work.\n");
+  for (unsigned pattern = 0; pattern < MFM_TEST_PATTERNS; pattern++) {
+    work_track.cylinder = 0;
+    work_track.head = 0;
+    if (!mfm_test_fill(&work_track, pattern, 0)) return;
+    memcpy(io_buf, work_track.data[0], sizeof(io_buf));
+    uint8_t *pulses = (uint8_t *)work_track.data;
+    mfm_encode_t encoder;
+    mfm_encode_init(&encoder, pulses, sizeof(work_track.data));
+    mfm_encode_sector(&encoder, 0, 0, 0, io_buf);
+    mfm_encode_gap(&encoder, 54);
+    if (encoder.stopped) {
+      printf("  Benchmark encoding failed\n");
+      return;
+    }
+    uint32_t ticks = 0;
+    for (size_t i = 0; i < encoder.pos; i++) ticks += pulses[i];
+    uint32_t decoded = 0;
+    bool exact = true;
+    mfm_sector_t sector;
+    absolute_time_t started = get_absolute_time();
+    for (unsigned repetition = 0; repetition < repetitions; repetition++) {
+      mfm_init(&signal_probe.decoder);
+      for (size_t i = 0; i < encoder.pos; i++) {
+        if (!mfm_feed(&signal_probe.decoder, pulses[i], &sector)) continue;
+        decoded++;
+        if (memcmp(sector.data, io_buf, sizeof(io_buf)) != 0) exact = false;
+      }
+      if (signal_probe.decoder.crc_errors || signal_probe.decoder.format_errors) {
+        exact = false;
+      }
+    }
+    int64_t elapsed_us = absolute_time_diff_us(started, get_absolute_time());
+    if (elapsed_us <= 0) {
+      printf("  Benchmark timer failed\n");
+      return;
+    }
+    uint32_t rate = (uint32_t)((uint64_t)encoder.pos * repetitions * 1000000u /
+                              (uint64_t)elapsed_us);
+    double load = (double)elapsed_us * (MFM_TICK_HZ / 1000000u) * 100.0 /
+                   ((double)ticks * repetitions);
+    printf("  pattern=%s sectors=%lu/%u exact=%s pulses/s=%lu load=%.1f%%\n",
+           mfm_test_pattern_names[pattern], (unsigned long)decoded, repetitions,
+           exact && decoded == repetitions ? "yes" : "NO",
+           (unsigned long)rate, load);
+  }
+}
+
 static void check(bool cond, const char *tag, int *pass, int *fail) {
   if (cond) {
     printf("  PASS: %s\n", tag);
@@ -1709,7 +1765,11 @@ static bool run_mfm_patterns(uint32_t rounds, int *pass, int *fail) {
                        stats.media_changes == 0;
           check(clean, "pattern survives seek and motor restart", pass, fail);
           if (!clean) {
-            print_track_stats(&signal_probe, "    ");
+            if (signal_probe.decoder.cell_q8 != 0) {
+              print_track_stats(&signal_probe, "    ");
+            } else {
+              printf("    Post-restart capture was not reached; failure occurred during write or positioning.\n");
+            }
             if (error != DISK_OK || stats_error != DISK_OK) return false;
           }
         }

@@ -14,6 +14,7 @@
 #define FLOPPY_FLUX_DMA_COUNT 0x0FFFFFFFu
 #define FLOPPY_READ_REVOLUTIONS 4u
 #define FLOPPY_READ_TRANSITIONS_MAX 500000u
+#define FLOPPY_READ_BATCH 64u
 #define FLOPPY_READ_DEADLINE_MS 5000u
 #define FLOPPY_WRITE_DEADLINE_MS 20000u
 #define FLOPPY_CONTROL_DEADLINE_MS 7000u
@@ -453,22 +454,17 @@ static disk_err_t floppy_flux_next_internal(floppy_t *f,
   return DISK_OK;
 }
 
-disk_result_t floppy_flux_read(floppy_t *f, floppy_pulse_t *pulses, size_t capacity) {
+static disk_result_t floppy_flux_read_batch(floppy_t *f,
+                                             const floppy_deadline_t *deadline,
+                                             uint32_t generation,
+                                             floppy_pulse_t *pulses,
+                                             size_t capacity) {
   disk_result_t result = {.error = DISK_OK, .count = 0};
-  if (!floppy_ready(f) || f->operation != FLOPPY_OPERATION_RAW || !f->flux_active ||
-      !pulses || capacity == 0) {
-    result.error = DISK_ERR_INVALID;
-    return result;
-  }
-  floppy_deadline_t deadline = {
-      .start_ms = f->operation_start_ms,
-      .limit_ms = f->operation_limit_ms,
-  };
-  if (deadline_elapsed(&deadline)) {
+  if (deadline_elapsed(deadline)) {
     result.error = DISK_ERR_TIMEOUT;
     return result;
   }
-  result.error = floppy_flux_next_internal(f, &deadline, f->flux_generation, pulses);
+  result.error = floppy_flux_next_internal(f, deadline, generation, pulses);
   if (result.error != DISK_OK) return result;
   result.count = 1;
   while (result.count < capacity && flux_data_available(f)) {
@@ -485,8 +481,20 @@ disk_result_t floppy_flux_read(floppy_t *f, floppy_pulse_t *pulses, size_t capac
     result.error = DISK_ERR_OVERRUN;
     return result;
   }
-  result.error = floppy_flux_media_status(f, f->flux_generation);
+  result.error = floppy_flux_media_status(f, generation);
   return result;
+}
+
+disk_result_t floppy_flux_read(floppy_t *f, floppy_pulse_t *pulses, size_t capacity) {
+  if (!floppy_ready(f) || f->operation != FLOPPY_OPERATION_RAW || !f->flux_active ||
+      !pulses || capacity == 0) {
+    return (disk_result_t){.error = DISK_ERR_INVALID};
+  }
+  floppy_deadline_t deadline = {
+      .start_ms = f->operation_start_ms,
+      .limit_ms = f->operation_limit_ms,
+  };
+  return floppy_flux_read_batch(f, &deadline, f->flux_generation, pulses, capacity);
 }
 
 disk_err_t floppy_flux_end(floppy_t *f) {
@@ -832,48 +840,54 @@ static disk_err_t floppy_read_flux(floppy_t *f, uint32_t expected_generation,
   bool previous_index = false;
   disk_err_t result = DISK_ERR_TIMEOUT;
 
+  floppy_pulse_t pulses[FLOPPY_READ_BATCH];
   while (transitions < FLOPPY_READ_TRANSITIONS_MAX &&
          completed_revolutions < FLOPPY_READ_REVOLUTIONS) {
-    if ((transitions & 0xFFu) == 0 && deadline_elapsed(deadline)) break;
-    floppy_pulse_t pulse;
-    status = floppy_flux_next_internal(f, deadline, expected_generation, &pulse);
-    if (status != DISK_OK) {
-      result = status;
+    disk_result_t batch = floppy_flux_read_batch(f, deadline, expected_generation,
+                                                 pulses, FLOPPY_READ_BATCH);
+    if (batch.error != DISK_OK) {
+      result = batch.error;
       break;
     }
-    transitions++;
-    bool boundary = have_index && previous_index && !pulse.index;
-    previous_index = pulse.index;
-    have_index = true;
-    if (boundary) {
-      if (aligned) {
-        completed_revolutions++;
-        if (goal->conflict != 0) {
-          result = goal->expected ? DISK_ERR_VERIFY : DISK_ERR_CORRUPT;
-          break;
-        }
-        if (goal->verify_failed) {
-          result = DISK_ERR_VERIFY;
-          break;
-        }
-        if (read_goal_complete(goal)) {
-          clean++;
-          if (clean >= clean_revolutions) {
-            result = DISK_OK;
-            break;
+    for (size_t i = 0; i < batch.count; i++) {
+      const floppy_pulse_t *pulse = &pulses[i];
+      if (transitions++ == FLOPPY_READ_TRANSITIONS_MAX) goto captured;
+      bool boundary = have_index && previous_index && !pulse->index;
+      previous_index = pulse->index;
+      have_index = true;
+      if (boundary) {
+        if (aligned) {
+          completed_revolutions++;
+          if (goal->conflict != 0) {
+            result = goal->expected ? DISK_ERR_VERIFY : DISK_ERR_CORRUPT;
+            goto captured;
           }
-        } else {
-          clean = 0;
+          if (goal->verify_failed) {
+            result = DISK_ERR_VERIFY;
+            goto captured;
+          }
+          if (read_goal_complete(goal)) {
+            clean++;
+            if (clean >= clean_revolutions) {
+              result = DISK_OK;
+              goto captured;
+            }
+          } else {
+            clean = 0;
+          }
+          if (completed_revolutions == FLOPPY_READ_REVOLUTIONS) goto captured;
         }
+        aligned = true;
+        mfm_reset(&decoder);
+        goal->seen = 0;
+        continue;
       }
-      aligned = true;
-      mfm_reset(&decoder);
-      goal->seen = 0;
-      continue;
+      if (!aligned) continue;
+      if (mfm_feed(&decoder, pulse->delta, &sector)) read_goal_accept(goal, &sector);
     }
-    if (!aligned) continue;
-    if (mfm_feed(&decoder, pulse.delta, &sector)) read_goal_accept(goal, &sector);
   }
+
+captured:
 
   if (result == DISK_ERR_TIMEOUT) result = read_goal_verdict(goal, &decoder);
   floppy_flux_read_stop(f);

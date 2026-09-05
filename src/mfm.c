@@ -2,6 +2,10 @@
 #include "crc.h"
 #include <string.h>
 
+#define MFM_MEDIUM_CELL_Q16 ((2u * 65536u + 2u) / 3u)
+
+_Static_assert(MFM_PULSE_CEILING <= 256u, "medium normalization must be exact");
+
 static const uint8_t mfm_sync_pattern[] = {
     MFM_MEDIUM, MFM_LONG, MFM_MEDIUM, MFM_LONG, MFM_MEDIUM,
     MFM_SHORT, MFM_LONG, MFM_MEDIUM, MFM_LONG, MFM_MEDIUM,
@@ -204,7 +208,9 @@ static int mfm_classify(mfm_t *m, uint16_t delta) {
   int pulse = delta <= mfm_short_limit(m) ? MFM_SHORT
                 : delta <= mfm_medium_limit(m) ? MFM_MEDIUM : MFM_LONG;
   if (m->state == MFM_DATA || m->state == MFM_CLOCK) {
-    uint32_t observed = (uint32_t)delta * 512u / ((uint32_t)pulse + 2u);
+    uint32_t observed = pulse == MFM_SHORT ? (uint32_t)delta << 8u
+                        : pulse == MFM_LONG ? (uint32_t)delta << 7u
+                        : ((uint32_t)delta * MFM_MEDIUM_CELL_Q16) >> 8u;
     int32_t difference = (int32_t)observed - (int32_t)m->cell_q8;
     int32_t limit = (int32_t)(m->cell_q8 / 8u);
     if (difference >= -limit && difference <= limit) {

@@ -120,7 +120,7 @@ Every MFM timing constant derives from one tick: 24 MHz, 48 ticks per 2 µs bit 
 
 The codec emits physical tick intervals. Only the floppy driver subtracts the write PIO instruction overhead when filling DMA buffers; flux capture utilities use the physical intervals directly.
 
-The MFM decoder keeps one fractional cell-period estimate and derives its classification thresholds from it. It learns the initial period from a contiguous zero preamble and tracks bounded changes using short, medium, and long intervals. An invalid pulse breaks preamble continuity. The read PIO keeps every counter path at three state-machine cycles per tick, following the [RP2040 instruction timing rules](https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf).
+The MFM decoder keeps one fractional cell-period estimate and derives its classification thresholds from it. It learns the initial period from a contiguous zero preamble and tracks bounded changes using short, medium, and long intervals. Pulse normalization uses shifts and an exact bounded reciprocal multiplication, avoiding per-pulse division on RP2040. Track reads and verification drain flux in bounded batches. An invalid pulse breaks preamble continuity. The read PIO keeps every counter path at three state-machine cycles per tick, following the [RP2040 instruction timing rules](https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf).
 
 Write precompensation shifts individual transitions and balances neighboring intervals, preserving total track time. From cylinder 40 it applies a fixed three-tick (125 ns) shift using the MFM short-neighbor patterns also used by [Greaseweazle](https://github.com/keirf/greaseweazle/blob/master/src/greaseweazle/track.py). The amount requires drive and media calibration.
 
@@ -146,12 +146,13 @@ Use a disposable, writable 1.44 MB disk for the destructive hardware suite:
 
 ```text
 version
+mfmbench
 rpm
 test-full 12
 mfmscan
 ```
 
-Confirm firmware version `0.4.0`. Save the complete serial output, including the spindle periods, pattern rows, drive statistics, and final summaries.
+Confirm firmware version `0.4.1`. Save the complete serial output, including the decoder benchmark, spindle periods, pattern rows, drive statistics, and final summaries. `mfmbench` does no disk I/O: it measures decoding of seven patterns on the actual CPU, verifies the decoded data, and reports pulses per second and decoder time as a percentage of encoded flux duration. That percentage excludes GPIO, DMA handling, and other application work; the physical pattern test checks the combined receive path.
 
 `test-full` first writes seven patterns (`00`, `FF`, `55`, `AA`, `92`, `49`, and deterministic random data) to cylinders 0, 39, 40, and 79 on both heads. Each of these 56 cases uses the driver's verified write, seeks away, switches the motor off for one second, then captures three complete revolutions after restart. Every revolution must contain all 18 correctly addressed sectors with exact data, no duplicates, and no CRC or format errors. Each case reports retries, overruns, underruns, and peak DMA ring usage; retries and flow faults fail this strict pattern check. Cylinders 39 and 40 straddle the precompensation boundary.
 

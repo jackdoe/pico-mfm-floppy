@@ -617,6 +617,32 @@ TEST(test_decoder_tracks_slow_changes_in_all_pulse_classes) {
   }
 }
 
+TEST(test_clock_tracking_matches_exact_division_for_every_cell_and_pulse) {
+  for (uint32_t cell = MFM_PULSE_FLOOR * 256u;
+       cell <= MFM_CELL_TICKS * 5u / 4u * 256u; cell++) {
+    for (uint16_t delta = MFM_PULSE_FLOOR; delta < MFM_PULSE_CEILING; delta++) {
+      unsigned cells = delta <= cell * 5u / 1024u ? 2u
+                       : delta <= cell * 7u / 1024u ? 3u : 4u;
+      int32_t difference = (int32_t)((uint32_t)delta * 512u / cells) - (int32_t)cell;
+      int32_t limit = (int32_t)(cell / 8u);
+      uint32_t expected = cell;
+      if (difference >= -limit && difference <= limit) {
+        expected = (uint32_t)((int32_t)cell + difference / 16);
+      }
+      if (expected < MFM_PULSE_FLOOR * 256u) expected = MFM_PULSE_FLOOR * 256u;
+      if (expected > MFM_CELL_TICKS * 5u / 4u * 256u) {
+        expected = MFM_CELL_TICKS * 5u / 4u * 256u;
+      }
+      for (mfm_state_t state = MFM_DATA; state <= MFM_CLOCK; state++) {
+        mfm_t decoder = {.state = state, .cell_q8 = cell};
+        mfm_sector_t sector;
+        mfm_feed(&decoder, delta, &sector);
+        ASSERT_EQ(decoder.cell_q8, expected);
+      }
+    }
+  }
+}
+
 TEST(test_invalid_pulses_break_preamble_continuity) {
   static const uint16_t invalid[] = {0, MFM_PULSE_FLOOR - 1u, MFM_PULSE_CEILING, UINT16_MAX};
   for (size_t j = 0; j < sizeof(invalid) / sizeof(invalid[0]); j++) {
@@ -676,6 +702,7 @@ int main(void) {
   RUN_TEST(test_emit_mode_matches_linear_mode);
   RUN_TEST(test_emit_can_stop_encoder);
   RUN_TEST(test_decoder_tracks_slow_changes_in_all_pulse_classes);
+  RUN_TEST(test_clock_tracking_matches_exact_division_for_every_cell_and_pulse);
   RUN_TEST(test_invalid_pulses_break_preamble_continuity);
   RUN_TEST(test_decoder_null_inputs_fail_closed);
   TEST_RESULTS();
